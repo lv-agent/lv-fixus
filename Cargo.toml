@@ -1,0 +1,85 @@
+[package]
+name = "fixus"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Session Event Store — 不可变事件存储与可靠执行运行时"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Database — 开发阶段使用 SQLite，PostgreSQL 支持保留
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "sqlite",
+    "chrono",
+    "uuid",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v7", "v4", "serde"] }
+
+# Error handling
+thiserror = "2"
+async-trait = "0.1"
+
+# HTTP client (sandbox client)
+reqwest = { version = "0.12", features = ["json"] }
+
+# CLI (sandbox-server)
+clap = { version = "4", features = ["derive"] }
+
+# WebSocket client (fixlet → fixus)
+tokio-tungstenite = "0.29"
+
+# WebSocket utilities
+futures-util = "0.3"
+
+# Hashing (idempotency_key)
+sha2 = "0.10"
+hex = "0.4"
+
+# Streaming (optional — Redis pub/sub + SSE)
+redis = { version = "0.31", features = ["tokio-comp", "aio", "connection-manager"] }
+tokio-stream = "0.1"
+
+# Sandbox (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+serde_json = "1"
+http-body-util = "0.1"
+
+[[bin]]
+name = "fixus"
+path = "src/main.rs"
+
+[[bin]]
+name = "fixlet"
+path = "src/bin/fixlet/main.rs"
+
+[[bin]]
+name = "sandbox-server"
+path = "src/bin/sandbox-server/main.rs"
+
+[[bin]]
+name = "fixus-stream"
+path = "src/bin/fixus-stream/main.rs"

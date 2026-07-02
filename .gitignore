@@ -1,0 +1,10 @@
+/target
+
+# 永不提交 — 设计文档与 AI 辅助目录
+/veps
+/.claude
+/CLAUDE.md
+
+# 运行时数据 — 归档与本地数据库
+/archives
+*.db
