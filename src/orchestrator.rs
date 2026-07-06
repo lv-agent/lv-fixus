@@ -88,6 +88,15 @@ pub struct Orchestrator {
     token_publisher: crate::stream::TokenPublisher,
 }
 
+/// 异步 Turn 启动结果(`start_turn_async`)
+#[derive(Debug)]
+pub enum AsyncTurnStart {
+    /// Turn 已启动,后台执行中;客户端凭 turn_id 连 fixus-stream SSE 看进度
+    Started { turn_id: i64 },
+    /// 检测到未完成 Turn,已触发后台恢复;本次无新 Turn
+    RecoveryTriggered { incomplete_count: usize },
+}
+
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
@@ -138,7 +147,6 @@ impl Orchestrator {
         // 2. 启动新 Turn（WAL: turn_started）
         let (turn_id, redo_group, _turn_started) =
             service::start_turn(&*self.store, session_id, user_input, redo_group).await?;
-
         tracing::info!(
             "session {}: turn {} started, redo_group={}",
             session_id,
@@ -146,19 +154,33 @@ impl Orchestrator {
             redo_group
         );
 
+        // 3-7. 执行体
+        self.run_turn_to_completion(session_id, turn_id, user_input, &redo_group)
+            .await
+    }
+
+    /// Turn 执行体(turn_started 已写入、turn_id 已知):
+    /// 构建 context → 注册 PendingTurn → 检查 fixlet → 派发 → 等待完成(超时/失败处理)。
+    /// 被 `execute_turn`(同步)与 `start_turn_async`(后台)复用。
+    async fn run_turn_to_completion(
+        &self,
+        session_id: &str,
+        turn_id: i64,
+        user_input: &str,
+        redo_group: &str,
+    ) -> Result<TurnOutcome> {
         // 3. 构建 context（只构建一次，传递给 dispatch）
         let ctx = context::build_llm_context(&*self.store, session_id).await?;
 
         // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知）
         let (pending, result_rx) =
-            PendingTurn::new(session_id.to_string(), turn_id, redo_group.clone());
+            PendingTurn::new(session_id.to_string(), turn_id, redo_group.to_string());
         self.registry
             .register_pending_turn(session_id, pending)
             .await;
 
         // 5. 检查 fixlet 是否已连接
         if self.registry.get_fixlet_sender(session_id).await.is_none() {
-            // 写 turn_failed 并返回错误
             self.fail_turn_and_respond(
                 session_id,
                 turn_id,
@@ -177,7 +199,7 @@ impl Orchestrator {
             session_id,
             turn_id,
             user_input,
-            &redo_group,
+            redo_group,
             0,
             &[],
             &ctx,
@@ -213,6 +235,65 @@ impl Orchestrator {
                 .await
             }
         }
+    }
+
+    /// 异步启动 Turn:写 turn_started 后**立即返回 turn_id**,执行体在后台进行。
+    /// 客户端凭 turn_id 连 fixus-stream SSE,实时看事件 + token 流式。
+    pub async fn start_turn_async(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        redo_group: Option<&str>,
+    ) -> Result<AsyncTurnStart> {
+        // 1. 恢复检查
+        let incomplete = self.store.get_incomplete_turns(session_id).await?;
+        if !incomplete.is_empty() {
+            let count = incomplete.len();
+            tracing::warn!(
+                "session {}: {} incomplete turns, triggering background recovery",
+                session_id,
+                count
+            );
+            self.spawn_background_recovery(session_id.to_string());
+            return Ok(AsyncTurnStart::RecoveryTriggered { incomplete_count: count });
+        }
+
+        // 2. 启动新 Turn（WAL: turn_started）— turn_id 在此确定
+        let (turn_id, redo_group, _turn_started) =
+            service::start_turn(&*self.store, session_id, user_input, redo_group).await?;
+        tracing::info!(
+            "session {}: turn {} started (async), redo_group={}",
+            session_id,
+            turn_id,
+            redo_group
+        );
+
+        // 3-7. 后台执行(不阻塞 HTTP 响应)
+        let orch = Orchestrator {
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            turn_timeout: self.turn_timeout,
+            token_publisher: self.token_publisher.clone(),
+        };
+        let sid = session_id.to_string();
+        let ui = user_input.to_string();
+        tokio::spawn(async move {
+            match orch.run_turn_to_completion(&sid, turn_id, &ui, &redo_group).await {
+                Ok(_) => tracing::info!(
+                    "session {}: turn {} background execution finished",
+                    sid,
+                    turn_id
+                ),
+                Err(e) => tracing::error!(
+                    "session {}: turn {} background execution failed: {}",
+                    sid,
+                    turn_id,
+                    e
+                ),
+            }
+        });
+
+        Ok(AsyncTurnStart::Started { turn_id })
     }
 
     /// 后台恢复：检测未完成 Turn，逐个 redo，不阻塞 HTTP 请求。

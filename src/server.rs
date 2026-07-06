@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::orchestrator::Orchestrator;
 use crate::protocol::*;
-use crate::session_registry::{SessionRegistry, TurnOutcome};
+use crate::session_registry::SessionRegistry;
 use crate::storage::{EventStore, LogdbdEventStore};
 use crate::{context, recovery, service};
 
@@ -294,34 +294,28 @@ async fn start_turn_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let orch = orchestrator(&state);
 
-    // 调用 orchestrator.execute_turn — 阻塞直到 Turn 完成
-    let outcome = orch
-        .execute_turn(&session_id, &req.user_input, req.redo_group.as_deref())
-        .await?;
-
-    match outcome {
-        TurnOutcome::Completed {
-            final_output,
-            turn_id,
-            event_count,
-        } => Ok(Json(ApiResponse::ok(serde_json::json!({
-            "turn_id": turn_id,
-            "final_output": final_output,
-            "event_count": event_count,
-            "stream_url": stream_url_for(&session_id, turn_id),
-        })))),
-        TurnOutcome::Failed {
-            turn_id,
-            error_type,
-            error_message,
-        } => Err(AppError::Recovery(format!(
-            "Turn {} failed: [{}] {}",
-            turn_id, error_type, error_message
+    // 异步启动:写 turn_started 后立即返回 turn_id + stream_url,执行在后台进行。
+    // 客户端凭 stream_url 连 fixus-stream SSE,实时看事件 + token 流式。
+    match orch
+        .start_turn_async(&session_id, &req.user_input, req.redo_group.as_deref())
+        .await?
+    {
+        crate::orchestrator::AsyncTurnStart::Started { turn_id } => Ok(Json(ApiResponse::ok(
+            serde_json::json!({
+                "turn_id": turn_id,
+                "stream_url": stream_url_for(&session_id, turn_id),
+            }),
         ))),
-        TurnOutcome::Timeout { turn_id } => Err(AppError::Recovery(format!(
-            "Turn {} timed out",
-            turn_id
-        ))),
+        crate::orchestrator::AsyncTurnStart::RecoveryTriggered { incomplete_count } => {
+            Ok(Json(ApiResponse::ok(serde_json::json!({
+                "turn_id": 0,
+                "stream_url": serde_json::Value::Null,
+                "recovery": format!(
+                    "{} incomplete turn(s) detected; retry after recovery",
+                    incomplete_count
+                ),
+            }))))
+        }
     }
 }
 
