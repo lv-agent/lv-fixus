@@ -84,14 +84,21 @@ pub struct Orchestrator {
     registry: Arc<SessionRegistry>,
     /// Turn 级超时（默认 5 分钟）
     turn_timeout: Duration,
+    /// Token 逐字流式发布(Redis ephemeral 快路径,仅 llm_chunk)
+    token_publisher: crate::stream::TokenPublisher,
 }
 
 impl Orchestrator {
-    pub fn new(store: Arc<dyn EventStore>, registry: Arc<SessionRegistry>) -> Self {
+    pub fn new(
+        store: Arc<dyn EventStore>,
+        registry: Arc<SessionRegistry>,
+        token_publisher: crate::stream::TokenPublisher,
+    ) -> Self {
         Self {
             store,
             registry,
             turn_timeout: Duration::from_secs(300),
+            token_publisher,
         }
     }
 
@@ -215,6 +222,7 @@ impl Orchestrator {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let turn_timeout = self.turn_timeout;
+        let token_publisher = self.token_publisher.clone();
 
         tokio::spawn(async move {
             tracing::info!("session {}: background recovery started", session_id);
@@ -237,6 +245,7 @@ impl Orchestrator {
                 store: store.clone(),
                 registry: registry.clone(),
                 turn_timeout,
+                token_publisher,
             };
 
             let mut redo_success = 0;
@@ -583,15 +592,21 @@ impl Orchestrator {
 
     /// 处理 fixlet 上报的 llm_chunk（流式 token）
     ///
-    /// 历史:曾发布到 Redis 加速通道供 fixus-stream 转发。Redis 通道已移除,
-    /// token 级流式暂不提供(事件级流式走 logdbd Subscribe)。保留为 no-op
-    /// 以兼容 fixlet 上报协议。
+    /// token 频率太高,不入 append-only 事件库;走 Redis ephemeral 快路径,
+    /// fixus-stream SUBSCRIBE 同一通道,与 logdbd 事件流 fan-in 转 SSE。
     pub async fn handle_llm_chunk(
         &self,
-        _session_id: &str,
-        _turn_id: i64,
-        _text: &str,
+        session_id: &str,
+        turn_id: i64,
+        text: &str,
     ) -> Result<()> {
+        self.token_publisher
+            .publish(
+                session_id,
+                turn_id,
+                &serde_json::json!({ "type": "llm_chunk", "text": text }).to_string(),
+            )
+            .await;
         Ok(())
     }
 

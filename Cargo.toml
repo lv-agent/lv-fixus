@@ -48,7 +48,8 @@ futures-util = "0.3"
 sha2 = "0.10"
 hex = "0.4"
 
-# Streaming (fixus-stream SSE 网关用)
+# Streaming — fixus-stream SSE 网关 + token 逐字流式(Redis ephemeral 快路径)
+redis = { version = "0.31", features = ["tokio-comp", "aio", "connection-manager"] }
 tokio-stream = "0.1"
 
 # Sandbox (Linux only)

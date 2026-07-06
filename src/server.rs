@@ -33,6 +33,7 @@ use crate::{context, recovery, service};
 pub struct AppState {
     pub store: Arc<dyn EventStore>,
     pub registry: Arc<SessionRegistry>,
+    pub token_publisher: Arc<crate::stream::TokenPublisher>,
 }
 
 // ── 错误转换 ────────────────────────────────────────────────────────────
@@ -75,9 +76,11 @@ pub async fn start() -> Result<(), AppError> {
     let store: Arc<dyn EventStore> = Arc::new(db);
 
     let registry = SessionRegistry::new();
+    let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
     let state = AppState {
         store,
         registry,
+        token_publisher,
     };
     let app = build_router(state);
 
@@ -114,7 +117,11 @@ fn stream_url_for(session_id: &str, turn_id: i64) -> Option<String> {
 
 /// 从 AppState 创建 Orchestrator
 fn orchestrator(state: &AppState) -> Orchestrator {
-    Orchestrator::new(state.store.clone(), state.registry.clone())
+    Orchestrator::new(
+        state.store.clone(),
+        state.registry.clone(),
+        (*state.token_publisher).clone(),
+    )
 }
 
 /// 构建 Axum Router
