@@ -685,7 +685,7 @@ impl EventStore for LogdbdEventStore {
         turn_id: i64,
     ) -> Result<Vec<StepExecution>> {
         let sql = format!(
-            "SELECT e_start.step_id, e_start.metadata_json AS start_meta, e_start.ts_ns AS started_ts, e_end.ts_ns AS ended_ts, e_end.event_type AS end_event FROM records e_start JOIN records e_end ON json_extract(e_end.metadata_json, '$.step_id') = json_extract(e_start.metadata_json, '$.step_id') AND e_end.event_type IN ('llm_completed','llm_failed','tool_completed','tool_failed') WHERE json_extract(e_start.metadata_json, '$.turn_id') = '{tid}' AND e_start.event_type IN ('llm_invoked','tool_invoked') ORDER BY e_start.seq ASC",
+            "SELECT json_extract(e_start.metadata_json, '$.step_id') AS step_id, e_start.content AS start_content, e_start.ts_ns AS started_ts, e_end.ts_ns AS ended_ts, e_end.event_type AS end_event FROM records e_start JOIN records e_end ON json_extract(e_end.metadata_json, '$.step_id') = json_extract(e_start.metadata_json, '$.step_id') AND e_end.event_type IN ('llm_completed','llm_failed','tool_completed','tool_failed') WHERE json_extract(e_start.metadata_json, '$.turn_id') = '{tid}' AND e_start.event_type IN ('llm_invoked','tool_invoked') ORDER BY e_start.seq ASC",
             tid = turn_id
         );
         let mut client = self.client.lock().await;
@@ -698,14 +698,21 @@ impl EventStore for LogdbdEventStore {
         for row_str in &rows {
             let v: serde_json::Value =
                 serde_json::from_str(row_str).unwrap_or_default();
-            let start_meta_str =
-                v["start_meta"].as_str().unwrap_or("{}");
-            let start_meta: serde_json::Value =
-                serde_json::from_str(start_meta_str).unwrap_or_default();
-            let step_type = start_meta
-                .get("step_type")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string());
+            // content 在 query 结果中为 hex 字符串(logdbd blob→hex);
+            // step_type 在事件 payload 里(metadata_json 不含它)。
+            let content_hex = v["start_content"].as_str().unwrap_or("");
+            let step_type = if content_hex.is_empty() || content_hex == "null" {
+                None
+            } else {
+                hex::decode(content_hex)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|p| {
+                        p.get("step_type")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                    })
+            };
             let started_ts = v["started_ts"].as_i64().unwrap_or(0);
             let ended_ts = v["ended_ts"].as_i64().unwrap_or(0);
             let duration_ms = if ended_ts > started_ts {
@@ -1298,6 +1305,70 @@ mod logdbd_tests {
             "expected LifecycleInvariant, got {:?}",
             err
         );
+    }
+
+    // ── get_turn_steps(回归:SQL 曾误引 records.step_id 列,见审计 E2)────────
+
+    #[tokio::test]
+    async fn get_turn_steps_pairs_invoked_completed() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-steps";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        // step-1: llm_invoked → llm_completed
+        let inv1 = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-1".into()),
+            EventType::LlmInvoked,
+            serde_json::json!({"step_type":"llm_call","model":"gpt-4","messages":[],"local_seq":1}),
+        );
+        store.write_event(&inv1).await.unwrap();
+        wait_seq(&store, sid, 2).await;
+        let comp1 = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-1".into()),
+            EventType::LlmCompleted,
+            serde_json::json!({"model":"gpt-4","local_seq":1,"content":"ok"}),
+        );
+        store.write_event(&comp1).await.unwrap();
+        wait_seq(&store, sid, 3).await;
+
+        // step-2: tool_invoked → tool_completed
+        let inv2 = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-2".into()),
+            EventType::ToolInvoked,
+            serde_json::json!({"step_type":"tool_call","tool_name":"Bash","tool_call_id":"c1","idempotency_key":"k","input":{},"local_seq":2}),
+        );
+        store.write_event(&inv2).await.unwrap();
+        wait_seq(&store, sid, 4).await;
+        let comp2 = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-2".into()),
+            EventType::ToolCompleted,
+            serde_json::json!({"tool_call_id":"c1","output":{},"is_error":false,"local_seq":2}),
+        );
+        store.write_event(&comp2).await.unwrap();
+        wait_seq(&store, sid, 5).await;
+
+        let steps = store.get_turn_steps(sid, 1).await.unwrap();
+        assert_eq!(steps.len(), 2, "应有 2 个 step(1 llm + 1 tool),got {}", steps.len());
+        // ORDER BY e_start.seq ASC → step-1 在前
+        assert_eq!(steps[0].step_id, "step-1");
+        assert_eq!(steps[0].end_event.as_deref(), Some("llm_completed"));
+        assert_eq!(steps[0].step_type.as_deref(), Some("llm_call"));
+        assert!(steps[0].ended_at.is_some(), "ended_at 应存在");
+        assert_eq!(steps[1].step_id, "step-2");
+        assert_eq!(steps[1].end_event.as_deref(), Some("tool_completed"));
+        assert_eq!(steps[1].step_type.as_deref(), Some("tool_call"));
+
+        // 过滤 turn_id:查不存在的 turn 应返回空
+        assert!(store.get_turn_steps(sid, 99).await.unwrap().is_empty());
     }
 
     // ── Seq 连续性 ────────────────────────────────────────────────────────────
