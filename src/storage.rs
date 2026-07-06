@@ -1047,3 +1047,387 @@ impl EventStore for LogdbdEventStore {
     }
 }
 
+// ── 集成测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod logdbd_tests {
+    //! LogdbdEventStore 集成测试 — 起真实 logdbd(内嵌 lib + Indexer)验证 EventStore 契约。
+    //!
+    //! 与 logdb-client/tests/integration.rs 的关键区别:本 harness 额外启动 Indexer
+    //! 后台线程。query() RPC 读 per-stream SQLite 缓存,该缓存由 Indexer 异步填充
+    //!(~10ms 轮询 logdb durable_cursor);不启动 Indexer 则所有 query 返回空。
+    //! 故每次 append 后用 `wait_seq` 轮询缓存追平,再断言/写下一个依赖事件。
+
+    use super::{EventStore, LogdbdEventStore};
+    use crate::error::AppError;
+    use crate::models::{AgentEvent, EventType};
+
+    use logdbd::cache::Indexer;
+    use logdbd::catalog::Catalog;
+    use logdbd::config::CacheConfig;
+    use logdbd::consumer::ConsumerTracker;
+    use logdbd::pb::log_db_service_server::LogDbServiceServer;
+    use logdbd::service::LogDbServiceImpl;
+    use logdbd::storage::Storage;
+    use logdbd::subscribe::SubscribeHub;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    const NS: &str = "fixus-test";
+
+    fn test_storage(dir: &std::path::Path) -> Storage {
+        let mut cfg = logdb::Config::default();
+        cfg.data_dir = dir.to_path_buf();
+        cfg.durability_mode = logdb::DurabilityMode::Sync;
+        cfg.ring_size = 256;
+        cfg.shards = 1;
+        cfg.flush_timeout = Duration::from_secs(5);
+        let db = logdb::LogDb::open(cfg).unwrap();
+        Storage::new(db, 1)
+    }
+
+    /// 起一个真实 logdbd gRPC server(含 Indexer 后台线程)。
+    /// 返回 (addr, tempdir);tempdir 必须在测试期间存活(持有 data_dir + cache_dir)。
+    async fn start_server() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let storage = Arc::new(test_storage(dir.path()));
+        let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+        let subscribe_hub = Arc::new(SubscribeHub::new());
+        let consumer_tracker = Arc::new(ConsumerTracker::new(None));
+
+        // Indexer:轮询 logdb durable_cursor,把记录写进 per-stream SQLite 缓存。
+        // query() 读这个缓存 — 不启动 Indexer 则所有 query 返回空。
+        let indexer = Arc::new(Indexer::new(
+            storage.db_arc(),
+            Arc::clone(&catalog),
+            cache_dir.clone(),
+            &CacheConfig::default(),
+            Arc::clone(&subscribe_hub),
+        ));
+        indexer.clone().start();
+
+        let svc = LogDbServiceImpl::new(
+            Arc::clone(&storage),
+            Arc::clone(&catalog),
+            Arc::clone(&consumer_tracker),
+            Arc::clone(&subscribe_hub),
+            "test-node".into(),
+            "primary".into(),
+            cache_dir,
+        );
+        let svc = LogDbServiceServer::new(svc);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (addr, dir)
+    }
+
+    async fn setup() -> (LogdbdEventStore, tempfile::TempDir) {
+        let (addr, dir) = start_server().await;
+        let store = LogdbdEventStore::connect(&addr, NS).await.unwrap();
+        (store, dir)
+    }
+
+    /// 轮询直到 query 缓存的 max_seq >= expected(Indexer 异步追平)。
+    /// 这是测试与 logdbd 异步索引之间的同步点。
+    ///
+    /// 容忍瞬态 query 错误:Indexer 在处理某 stream 第一条记录时才建 `records`
+    /// 表,此前该 stream 的缓存 DB 不存在表,query 返回 "no such table"。
+    /// 这属正常竞态,轮询即可,不视作失败。
+    async fn wait_seq(store: &LogdbdEventStore, sid: &str, expected: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match store.get_max_seq(sid).await {
+                Ok(v) if v >= expected => return,
+                Ok(_) => {}
+                Err(_) => {} // 表尚未建(Indexer 未处理到)→ 继续等
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "cache did not catch up to seq {} for {} (last={:?})",
+                    expected,
+                    sid,
+                    store.get_max_seq(sid).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // ── Session 生命周期 ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_session_round_trip() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-create";
+        let ev = store
+            .create_session(sid, "tenant-a", "user-1", "claude-code", None)
+            .await
+            .unwrap();
+        assert_eq!(ev.event_type, EventType::SessionStarted);
+        assert_eq!(ev.seq, 1);
+
+        wait_seq(&store, sid, 1).await;
+        assert!(store.session_exists(sid).await.unwrap());
+
+        let s = store.get_session(sid).await.unwrap().unwrap();
+        assert_eq!(s.session_id, sid);
+        assert_eq!(s.tenant_id, "tenant-a");
+        assert_eq!(s.user_id, "user-1");
+        assert_eq!(s.agent_type, "claude-code");
+        assert!(!store.is_session_ended(sid).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_ended_detected() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-end";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+        assert!(!store.is_session_ended(sid).await.unwrap());
+
+        let end = AgentEvent::new(
+            sid.into(),
+            None,
+            None,
+            EventType::SessionEnded,
+            serde_json::json!({"reason": "done"}),
+        );
+        assert_eq!(store.write_event(&end).await.unwrap(), 2);
+        wait_seq(&store, sid, 2).await;
+        assert!(store.is_session_ended(sid).await.unwrap());
+    }
+
+    // ── 终态唯一性(B2)──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn terminal_uniqueness_rejects_duplicate_turn_terminal() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-turn-term";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        let ts = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            None,
+            EventType::TurnStarted,
+            serde_json::json!({"user_input": "hi", "redo_group": "rg1", "redo_count": 0}),
+        );
+        store.write_event(&ts).await.unwrap();
+        wait_seq(&store, sid, 2).await;
+
+        // 首个 turn terminal(completed)写入成功
+        let tc = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            None,
+            EventType::TurnCompleted,
+            serde_json::json!({"final_output": "done"}),
+        );
+        store.write_event(&tc).await.unwrap();
+        wait_seq(&store, sid, 3).await;
+
+        // 第二个 turn terminal(failed,同 turn_id)→ LifecycleInvariant
+        let tf = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            None,
+            EventType::TurnFailed,
+            serde_json::json!({"error_type": "boom", "error_message": "x"}),
+        );
+        let err = store.write_event(&tf).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::LifecycleInvariant(_)),
+            "expected LifecycleInvariant, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_uniqueness_rejects_duplicate_step_terminal() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-step-term";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        let inv = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-1".into()),
+            EventType::LlmInvoked,
+            serde_json::json!({"step_type":"llm_call","model":"gpt-4","messages":[],"local_seq":1}),
+        );
+        store.write_event(&inv).await.unwrap();
+        wait_seq(&store, sid, 2).await;
+
+        let comp = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-1".into()),
+            EventType::LlmCompleted,
+            serde_json::json!({"model":"gpt-4","local_seq":1,"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
+        );
+        store.write_event(&comp).await.unwrap();
+        wait_seq(&store, sid, 3).await;
+
+        // llm_failed 与已写入的 llm_completed 同 step_id → LifecycleInvariant
+        let fail = AgentEvent::new(
+            sid.into(),
+            Some(1),
+            Some("step-1".into()),
+            EventType::LlmFailed,
+            serde_json::json!({"error_type":"x","error_message":"y","local_seq":1}),
+        );
+        let err = store.write_event(&fail).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::LifecycleInvariant(_)),
+            "expected LifecycleInvariant, got {:?}",
+            err
+        );
+    }
+
+    // ── Seq 连续性 ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn seq_monotonic_and_no_gaps() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-seq";
+        assert_eq!(
+            store
+                .create_session(sid, "t", "u", "a", None)
+                .await
+                .unwrap()
+                .seq,
+            1
+        );
+
+        for tid in 1..=3i64 {
+            let e = AgentEvent::new(
+                sid.into(),
+                Some(tid),
+                None,
+                EventType::TurnStarted,
+                serde_json::json!({
+                    "user_input": format!("t{}", tid),
+                    "redo_group": format!("rg{}", tid),
+                    "redo_count": 0,
+                }),
+            );
+            let seq = store.write_event(&e).await.unwrap();
+            assert_eq!(seq, tid + 1, "seq must be contiguous");
+        }
+
+        wait_seq(&store, sid, 4).await;
+        assert_eq!(store.get_max_seq(sid).await.unwrap(), 4);
+        assert_eq!(store.get_max_turn_id(sid).await.unwrap(), 3);
+        let gaps = store.detect_seq_gaps(sid).await.unwrap();
+        assert!(gaps.is_empty(), "unexpected seq gaps: {:?}", gaps);
+    }
+
+    // ── 崩溃恢复:redo_group/redo_count 解析(B3)──────────────────────────
+
+    #[tokio::test]
+    async fn incomplete_turns_parse_redo_group() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-redo";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        // turn 7 started(带 redo_group/redo_count),未终止 → 应出现在 incomplete 列表
+        let ts = AgentEvent::new(
+            sid.into(),
+            Some(7),
+            None,
+            EventType::TurnStarted,
+            serde_json::json!({
+                "user_input": "x",
+                "redo_group": "rg-abc",
+                "redo_count": 2,
+            }),
+        );
+        store.write_event(&ts).await.unwrap();
+        wait_seq(&store, sid, 2).await;
+
+        let incomplete = store.get_incomplete_turns(sid).await.unwrap();
+        assert_eq!(incomplete.len(), 1, "turn 7 should be incomplete");
+        let t = &incomplete[0];
+        assert_eq!(t.turn_id, 7);
+        assert_eq!(t.redo_group, "rg-abc");
+        assert_eq!(t.redo_count, 2);
+    }
+
+    // ── 批写原子性(B4)──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_events_batch_returns_contiguous_seqs() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-batch";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        let events = vec![
+            AgentEvent::new(
+                sid.into(),
+                Some(1),
+                None,
+                EventType::TurnStarted,
+                serde_json::json!({"user_input":"hi","redo_group":"rg1","redo_count":0}),
+            ),
+            AgentEvent::new(
+                sid.into(),
+                Some(1),
+                Some("s1".into()),
+                EventType::LlmInvoked,
+                serde_json::json!({"step_type":"llm_call","model":"gpt-4","messages":[],"local_seq":1}),
+            ),
+            AgentEvent::new(
+                sid.into(),
+                Some(1),
+                Some("s1".into()),
+                EventType::LlmCompleted,
+                serde_json::json!({"model":"gpt-4","local_seq":1,"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}),
+            ),
+        ];
+        let seqs = store.write_events_batch(&events).await.unwrap();
+        assert_eq!(seqs, vec![2, 3, 4]);
+        wait_seq(&store, sid, 4).await;
+
+        let tev = store.get_turn_events(sid, 1).await.unwrap();
+        assert_eq!(tev.len(), 3, "turn events read back via query");
+    }
+
+    // ── gRPC read 路径 ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_event_reads_back_via_grpc() {
+        let (store, _dir) = setup().await;
+        let sid = "sess-read";
+        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        wait_seq(&store, sid, 1).await;
+
+        // get_event 走原生 gRPC read(不经 query cache)
+        let ev = store.get_event(sid, 1).await.unwrap().unwrap();
+        assert_eq!(ev.event_type, EventType::SessionStarted);
+        assert_eq!(ev.seq, 1);
+        assert_eq!(ev.payload["agent_type"], "a");
+        assert_eq!(ev.payload["user_id"], "u");
+
+        // 不存在的 seq → None
+        assert!(store.get_event(sid, 999).await.unwrap().is_none());
+    }
+}
+
