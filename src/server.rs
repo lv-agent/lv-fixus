@@ -624,8 +624,8 @@ async fn handle_fixlet_ws(
     // 创建 mpsc channel 用于 orchestrator → fixlet 的下行消息
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // 当前连接的 session_id（收到 register 后确定）
-    let mut current_session: Option<String> = None;
+    // 当前连接服务的 agent_type(收到 register 后确定,用于按 agent_type 路由)
+    let mut current_agent_type: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -639,12 +639,18 @@ async fn handle_fixlet_ws(
                             let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                             match msg_type {
-                                // fixlet 注册自己服务的 session
+                                // fixlet 注册自己服务的 agent_type(按 agent_type 路由,
+                                // 不再绑定具体 session_id)
                                 "register" => {
-                                    if let Some(sid) = parsed.get("session_id").and_then(|v| v.as_str()) {
-                                        tracing::info!("fixlet registered for session {}", sid);
-                                        current_session = Some(sid.to_string());
-                                        state.registry.register_fixlet(sid, msg_tx.clone()).await;
+                                    if let Some(at) = parsed.get("agent_type").and_then(|v| v.as_str()) {
+                                        tracing::info!("fixlet registered for agent_type {}", at);
+                                        current_agent_type = Some(at.to_string());
+                                        state.registry.register_fixlet(at, msg_tx.clone()).await;
+                                    } else {
+                                        tracing::warn!(
+                                            "fixlet register missing agent_type: {}",
+                                            text_str
+                                        );
                                     }
                                 }
 
@@ -761,9 +767,9 @@ async fn handle_fixlet_ws(
         }
     }
 
-    // fixlet 断连时清理
-    if let Some(ref sid) = current_session {
-        state.registry.unregister_fixlet(sid).await;
+    // fixlet 断连时清理(按 agent_type 注销 + 快速失败该类型 pending turn)
+    if let Some(ref at) = current_agent_type {
+        state.registry.unregister_fixlet(at).await;
     }
 }
 

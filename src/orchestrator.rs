@@ -111,6 +111,17 @@ impl Orchestrator {
         }
     }
 
+    /// 解析 session 的 agent_type(用于按 agent_type 路由到 fixlet)。
+    /// agent_type 是 session 创建时落库的独立业务字段,非事件派生。
+    async fn resolve_agent_type(&self, session_id: &str) -> Result<String> {
+        let session = self
+            .store
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?;
+        Ok(session.agent_type)
+    }
+
     // ── Turn 执行入口 ────────────────────────────────────────────────
 
     /// 执行一个完整的 Turn
@@ -172,25 +183,37 @@ impl Orchestrator {
         // 3. 构建 context（只构建一次，传递给 dispatch）
         let ctx = context::build_llm_context(&*self.store, session_id).await?;
 
-        // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知）
-        let (pending, result_rx) =
-            PendingTurn::new(session_id.to_string(), turn_id, redo_group.to_string());
+        // 3b. 解析 agent_type —— 按 agent_type 路由到 fixlet(不再按 session_id)
+        let agent_type = self.resolve_agent_type(session_id).await?;
+
+        // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知;记录 agent_type 便于 fixlet 断连快速失败）
+        let (pending, result_rx) = PendingTurn::new(
+            session_id.to_string(),
+            agent_type.clone(),
+            turn_id,
+            redo_group.to_string(),
+        );
         self.registry
             .register_pending_turn(session_id, pending)
             .await;
 
-        // 5. 检查 fixlet 是否已连接
-        if self.registry.get_fixlet_sender(session_id).await.is_none() {
+        // 5. 检查服务于该 agent_type 的 fixlet 是否已连接
+        if self
+            .registry
+            .get_fixlet_for_agent_type(&agent_type)
+            .await
+            .is_none()
+        {
             self.fail_turn_and_respond(
                 session_id,
                 turn_id,
                 "no_fixlet",
-                "No fixlet connected for this session",
+                &format!("No fixlet connected for agent_type {}", agent_type),
             )
             .await?;
             return Err(AppError::Protocol(format!(
-                "No fixlet connected for session {}",
-                session_id
+                "No fixlet connected for agent_type {} (session {})",
+                agent_type, session_id
             )));
         }
 
@@ -332,6 +355,19 @@ impl Orchestrator {
             let mut redo_success = 0;
             let mut redo_failed = 0;
 
+            // agent_type 是 session 级常量,循环外解析一次(按 agent_type 路由 redo)
+            let agent_type = match orch.resolve_agent_type(&session_id).await {
+                Ok(at) => at,
+                Err(e) => {
+                    tracing::error!(
+                        "session {}: recovery cannot resolve agent_type: {}",
+                        session_id,
+                        e
+                    );
+                    return;
+                }
+            };
+
             for redo_ctx in &redo_queue {
                 tracing::info!(
                     "session {}: redo turn {} redo_count={} redo_group={}",
@@ -343,6 +379,7 @@ impl Orchestrator {
 
                 let (pending, result_rx) = PendingTurn::new(
                     session_id.clone(),
+                    agent_type.clone(),
                     redo_ctx.turn_id,
                     redo_ctx.redo_group.clone(),
                 );
@@ -509,8 +546,10 @@ impl Orchestrator {
             "redo_count": redo_count,
         });
 
+        // 按 session 的 agent_type 路由到对应 fixlet
+        let agent_type = self.resolve_agent_type(session_id).await?;
         self.registry
-            .send_to_fixlet(session_id, &msg.to_string())
+            .send_to_fixlet_for_agent_type(&agent_type, &msg.to_string())
             .await
             .map_err(|e| {
                 AppError::Protocol(format!("Failed to dispatch execute_turn: {}", e))
@@ -656,14 +695,27 @@ impl Orchestrator {
             "duration_ms": duration_ms,
         });
 
+        // tool_result 也按 agent_type 路由回对应 fixlet
+        let agent_type = match self.resolve_agent_type(session_id).await {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::error!(
+                    "session {}: cannot resolve agent_type for tool_result: {}",
+                    session_id,
+                    e
+                );
+                return;
+            }
+        };
         if let Err(e) = self
             .registry
-            .send_to_fixlet(session_id, &result_msg.to_string())
+            .send_to_fixlet_for_agent_type(&agent_type, &result_msg.to_string())
             .await
         {
             tracing::error!(
-                "session {}: failed to send tool_result to fixlet: {}",
+                "session {}: failed to send tool_result to fixlet (agent_type {}): {}",
                 session_id,
+                agent_type,
                 e
             );
         }

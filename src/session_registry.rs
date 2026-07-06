@@ -1,8 +1,12 @@
-//! Session Registry — 活跃 Session 与 fixlet 连接管理
+//! Session Registry — fixlet 连接 + 活跃 Turn 管理
 //!
 //! 维护两个映射：
-//! - session_id → fixlet WebSocket sender（路由消息给 fixlet）
-//! - session_id → PendingTurn（Turn 完成时通知 HTTP handler）
+//! - **agent_type → fixlet WebSocket sender**(按 agent_type 路由 execute_turn 给 fixlet)
+//! - session_id → PendingTurn(Turn 完成时通知 HTTP handler;turn 属 session,仍按 session_id)
+//!
+//! 为什么按 agent_type 而非 session_id:上游(如 nuntius)每次创建随机 session_id,
+//! 但 fixlet 实例按它服务的 agent_type 注册。按 agent_type 路由让任意同类型 session
+//! 都能命中对应 fixlet,无需 session_id 协调。
 //!
 //! 线程安全：使用 RwLock，写少读多。
 
@@ -40,6 +44,8 @@ pub enum TurnOutcome {
 /// 一个正在等待结果的 Turn
 pub struct PendingTurn {
     pub session_id: String,
+    /// 该 turn 所属 session 的 agent_type(fixlet 断连时按它快速失败同类型 pending turn)
+    pub agent_type: String,
     pub turn_id: i64,
     pub redo_group: String,
     /// Turn 完成时通知 HTTP handler
@@ -49,6 +55,7 @@ pub struct PendingTurn {
 impl PendingTurn {
     pub fn new(
         session_id: String,
+        agent_type: String,
         turn_id: i64,
         redo_group: String,
     ) -> (Self, oneshot::Receiver<TurnOutcome>) {
@@ -56,6 +63,7 @@ impl PendingTurn {
         (
             Self {
                 session_id,
+                agent_type,
                 turn_id,
                 redo_group,
                 result_tx: tx,
@@ -67,10 +75,10 @@ impl PendingTurn {
 
 // ── SessionRegistry ─────────────────────────────────────────────────────
 
-/// 全局 Session → fixlet 连接注册表
+/// 全局 fixlet 连接注册表(按 agent_type 路由)+ 活跃 Turn
 pub struct SessionRegistry {
-    /// session_id → fixlet WebSocket sender
-    sessions: RwLock<HashMap<String, WsSender>>,
+    /// agent_type → fixlet WebSocket sender(一种 agent_type 一个 fixlet;worker-pool 待扩展)
+    by_agent_type: RwLock<HashMap<String, WsSender>>,
     /// session_id → 当前活跃的 PendingTurn
     active_turns: RwLock<HashMap<String, PendingTurn>>,
 }
@@ -78,55 +86,71 @@ pub struct SessionRegistry {
 impl SessionRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            sessions: RwLock::new(HashMap::new()),
+            by_agent_type: RwLock::new(HashMap::new()),
             active_turns: RwLock::new(HashMap::new()),
         })
     }
 
-    // ── fixlet 连接管理 ──
+    // ── fixlet 连接管理(按 agent_type)──
 
-    /// fixlet 连接时注册（一个 fixlet 服务一个 session）
-    pub async fn register_fixlet(&self, session_id: &str, sender: WsSender) {
-        let mut sessions = self.sessions.write().await;
-        let old = sessions.insert(session_id.to_string(), sender);
+    /// fixlet 连接时注册它服务的 agent_type(一种 agent_type 一个 fixlet)
+    pub async fn register_fixlet(&self, agent_type: &str, sender: WsSender) {
+        let mut map = self.by_agent_type.write().await;
+        let old = map.insert(agent_type.to_string(), sender);
         if old.is_some() {
             tracing::info!(
-                "session {}: fixlet reconnected (old connection replaced)",
-                session_id
+                "agent_type {}: fixlet reconnected (old connection replaced)",
+                agent_type
             );
         } else {
-            tracing::info!("session {}: fixlet registered", session_id);
+            tracing::info!("agent_type {}: fixlet registered", agent_type);
         }
     }
 
-    /// fixlet 断开时注销
-    pub async fn unregister_fixlet(&self, session_id: &str) {
-        let mut sessions = self.sessions.write().await;
-        sessions.remove(session_id);
-        tracing::info!("session {}: fixlet unregistered", session_id);
+    /// fixlet 断开时注销其 agent_type,并快速失败该类型下所有 pending turn
+    /// (fixlet 已断,继续等只会拖到 turn 超时;主动通知 HTTP handler)
+    pub async fn unregister_fixlet(&self, agent_type: &str) {
+        self.by_agent_type.write().await.remove(agent_type);
 
-        // 清理该 session 的 pending turn（会 dropped oneshot → HTTP 返回错误）
         let mut turns = self.active_turns.write().await;
-        turns.remove(session_id);
+        let to_fail: Vec<String> = turns
+            .iter()
+            .filter(|(_, p)| p.agent_type == agent_type)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in to_fail {
+            if let Some(p) = turns.remove(&sid) {
+                let _ = p.result_tx.send(TurnOutcome::Failed {
+                    turn_id: p.turn_id,
+                    error_type: "fixlet_disconnected".into(),
+                    error_message: format!("fixlet for agent_type {} disconnected", agent_type),
+                });
+            }
+        }
+        tracing::info!("agent_type {}: fixlet unregistered", agent_type);
     }
 
-    /// 查找 session 对应的 fixlet 发送通道
-    pub async fn get_fixlet_sender(&self, session_id: &str) -> Option<WsSender> {
-        let sessions = self.sessions.read().await;
-        sessions.get(session_id).cloned()
+    /// 查找服务于指定 agent_type 的 fixlet 发送通道
+    pub async fn get_fixlet_for_agent_type(&self, agent_type: &str) -> Option<WsSender> {
+        let map = self.by_agent_type.read().await;
+        map.get(agent_type).cloned()
     }
 
-    /// 向指定 session 的 fixlet 发送消息
-    pub async fn send_to_fixlet(&self, session_id: &str, msg: &str) -> Result<(), String> {
+    /// 向服务于指定 agent_type 的 fixlet 发送消息
+    pub async fn send_to_fixlet_for_agent_type(
+        &self,
+        agent_type: &str,
+        msg: &str,
+    ) -> Result<(), String> {
         let sender = self
-            .get_fixlet_sender(session_id)
+            .get_fixlet_for_agent_type(agent_type)
             .await
-            .ok_or_else(|| format!("No fixlet connected for session {}", session_id))?;
+            .ok_or_else(|| format!("No fixlet connected for agent_type {}", agent_type))?;
 
         sender.send(msg.to_string()).map_err(|e| {
             format!(
-                "Failed to send message to fixlet for session {}: {}",
-                session_id, e
+                "Failed to send message to fixlet for agent_type {}: {}",
+                agent_type, e
             )
         })
     }
@@ -194,10 +218,10 @@ mod tests {
         let registry = SessionRegistry::new();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("sess_1", tx).await;
+        registry.register_fixlet("database.repair", tx).await;
 
         registry
-            .send_to_fixlet("sess_1", "hello")
+            .send_to_fixlet_for_agent_type("database.repair", "hello")
             .await
             .unwrap();
 
@@ -206,9 +230,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_to_unknown_session_fails() {
+    async fn test_send_to_unknown_agent_type_fails() {
         let registry = SessionRegistry::new();
-        let result = registry.send_to_fixlet("nonexistent", "msg").await;
+        let result = registry
+            .send_to_fixlet_for_agent_type("nonexistent", "msg")
+            .await;
         assert!(result.is_err());
     }
 
@@ -217,21 +243,20 @@ mod tests {
         let registry = SessionRegistry::new();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("sess_1", tx).await;
-        assert!(registry.get_fixlet_sender("sess_1").await.is_some());
+        registry.register_fixlet("database.repair", tx).await;
+        assert!(registry.get_fixlet_for_agent_type("database.repair").await.is_some());
 
-        registry.unregister_fixlet("sess_1").await;
-        assert!(registry.get_fixlet_sender("sess_1").await.is_none());
+        registry.unregister_fixlet("database.repair").await;
+        assert!(registry.get_fixlet_for_agent_type("database.repair").await.is_none());
     }
 
     #[tokio::test]
     async fn test_pending_turn_lifecycle() {
         let registry = SessionRegistry::new();
 
-        let (pending, mut rx) = PendingTurn::new("sess_1".into(), 1, "rg_001".into());
-        registry
-            .register_pending_turn("sess_1", pending)
-            .await;
+        let (pending, mut rx) =
+            PendingTurn::new("sess_1".into(), "database.repair".into(), 1, "rg_001".into());
+        registry.register_pending_turn("sess_1", pending).await;
 
         // 完成 Turn
         registry
@@ -259,21 +284,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unregister_drops_pending_turn() {
+    async fn test_unregister_fails_pending_turns_of_agent_type() {
         let registry = SessionRegistry::new();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("sess_1", tx).await;
+        registry.register_fixlet("database.repair", tx).await;
 
-        let (pending, mut rx) = PendingTurn::new("sess_1".into(), 1, "rg_001".into());
-        registry
-            .register_pending_turn("sess_1", pending)
-            .await;
+        // 两个同 agent_type 的 session 都有 pending turn
+        let (p1, mut rx1) =
+            PendingTurn::new("sess_a".into(), "database.repair".into(), 1, "rg1".into());
+        let (p2, mut rx2) =
+            PendingTurn::new("sess_b".into(), "database.repair".into(), 1, "rg2".into());
+        // 另一种 agent_type 的 pending turn 不应被动
+        let (p3, mut rx3) =
+            PendingTurn::new("sess_c".into(), "deploy.service".into(), 1, "rg3".into());
+        registry.register_pending_turn("sess_a", p1).await;
+        registry.register_pending_turn("sess_b", p2).await;
+        registry.register_pending_turn("sess_c", p3).await;
 
-        // fixlet 断开 → pending turn 被清理
-        registry.unregister_fixlet("sess_1").await;
+        // database.repair 的 fixlet 断开 → 该类型 pending turn 快速失败,deploy.service 不受影响
+        registry.unregister_fixlet("database.repair").await;
 
-        // oneshot 被 dropped
-        assert!(rx.try_recv().is_err());
+        match rx1.try_recv().unwrap() {
+            TurnOutcome::Failed { error_type, .. } => assert_eq!(error_type, "fixlet_disconnected"),
+            other => panic!("Expected Failed for sess_a, got {:?}", other),
+        }
+        assert!(matches!(
+            rx2.try_recv().unwrap(),
+            TurnOutcome::Failed { .. }
+        ));
+        // deploy.service 的 turn 仍在等待
+        assert!(rx3.try_recv().is_err());
+        assert!(registry.take_pending_turn("sess_c").await.is_some());
     }
 }
