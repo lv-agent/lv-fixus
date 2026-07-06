@@ -33,7 +33,6 @@ use crate::{context, recovery, service};
 pub struct AppState {
     pub store: Arc<dyn EventStore>,
     pub registry: Arc<SessionRegistry>,
-    pub stream: Arc<crate::stream::StreamPublisher>,
 }
 
 // ── 错误转换 ────────────────────────────────────────────────────────────
@@ -76,11 +75,9 @@ pub async fn start() -> Result<(), AppError> {
     let store: Arc<dyn EventStore> = Arc::new(db);
 
     let registry = SessionRegistry::new();
-    let stream = Arc::new(crate::stream::StreamPublisher::new().await);
     let state = AppState {
         store,
         registry,
-        stream,
     };
     let app = build_router(state);
 
@@ -104,15 +101,20 @@ pub async fn start() -> Result<(), AppError> {
 }
 
 /// 流式端点 URL（环境变量 FIXUS_STREAM_URL，未设置时流式不可用）
-fn stream_url_for(turn_id: i64) -> Option<String> {
+fn stream_url_for(session_id: &str, turn_id: i64) -> Option<String> {
     std::env::var("FIXUS_STREAM_URL").ok().map(|base| {
-        format!("{}/turns/{}/stream", base.trim_end_matches('/'), turn_id)
+        format!(
+            "{}/sessions/{}/turns/{}/stream",
+            base.trim_end_matches('/'),
+            session_id,
+            turn_id
+        )
     })
 }
 
 /// 从 AppState 创建 Orchestrator
 fn orchestrator(state: &AppState) -> Orchestrator {
-    Orchestrator::new(state.store.clone(), state.registry.clone(), (*state.stream).clone())
+    Orchestrator::new(state.store.clone(), state.registry.clone())
 }
 
 /// 构建 Axum Router
@@ -299,7 +301,7 @@ async fn start_turn_handler(
             "turn_id": turn_id,
             "final_output": final_output,
             "event_count": event_count,
-            "stream_url": stream_url_for(turn_id),
+            "stream_url": stream_url_for(&session_id, turn_id),
         })))),
         TurnOutcome::Failed {
             turn_id,

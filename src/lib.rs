@@ -15,7 +15,6 @@ pub mod sandbox;
 pub mod sandbox_client;
 pub mod session_registry;
 pub mod orchestrator;
-pub mod stream;
 
 // 重新导出核心类型
 pub use error::{AppError, Result};

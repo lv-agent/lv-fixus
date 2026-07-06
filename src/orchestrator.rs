@@ -84,21 +84,14 @@ pub struct Orchestrator {
     registry: Arc<SessionRegistry>,
     /// Turn 级超时（默认 5 分钟）
     turn_timeout: Duration,
-    /// 流式发布器（可选，REDIS_URL 未设置时为空操作）
-    stream: crate::stream::StreamPublisher,
 }
 
 impl Orchestrator {
-    pub fn new(
-        store: Arc<dyn EventStore>,
-        registry: Arc<SessionRegistry>,
-        stream: crate::stream::StreamPublisher,
-    ) -> Self {
+    pub fn new(store: Arc<dyn EventStore>, registry: Arc<SessionRegistry>) -> Self {
         Self {
             store,
             registry,
             turn_timeout: Duration::from_secs(300),
-            stream,
         }
     }
 
@@ -221,7 +214,6 @@ impl Orchestrator {
     fn spawn_background_recovery(&self, session_id: String) {
         let store = self.store.clone();
         let registry = self.registry.clone();
-        let stream = self.stream.clone();
         let turn_timeout = self.turn_timeout;
 
         tokio::spawn(async move {
@@ -245,7 +237,6 @@ impl Orchestrator {
                 store: store.clone(),
                 registry: registry.clone(),
                 turn_timeout,
-                stream,
             };
 
             let mut redo_success = 0;
@@ -556,11 +547,6 @@ impl Orchestrator {
         }
     }
 
-    /// 发布流式事件到 Redis（fire & forget）
-    async fn stream_publish(&self, session_id: &str, turn_id: i64, event_json: &str) {
-        self.stream.publish(session_id, turn_id, event_json).await;
-    }
-
     /// 回传 tool_result 到 fixlet
     async fn send_tool_result_to_fixlet(
         &self,
@@ -597,19 +583,15 @@ impl Orchestrator {
 
     /// 处理 fixlet 上报的 llm_chunk（流式 token）
     ///
-    /// 不写 WAL，仅发布到 Redis 加速通道。
+    /// 历史:曾发布到 Redis 加速通道供 fixus-stream 转发。Redis 通道已移除,
+    /// token 级流式暂不提供(事件级流式走 logdbd Subscribe)。保留为 no-op
+    /// 以兼容 fixlet 上报协议。
     pub async fn handle_llm_chunk(
         &self,
-        session_id: &str,
-        turn_id: i64,
-        text: &str,
+        _session_id: &str,
+        _turn_id: i64,
+        _text: &str,
     ) -> Result<()> {
-        let event_json = serde_json::json!({
-            "type": "llm_chunk",
-            "text": text,
-        });
-        self.stream_publish(session_id, turn_id, &event_json.to_string())
-            .await;
         Ok(())
     }
 
@@ -654,13 +636,6 @@ impl Orchestrator {
             output_tokens,
             total_tokens
         );
-
-        self.stream_publish(
-            session_id,
-            turn_id,
-            &serde_json::json!({"type":"llm_completed","input_tokens":input_tokens,"output_tokens":output_tokens,"total_tokens":total_tokens}).to_string(),
-        )
-        .await;
 
         Ok(())
     }
@@ -720,14 +695,6 @@ impl Orchestrator {
             turn_id,
             event_count
         );
-
-        // 流式发布
-        self.stream_publish(
-            session_id,
-            turn_id,
-            &serde_json::json!({"type":"turn_completed","final_output":final_output}).to_string(),
-        )
-        .await;
 
         Ok(())
     }
