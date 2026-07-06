@@ -13,13 +13,10 @@ axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
-# Database — 开发阶段使用 SQLite，PostgreSQL 支持保留
-sqlx = { version = "0.8", features = [
-    "runtime-tokio",
-    "sqlite",
-    "chrono",
-    "uuid",
-] }
+# logdbd — append-only log database (gRPC + SQL query cache)
+logdb-client = { path = "../../logdb/lv-logdb/logdb-client" }
+logdbd-proto = { path = "../../logdb/lv-logdb/logdbd-proto" }
+tonic = "0.12"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

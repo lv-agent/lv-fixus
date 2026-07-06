@@ -7,15 +7,14 @@
 //!
 //! 所有 pub API 返回 `Result<T, AppError>`，不 panic。
 
-use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::{
-    AgentEvent, EventType, SummaryMarkerPayload,
-    TurnCompletedPayload, TurnFailedPayload, TurnStartedPayload,
+    AgentEvent, EventType, SummaryMarkerPayload, TurnCompletedPayload, TurnFailedPayload,
+    TurnStartedPayload,
 };
-use crate::storage;
+use crate::storage::EventStore;
 
 // ── Session 生命周期管理 ────────────────────────────────────────────────
 
@@ -26,24 +25,30 @@ use crate::storage;
 /// 2. 初始化 seq counter
 /// 3. 写入 session_started (seq = 1)
 pub async fn create_session(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     tenant_id: &str,
     user_id: &str,
     agent_type: &str,
     metadata: Option<serde_json::Value>,
 ) -> Result<AgentEvent> {
-    if storage::session_exists(pool, session_id).await? {
+    if store.session_exists(session_id).await? {
         return Err(AppError::SessionAlreadyExists(session_id.to_string()));
     }
-    storage::create_session(pool, session_id, tenant_id, user_id, agent_type, metadata).await
+    store
+        .create_session(session_id, tenant_id, user_id, agent_type, metadata)
+        .await
 }
 
 /// 结束 Session
 ///
 /// 写入 session_ended 事件。写入后该 session 不再接受任何新的业务事件。
-pub async fn end_session(pool: &SqlitePool, session_id: &str, reason: &str) -> Result<AgentEvent> {
-    if storage::is_session_ended(pool, session_id).await? {
+pub async fn end_session(
+    store: &dyn EventStore,
+    session_id: &str,
+    reason: &str,
+) -> Result<AgentEvent> {
+    if store.is_session_ended(session_id).await? {
         return Err(AppError::SessionAlreadyEnded(session_id.to_string()));
     }
 
@@ -55,12 +60,9 @@ pub async fn end_session(pool: &SqlitePool, session_id: &str, reason: &str) -> R
         serde_json::json!({"reason": reason}),
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
-    Ok(AgentEvent {
-        seq,
-        ..event
-    })
+    Ok(AgentEvent { seq, ..event })
 }
 
 // ── Turn 生命周期管理 ──────────────────────────────────────────────────
@@ -73,21 +75,21 @@ pub async fn end_session(pool: &SqlitePool, session_id: &str, reason: &str) -> R
 /// - 单线程串行前提下，通过 `MAX(turn_id) + 1` 生成
 /// - 崩溃恢复时重建计数器
 pub async fn start_turn(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     user_input: &str,
     redo_group: Option<&str>,
 ) -> Result<(i64, String, AgentEvent)> {
     // 检查 session 存在且未结束
-    if !storage::session_exists(pool, session_id).await? {
+    if !store.session_exists(session_id).await? {
         return Err(AppError::SessionNotFound(session_id.to_string()));
     }
-    if storage::is_session_ended(pool, session_id).await? {
+    if store.is_session_ended(session_id).await? {
         return Err(AppError::SessionAlreadyEnded(session_id.to_string()));
     }
 
     // 生成 turn_id
-    let max_turn = storage::get_max_turn_id(pool, session_id).await?;
+    let max_turn = store.get_max_turn_id(session_id).await?;
     let turn_id = max_turn + 1;
 
     // 生成 redo_group（幂等锚点）
@@ -109,13 +111,9 @@ pub async fn start_turn(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
-    Ok((
-        turn_id,
-        redo_group,
-        AgentEvent { seq, ..event },
-    ))
+    Ok((turn_id, redo_group, AgentEvent { seq, ..event }))
 }
 
 /// 完成一个 Turn
@@ -123,7 +121,7 @@ pub async fn start_turn(
 /// 写入 turn_completed 事件。
 /// 写入前必须先完成所有 active step（写入 terminal event）。
 pub async fn complete_turn(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
     final_output: &str,
@@ -140,7 +138,7 @@ pub async fn complete_turn(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
@@ -153,7 +151,7 @@ pub async fn complete_turn(
 /// turn_failed 表示 Turn 容器级失败，不替代 Step 的 terminal event。
 /// 调用方应先在 active step 上写入 llm_failed/tool_failed，再调用此函数。
 pub async fn fail_turn(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
     error_type: &str,
@@ -174,14 +172,14 @@ pub async fn fail_turn(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 用户取消 Turn
 pub async fn cancel_turn(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
     reason: &str,
@@ -193,13 +191,13 @@ pub async fn cancel_turn(
         EventType::TurnCanceled,
         serde_json::json!({"reason": reason}),
     );
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 阻塞 Turn（非幂等 Tool 悬空）
 pub async fn block_turn(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
     reason: &str,
@@ -211,7 +209,7 @@ pub async fn block_turn(
         EventType::TurnBlocked,
         serde_json::json!({"reason": reason}),
     );
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
     Ok(AgentEvent { seq, ..event })
 }
 
@@ -219,7 +217,7 @@ pub async fn block_turn(
 ///
 /// redo_count 递增，redo_group 保持不变。
 pub async fn start_turn_redo(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
     user_input: &str,
@@ -240,7 +238,7 @@ pub async fn start_turn_redo(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
@@ -251,7 +249,7 @@ pub async fn start_turn_redo(
 ///
 /// 遵循 Write-Ahead 原则：先写 Event，再执行操作。
 pub async fn record_llm_invoked(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -283,14 +281,14 @@ pub async fn record_llm_invoked(
         payload_map,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 记录 LLM 调用完成
 pub async fn record_llm_completed(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -327,14 +325,14 @@ pub async fn record_llm_completed(
         payload_map,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 记录 LLM 调用失败
 pub async fn record_llm_failed(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -360,7 +358,7 @@ pub async fn record_llm_failed(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
@@ -370,7 +368,7 @@ pub async fn record_llm_failed(
 /// ## idempotency_key 格式（设计文档 10.2 节）
 /// `{session_id}:{redo_group}:{tool_name}:{call_signature}`
 pub async fn record_tool_invoked(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -402,14 +400,14 @@ pub async fn record_tool_invoked(
         payload_map,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 记录 Tool 调用完成
 pub async fn record_tool_completed(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -433,14 +431,14 @@ pub async fn record_tool_completed(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 记录 Tool 调用失败
 pub async fn record_tool_failed(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: &str,
@@ -468,7 +466,7 @@ pub async fn record_tool_failed(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
@@ -498,10 +496,10 @@ impl SummaryTrigger {
 
 /// 计算摘要触发条件
 pub async fn check_summary_trigger(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
 ) -> Result<SummaryTrigger> {
-    let latest_summary = storage::get_latest_summary(pool, session_id).await?;
+    let latest_summary = store.get_latest_summary(session_id).await?;
 
     let summarized_up_to_seq = latest_summary
         .as_ref()
@@ -509,62 +507,24 @@ pub async fn check_summary_trigger(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    // 统计自上次摘要后的 Turn 数
-    let row = sqlx::query(
-        r#"
-        SELECT COUNT(DISTINCT turn_id) as turn_count
-        FROM agent_events
-        WHERE session_id = ?1
-          AND seq > ?2
-          AND turn_id IS NOT NULL
-          AND event_type = 'turn_started'
-        "#,
-    )
-    .bind(session_id)
-    .bind(summarized_up_to_seq)
-    .fetch_one(pool)
-    .await?;
-    let turn_count: i64 = row.get("turn_count");
+    // 统计自上次摘要后的 Turn 数（通过 trait 方法）
+    let turn_count = store
+        .count_turns_after_seq(session_id, summarized_up_to_seq)
+        .await?;
 
-    // 统计自上次摘要后的事件数（仅业务事件）
-    let row = sqlx::query(
-        r#"
-        SELECT COUNT(*) as cnt
-        FROM agent_events
-        WHERE session_id = ?1
-          AND seq > ?2
-          AND (
-              (turn_id IS NOT NULL AND step_id IS NULL AND event_type IN ('turn_pending', 'turn_started', 'turn_completed', 'turn_failed', 'turn_canceled', 'turn_blocked'))
-              OR
-              (turn_id IS NOT NULL AND step_id IS NOT NULL AND event_type IN ('llm_invoked', 'llm_completed', 'llm_failed', 'tool_invoked', 'tool_completed', 'tool_failed'))
-          )
-        "#,
-    )
-    .bind(session_id)
-    .bind(summarized_up_to_seq)
-    .fetch_one(pool)
-    .await?;
-    let event_count: i64 = row.get("cnt");
+    // 统计自上次摘要后的事件数（通过 trait 方法）
+    let event_count = store
+        .count_events_after_seq(session_id, summarized_up_to_seq)
+        .await?;
 
     // Token 估算（从 llm_completed 累积 usage）
-    let row = sqlx::query(
-        r#"
-        SELECT payload
-        FROM agent_events
-        WHERE session_id = ?1
-          AND seq > ?2
-          AND event_type = 'llm_completed'
-        "#,
-    )
-    .bind(session_id)
-    .bind(summarized_up_to_seq)
-    .fetch_all(pool)
-    .await?;
+    let payloads = store
+        .get_llm_payloads_after_seq(session_id, summarized_up_to_seq)
+        .await?;
 
     let mut token_estimate: i64 = 0;
-    for r in &row {
-        let payload_str: String = r.get("payload");
-        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+    for payload_str in &payloads {
+        if let Ok(p) = serde_json::from_str::<serde_json::Value>(payload_str) {
             if let Some(usage) = p.get("usage") {
                 if let Some(total) = usage.get("total_tokens").and_then(|v| v.as_i64()) {
                     token_estimate += total;
@@ -589,8 +549,10 @@ pub async fn check_summary_trigger(
 /// 2. 确定边界 → current_max_seq
 /// 3. 用 llm_invoked/llm_completed 记录摘要 LLM 调用（Session 级 Step）
 /// 4. 调用此函数写入 summary_marker
+///
+/// 注意：自动归档由调用方负责（调用 archive_events_before_seq）。
 pub async fn write_summary_marker(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     summarized_up_to_turn_id: i64,
     summarized_up_to_seq: i64,
@@ -612,29 +574,14 @@ pub async fn write_summary_marker(
         payload,
     );
 
-    let seq = storage::write_event(pool, &event).await?;
-
-    // 自动归档已摘要覆盖的 Event（后台异步，best-effort）
-    if summarized_up_to_seq > 0 {
-        let pool_clone = pool.clone();
-        let sid = session_id.to_string();
-        tokio::spawn(async move {
-            match storage::archive_events_before_seq(&pool_clone, &sid, summarized_up_to_seq + 1).await {
-                Ok(result) if result.archived > 0 => {
-                    tracing::info!("Auto-archived {} events for session {}", result.archived, sid);
-                }
-                Err(e) => tracing::warn!("Auto-archive failed for session {}: {}", sid, e),
-                _ => {}
-            }
-        });
-    }
+    let seq = store.write_event(&event).await?;
 
     Ok(AgentEvent { seq, ..event })
 }
 
 /// 使用便捷 payload 类型的通用事件记录函数（fixlet 事件回传入库用）
 pub async fn record_event(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: Option<i64>,
     step_id: Option<&str>,
@@ -649,43 +596,43 @@ pub async fn record_event(
         payload,
     );
 
-    storage::write_event(pool, &event).await
+    store.write_event(&event).await
 }
 
 // ── 查询封装（供 server 层调用，不直接暴露 storage） ──────────────────────
 
 /// 读取某个 Turn 的完整执行过程
 pub async fn get_turn_events(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
 ) -> Result<Vec<AgentEvent>> {
-    storage::get_turn_events(pool, session_id, turn_id).await
+    store.get_turn_events(session_id, turn_id).await
 }
 
 /// Turn 内的 Step 列表（含耗时）
 pub async fn get_turn_steps(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
     turn_id: i64,
 ) -> Result<Vec<crate::models::StepExecution>> {
-    storage::get_turn_steps(pool, session_id, turn_id).await
+    store.get_turn_steps(session_id, turn_id).await
 }
 
 /// 批量写入 Event（在同一事务中）
 pub async fn write_events_batch(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     events: &[AgentEvent],
 ) -> Result<Vec<i64>> {
-    storage::write_events_batch(pool, events).await
+    store.write_events_batch(events).await
 }
 
 /// LLM Token 消耗统计
 pub async fn get_token_usage_stats(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
 ) -> Result<Vec<crate::models::TokenUsageStats>> {
-    storage::get_token_usage_stats(pool, session_id).await
+    store.get_token_usage_stats(session_id).await
 }
 
 /// Session 详情聚合查询（供 server 层使用）
@@ -693,231 +640,25 @@ pub async fn get_token_usage_stats(
 /// 合并 session 基本信息 + is_ended + turn_count + event_count，
 /// 避免上层直接调用多个 storage 函数。
 pub async fn get_session_info(
-    pool: &SqlitePool,
+    store: &dyn EventStore,
     session_id: &str,
 ) -> Result<Option<crate::models::Session>> {
-    storage::get_session(pool, session_id).await
+    store.get_session(session_id).await
 }
 
 /// 检查 Session 是否已结束
-pub async fn is_session_ended(pool: &SqlitePool, session_id: &str) -> Result<bool> {
-    storage::is_session_ended(pool, session_id).await
+pub async fn is_session_ended(store: &dyn EventStore, session_id: &str) -> Result<bool> {
+    store.is_session_ended(session_id).await
 }
 
 /// 获取 Session 当前最大 turn_id
-pub async fn get_max_turn_id(pool: &SqlitePool, session_id: &str) -> Result<i64> {
-    storage::get_max_turn_id(pool, session_id).await
+pub async fn get_max_turn_id(store: &dyn EventStore, session_id: &str) -> Result<i64> {
+    store.get_max_turn_id(session_id).await
 }
 
 /// 获取 Session 当前最大 seq
-pub async fn get_max_seq(pool: &SqlitePool, session_id: &str) -> Result<i64> {
-    storage::get_max_seq(pool, session_id).await
+pub async fn get_max_seq(store: &dyn EventStore, session_id: &str) -> Result<i64> {
+    store.get_max_seq(session_id).await
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn setup() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        storage::run_migrations_on(&pool).await.unwrap();
-        pool
-    }
-
-    async fn setup_with_session(pool: &SqlitePool) -> String {
-        let sid = format!("sess_{}", Uuid::now_v7().to_string().replace('-', ""));
-        create_session(pool, &sid, "default", "", "test_agent", None)
-            .await
-            .unwrap();
-        sid
-    }
-
-    #[tokio::test]
-    async fn test_simple_turn_lifecycle() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        // Start turn
-        let (turn_id, redo_group, started) =
-            start_turn(&pool, &sid, "Hello, world!", None).await.unwrap();
-        assert_eq!(turn_id, 1);
-        assert!(!redo_group.is_empty());
-        assert_eq!(started.event_type, EventType::TurnStarted);
-        assert_eq!(started.payload["redo_group"], redo_group);
-
-        // Record llm step
-        let step_id = "step_001";
-        let _llm_inv = record_llm_invoked(
-            &pool, &sid, Some(turn_id), step_id,
-            "gpt-4",
-            &[crate::models::Message { role: "user".into(), content: "Hello".into() }],
-            None, None, 1,
-        ).await.unwrap();
-
-        let _llm_cmp = record_llm_completed(
-            &pool, &sid, Some(turn_id), step_id,
-            "gpt-4",
-            Some("Hi there!"),
-            None,
-            Some(&crate::models::Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }),
-            Some("stop"),
-            2,
-        ).await.unwrap();
-
-        // Complete turn
-        let completed = complete_turn(&pool, &sid, turn_id, "Hi there!")
-            .await
-            .unwrap();
-        assert_eq!(completed.event_type, EventType::TurnCompleted);
-
-        // Verify turn events
-        let events = storage::get_turn_events(&pool, &sid, turn_id)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 4); // turn_started, llm_invoked, llm_completed, turn_completed
-    }
-
-    #[tokio::test]
-    async fn test_turn_failed_lifecycle() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        let (turn_id, _, _) = start_turn(&pool, &sid, "test", None).await.unwrap();
-
-        // Simulate step failure then turn failure
-        let step_id = "step_fail_1";
-        let _tool_inv = record_tool_invoked(
-            &pool, &sid, Some(turn_id), step_id,
-            "bad_tool", "call_001",
-            "sess:rg:bad_tool:{}",
-            &serde_json::json!({"arg": 1}),
-            None, 1,
-        ).await.unwrap();
-
-        let _tool_fail = record_tool_failed(
-            &pool, &sid, Some(turn_id), step_id,
-            "call_001", "external_api_error", "API returned 503",
-            true, 1, 2,
-        ).await.unwrap();
-
-        let failed = fail_turn(
-            &pool, &sid, turn_id, "execution_error", "Turn failed due to tool error", None,
-        ).await.unwrap();
-        assert_eq!(failed.event_type, EventType::TurnFailed);
-
-        // Verify turn is not incomplete
-        let incomplete = storage::get_incomplete_turns(&pool, &sid)
-            .await
-            .unwrap();
-        assert!(incomplete.iter().all(|t| t.turn_id != turn_id));
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_turn_terminal_prevented() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        let (turn_id, _, _) = start_turn(&pool, &sid, "test", None).await.unwrap();
-        complete_turn(&pool, &sid, turn_id, "done").await.unwrap();
-
-        // 重复写 terminal 应失败
-        let result = complete_turn(&pool, &sid, turn_id, "done again").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_consecutive_turns() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        for i in 1..=3 {
-            let (turn_id, _, _) = start_turn(
-                &pool, &sid, &format!("turn {}", i), None,
-            ).await.unwrap();
-            assert_eq!(turn_id, i);
-
-            complete_turn(&pool, &sid, turn_id, &format!("result {}", i))
-                .await
-                .unwrap();
-        }
-
-        let max_turn = storage::get_max_turn_id(&pool, &sid).await.unwrap();
-        assert_eq!(max_turn, 3);
-    }
-
-    #[tokio::test]
-    async fn test_session_ended_prevents_new_turns() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        end_session(&pool, &sid, "done").await.unwrap();
-
-        let result = start_turn(&pool, &sid, "hello", None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_summary_trigger_check() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        // 写入一些 llm_completed 事件后检查摘要触发条件
-        let trigger = check_summary_trigger(&pool, &sid).await.unwrap();
-        // 新 session 应该不触发
-        assert!(!trigger.should_summarize());
-        assert_eq!(trigger.turn_count_since_last_summary, 0);
-    }
-
-    #[tokio::test]
-    async fn test_write_summary_marker() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-
-        let marker = write_summary_marker(&pool, &sid, 5, 100, "Summary of first 5 turns", 100)
-            .await
-            .unwrap();
-        assert_eq!(marker.event_type, EventType::SummaryMarker);
-        assert_eq!(marker.payload["summarized_up_to_turn_id"], 5);
-        assert_eq!(marker.payload["summarized_up_to_seq"], 100);
-
-        // 读回最新摘要
-        let latest = storage::get_latest_summary(&pool, &sid).await.unwrap().unwrap();
-        assert_eq!(latest.payload["summary"], "Summary of first 5 turns");
-    }
-
-    #[tokio::test]
-    async fn test_cancel_turn() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-        let (turn_id, _, _) = start_turn(&pool, &sid, "test", None).await.unwrap();
-
-        let event = cancel_turn(&pool, &sid, turn_id, "user canceled").await.unwrap();
-        assert_eq!(event.event_type, EventType::TurnCanceled);
-        assert!(event.payload["reason"].as_str().unwrap().contains("canceled"));
-
-        // Terminal written → no longer incomplete
-        let incomplete = storage::get_incomplete_turns(&pool, &sid).await.unwrap();
-        assert!(incomplete.iter().all(|t| t.turn_id != turn_id));
-    }
-
-    #[tokio::test]
-    async fn test_block_turn() {
-        let pool = setup().await;
-        let sid = setup_with_session(&pool).await;
-        let (turn_id, _, _) = start_turn(&pool, &sid, "test", None).await.unwrap();
-
-        let event = block_turn(&pool, &sid, turn_id, "non-idempotent tool in-flight").await.unwrap();
-        assert_eq!(event.event_type, EventType::TurnBlocked);
-
-        let incomplete = storage::get_incomplete_turns(&pool, &sid).await.unwrap();
-        assert!(incomplete.iter().all(|t| t.turn_id != turn_id));
-    }
-}

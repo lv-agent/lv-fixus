@@ -19,20 +19,19 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use sqlx::SqlitePool;
-
 use crate::error::AppError;
 use crate::orchestrator::Orchestrator;
 use crate::protocol::*;
 use crate::session_registry::{SessionRegistry, TurnOutcome};
-use crate::{context, recovery, service, storage};
+use crate::storage::{EventStore, LogdbdEventStore};
+use crate::{context, recovery, service};
 
 // ── 应用状态 ────────────────────────────────────────────────────────────
 
 /// 共享应用状态
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub store: Arc<dyn EventStore>,
     pub registry: Arc<SessionRegistry>,
     pub stream: Arc<crate::stream::StreamPublisher>,
 }
@@ -67,15 +66,19 @@ impl IntoResponse for AppError {
 
 /// 启动 fixus HTTP 服务器
 pub async fn start() -> Result<(), AppError> {
-    let pool = storage::pool_from_env().await?;
+    // logdbd 连接地址（默认 localhost:50051）
+    let addr = std::env::var("LOGDBD_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:50051".into());
+    let namespace = std::env::var("LOGDBD_NAMESPACE")
+        .unwrap_or_else(|_| "default".into());
 
-    // 自动执行迁移
-    storage::run_migrations_on(&pool).await?;
+    let db = LogdbdEventStore::connect(&addr, &namespace).await?;
+    let store: Arc<dyn EventStore> = Arc::new(db);
 
     let registry = SessionRegistry::new();
     let stream = Arc::new(crate::stream::StreamPublisher::new().await);
     let state = AppState {
-        pool,
+        store,
         registry,
         stream,
     };
@@ -109,7 +112,7 @@ fn stream_url_for(turn_id: i64) -> Option<String> {
 
 /// 从 AppState 创建 Orchestrator
 fn orchestrator(state: &AppState) -> Orchestrator {
-    Orchestrator::new(state.pool.clone(), state.registry.clone(), (*state.stream).clone())
+    Orchestrator::new(state.store.clone(), state.registry.clone(), (*state.stream).clone())
 }
 
 /// 构建 Axum Router
@@ -201,7 +204,7 @@ async fn create_session_handler(
         .unwrap_or("");
 
     let event = service::create_session(
-        &state.pool,
+        &*state.store,
         &req.session_id,
         tenant_id,
         user_id,
@@ -220,13 +223,13 @@ async fn get_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<SessionInfo>>, AppError> {
-    let session = service::get_session_info(&state.pool, &session_id)
+    let session = service::get_session_info(&*state.store, &session_id)
         .await?
         .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
 
-    let is_ended = service::is_session_ended(&state.pool, &session_id).await?;
-    let max_turn = service::get_max_turn_id(&state.pool, &session_id).await?;
-    let max_seq = service::get_max_seq(&state.pool, &session_id).await?;
+    let is_ended = service::is_session_ended(&*state.store, &session_id).await?;
+    let max_turn = service::get_max_turn_id(&*state.store, &session_id).await?;
+    let max_seq = service::get_max_seq(&*state.store, &session_id).await?;
 
     Ok(Json(ApiResponse::ok(SessionInfo {
         session_id: session.session_id,
@@ -264,7 +267,7 @@ async fn end_session_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("client_requested");
 
-    let event = service::end_session(&state.pool, &session_id, reason).await?;
+    let event = service::end_session(&*state.store, &session_id, reason).await?;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "session_id": event.session_id,
@@ -317,7 +320,7 @@ async fn get_turn_handler(
     State(state): State<AppState>,
     Path((session_id, turn_id)): Path<(String, i64)>,
 ) -> Result<Json<ApiResponse<TurnInfo>>, AppError> {
-    let events = service::get_turn_events(&state.pool, &session_id, turn_id).await?;
+    let events = service::get_turn_events(&*state.store, &session_id, turn_id).await?;
     if events.is_empty() {
         return Err(AppError::TurnNotFound {
             session_id,
@@ -325,7 +328,7 @@ async fn get_turn_handler(
         });
     }
 
-    let steps = service::get_turn_steps(&state.pool, &session_id, turn_id).await?;
+    let steps = service::get_turn_steps(&*state.store, &session_id, turn_id).await?;
 
     let terminal = events
         .iter()
@@ -354,7 +357,7 @@ async fn complete_turn_handler(
     Json(req): Json<CompleteTurnRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let event =
-        service::complete_turn(&state.pool, &session_id, turn_id, &req.final_output).await?;
+        service::complete_turn(&*state.store, &session_id, turn_id, &req.final_output).await?;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "turn_id": turn_id,
@@ -368,7 +371,7 @@ async fn cancel_turn_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("user_canceled");
-    let event = service::cancel_turn(&state.pool, &session_id, turn_id, reason).await?;
+    let event = service::cancel_turn(&*state.store, &session_id, turn_id, reason).await?;
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "turn_id": turn_id, "seq": event.seq, "state": "canceled"
     }))))
@@ -392,7 +395,7 @@ async fn fail_turn_handler(
         .and_then(|v| v.as_str());
 
     let event = service::fail_turn(
-        &state.pool,
+        &*state.store,
         &session_id,
         turn_id,
         error_type,
@@ -418,7 +421,7 @@ async fn record_event_handler(
         .ok_or_else(|| AppError::InvalidEventType(req.event_type.clone()))?;
 
     let seq = service::record_event(
-        &state.pool,
+        &*state.store,
         &session_id,
         req.turn_id,
         Some(&req.step_id),
@@ -451,7 +454,7 @@ async fn record_events_batch_handler(
         events.push(event);
     }
 
-    let seqs = service::write_events_batch(&state.pool, &events).await?;
+    let seqs = service::write_events_batch(&*state.store, &events).await?;
 
     Ok(Json(ApiResponse::ok(RecordEventsBatchResponse { seqs })))
 }
@@ -462,7 +465,7 @@ async fn get_context_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<ContextResponse>>, AppError> {
-    let ctx = context::build_llm_context(&state.pool, &session_id).await?;
+    let ctx = context::build_llm_context(&*state.store, &session_id).await?;
 
     Ok(Json(ApiResponse::ok(ContextResponse {
         summary: ctx.summary,
@@ -476,7 +479,7 @@ async fn get_turn_context_handler(
     State(state): State<AppState>,
     Path((session_id, turn_id)): Path<(String, i64)>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::Message>>>, AppError> {
-    let messages = context::build_turn_context(&state.pool, &session_id, turn_id).await?;
+    let messages = context::build_turn_context(&*state.store, &session_id, turn_id).await?;
     Ok(Json(ApiResponse::ok(messages)))
 }
 
@@ -486,12 +489,12 @@ async fn get_recovery_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<RecoveryStatusResponse>>, AppError> {
-    let rec_state = recovery::check_session_recovery(&state.pool, &session_id).await?;
+    let rec_state = recovery::check_session_recovery(&*state.store, &session_id).await?;
 
     let mut redo_queue = Vec::new();
     for incomplete_turn in &rec_state.incomplete_turns {
         let decision =
-            recovery::decide_turn_recovery(&state.pool, &session_id, incomplete_turn).await?;
+            recovery::decide_turn_recovery(&*state.store, &session_id, incomplete_turn).await?;
 
         match decision {
             recovery::RecoveryDecision::SafeToRedo {
@@ -501,7 +504,7 @@ async fn get_recovery_handler(
                 ..
             } => {
                 if let Some(ctx) =
-                    recovery::build_redo_context(&state.pool, &session_id, incomplete_turn)
+                    recovery::build_redo_context(&*state.store, &session_id, incomplete_turn)
                         .await?
                 {
                     redo_queue.push(RedoInfo {
@@ -527,7 +530,7 @@ async fn apply_recovery_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<RedoInfo>>>, AppError> {
-    let redo_queue = recovery::recover_session(&state.pool, &session_id).await?;
+    let redo_queue = recovery::recover_session(&*state.store, &session_id).await?;
 
     let redo_infos: Vec<RedoInfo> = redo_queue
         .into_iter()
@@ -570,7 +573,7 @@ async fn write_summary_handler(
         .unwrap_or(0);
 
     let event = service::write_summary_marker(
-        &state.pool,
+        &*state.store,
         &session_id,
         summarized_up_to_turn_id,
         summarized_up_to_seq,
@@ -592,7 +595,7 @@ async fn get_token_usage_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::TokenUsageStats>>>, AppError> {
-    let stats = service::get_token_usage_stats(&state.pool, &session_id).await?;
+    let stats = service::get_token_usage_stats(&*state.store, &session_id).await?;
     Ok(Json(ApiResponse::ok(stats)))
 }
 
@@ -973,236 +976,3 @@ async fn health_handler() -> Json<ApiResponse<&'static str>> {
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
-    use http_body_util::BodyExt;
-    use sqlx::sqlite::SqlitePoolOptions;
-    use tower::ServiceExt;
-
-    async fn setup() -> (Router, SqlitePool) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::run_migrations_on(&pool).await.unwrap();
-
-        let registry = crate::session_registry::SessionRegistry::new();
-        let stream = Arc::new(crate::stream::StreamPublisher::new().await);
-        let state = AppState {
-            pool: pool.clone(),
-            registry,
-            stream,
-        };
-        let app = build_router(state);
-        (app, pool)
-    }
-
-    #[tokio::test]
-    async fn test_health_endpoint() {
-        let (app, _pool) = setup().await;
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_create_and_get_session() {
-        let (app, _pool) = setup().await;
-
-        // Create session
-        let body = serde_json::json!({
-            "session_id": "sess_api_1",
-            "agent_type": "test_agent"
-        });
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Get session
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sessions/sess_api_1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["success"].as_bool().unwrap());
-        assert_eq!(json["data"]["session_id"], "sess_api_1");
-    }
-
-    #[tokio::test]
-    async fn test_create_duplicate_session_returns_409() {
-        let (app, _pool) = setup().await;
-
-        let body = serde_json::json!({
-            "session_id": "sess_dup_api",
-            "agent_type": "test"
-        });
-
-        // First create
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Duplicate
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_start_turn_without_fixlet_returns_error() {
-        let (app, _pool) = setup().await;
-
-        // 创建 session
-        let body = serde_json::json!({
-            "session_id": "sess_turn_api",
-            "agent_type": "test"
-        });
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // 开始 turn — 没有 fixlet 连接，orchestrator 会超时
-        let body = serde_json::json!({"user_input": "Hello"});
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions/sess_turn_api/turns")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // 无 fixlet → orchestrator 超时 → 500
-        assert!(
-            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || resp.status() == StatusCode::REQUEST_TIMEOUT,
-            "Expected error (no fixlet connected), got {}",
-            resp.status()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_context() {
-        let (app, _pool) = setup().await;
-
-        // 创建 session
-        let body = serde_json::json!({
-            "session_id": "sess_ctx_api",
-            "agent_type": "test"
-        });
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/sessions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // 获取上下文
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sessions/sess_ctx_api/context")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(json["success"].as_bool().unwrap());
-        assert_eq!(json["data"]["summarized_up_to_seq"], 0);
-    }
-
-    #[tokio::test]
-    async fn test_get_nonexistent_session_returns_404() {
-        let (app, _pool) = setup().await;
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sessions/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-}

@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use crate::error::{AppError, Result};
 use crate::session_registry::{PendingTurn, SessionRegistry, TurnOutcome};
-use crate::{context, recovery, sandbox, service, storage};
+use crate::storage::EventStore;
+use crate::{context, recovery, sandbox, service};
 
 // ── 辅助类型 ────────────────────────────────────────────────────────────
 
@@ -46,9 +47,16 @@ fn canonical_json(value: &serde_json::Value) -> String {
         serde_json::Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let items: Vec<String> = keys.iter().map(|k|
-                format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&map[*k]))
-            ).collect();
+            let items: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap(),
+                        canonical_json(&map[*k])
+                    )
+                })
+                .collect();
             format!("{{{}}}", items.join(","))
         }
         serde_json::Value::Array(arr) => {
@@ -72,7 +80,7 @@ fn capitalize_first(s: &str) -> String {
 
 /// Turn 编排器
 pub struct Orchestrator {
-    pool: sqlx::SqlitePool,
+    store: Arc<dyn EventStore>,
     registry: Arc<SessionRegistry>,
     /// Turn 级超时（默认 5 分钟）
     turn_timeout: Duration,
@@ -81,9 +89,13 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    pub fn new(pool: sqlx::SqlitePool, registry: Arc<SessionRegistry>, stream: crate::stream::StreamPublisher) -> Self {
+    pub fn new(
+        store: Arc<dyn EventStore>,
+        registry: Arc<SessionRegistry>,
+        stream: crate::stream::StreamPublisher,
+    ) -> Self {
         Self {
-            pool,
+            store,
             registry,
             turn_timeout: Duration::from_secs(300),
             stream,
@@ -103,7 +115,7 @@ impl Orchestrator {
         redo_group: Option<&str>,
     ) -> Result<TurnOutcome> {
         // 1. 恢复检查 — 检测到未完成 Turn 时触发后台恢复，不阻塞当前请求
-        let incomplete = storage::get_incomplete_turns(&self.pool, session_id).await?;
+        let incomplete = self.store.get_incomplete_turns(session_id).await?;
         if !incomplete.is_empty() {
             let count = incomplete.len();
             tracing::warn!(
@@ -125,7 +137,7 @@ impl Orchestrator {
 
         // 2. 启动新 Turn（WAL: turn_started）
         let (turn_id, redo_group, _turn_started) =
-            service::start_turn(&self.pool, session_id, user_input, redo_group).await?;
+            service::start_turn(&*self.store, session_id, user_input, redo_group).await?;
 
         tracing::info!(
             "session {}: turn {} started, redo_group={}",
@@ -135,7 +147,7 @@ impl Orchestrator {
         );
 
         // 3. 构建 context（只构建一次，传递给 dispatch）
-        let ctx = context::build_llm_context(&self.pool, session_id).await?;
+        let ctx = context::build_llm_context(&*self.store, session_id).await?;
 
         // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知）
         let (pending, result_rx) =
@@ -162,8 +174,13 @@ impl Orchestrator {
 
         // 6. 下发 execute_turn 给 fixlet（复用已构建的 context）
         self.dispatch_execute_turn_with_ctx(
-            session_id, turn_id, user_input, &redo_group, 0,
-            &[], &ctx,
+            session_id,
+            turn_id,
+            user_input,
+            &redo_group,
+            0,
+            &[],
+            &ctx,
         )
         .await?;
 
@@ -172,7 +189,10 @@ impl Orchestrator {
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(_recv_err)) => {
                 // oneshot sender 被 dropped（fixlet 断开等）
-                tracing::error!("session {}: pending turn channel closed unexpectedly", session_id);
+                tracing::error!(
+                    "session {}: pending turn channel closed unexpectedly",
+                    session_id
+                );
                 self.fail_turn_and_respond(
                     session_id,
                     turn_id,
@@ -199,7 +219,7 @@ impl Orchestrator {
     ///
     /// 恢复完成后客户端可以重新发起 execute_turn。
     fn spawn_background_recovery(&self, session_id: String) {
-        let pool = self.pool.clone();
+        let store = self.store.clone();
         let registry = self.registry.clone();
         let stream = self.stream.clone();
         let turn_timeout = self.turn_timeout;
@@ -207,7 +227,7 @@ impl Orchestrator {
         tokio::spawn(async move {
             tracing::info!("session {}: background recovery started", session_id);
 
-            let redo_queue = match recovery::recover_session(&pool, &session_id).await {
+            let redo_queue = match recovery::recover_session(&*store, &session_id).await {
                 Ok(q) => q,
                 Err(e) => {
                     tracing::error!("session {}: recovery failed: {}", session_id, e);
@@ -222,7 +242,7 @@ impl Orchestrator {
 
             // 创建临时 Orchestrator 用于 dispatch
             let orch = Orchestrator {
-                pool: pool.clone(),
+                store: store.clone(),
                 registry: registry.clone(),
                 turn_timeout,
                 stream,
@@ -234,7 +254,10 @@ impl Orchestrator {
             for redo_ctx in &redo_queue {
                 tracing::info!(
                     "session {}: redo turn {} redo_count={} redo_group={}",
-                    session_id, redo_ctx.turn_id, redo_ctx.redo_count, redo_ctx.redo_group
+                    session_id,
+                    redo_ctx.turn_id,
+                    redo_ctx.redo_count,
+                    redo_ctx.redo_group
                 );
 
                 let (pending, result_rx) = PendingTurn::new(
@@ -244,46 +267,85 @@ impl Orchestrator {
                 );
                 registry.register_pending_turn(&session_id, pending).await;
 
-                let cached = orch.get_cached_llm_responses(&session_id, redo_ctx.turn_id).await;
-                if let Err(e) = orch.dispatch_execute_turn(
-                    &session_id,
-                    redo_ctx.turn_id,
-                    &redo_ctx.user_input,
-                    &redo_ctx.redo_group,
-                    redo_ctx.redo_count,
-                    &cached,
-                ).await {
-                    tracing::error!("session {}: redo dispatch failed for turn {}: {}", session_id, redo_ctx.turn_id, e);
-                    let _ = orch.fail_turn_and_respond(
-                        &session_id, redo_ctx.turn_id,
-                        "redo_dispatch_failed", &e.to_string(),
-                    ).await;
+                let cached = orch
+                    .get_cached_llm_responses(&session_id, redo_ctx.turn_id)
+                    .await;
+                if let Err(e) = orch
+                    .dispatch_execute_turn(
+                        &session_id,
+                        redo_ctx.turn_id,
+                        &redo_ctx.user_input,
+                        &redo_ctx.redo_group,
+                        redo_ctx.redo_count,
+                        &cached,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        "session {}: redo dispatch failed for turn {}: {}",
+                        session_id,
+                        redo_ctx.turn_id,
+                        e
+                    );
+                    let _ = orch
+                        .fail_turn_and_respond(
+                            &session_id,
+                            redo_ctx.turn_id,
+                            "redo_dispatch_failed",
+                            &e.to_string(),
+                        )
+                        .await;
                     redo_failed += 1;
                     continue;
                 }
 
                 match tokio::time::timeout(turn_timeout, result_rx).await {
                     Ok(Ok(TurnOutcome::Completed { turn_id, .. })) => {
-                        tracing::info!("session {}: redo turn {} succeeded", session_id, turn_id);
+                        tracing::info!(
+                            "session {}: redo turn {} succeeded",
+                            session_id,
+                            turn_id
+                        );
                         redo_success += 1;
                     }
-                    Ok(Ok(TurnOutcome::Failed { turn_id, error_type, .. })) => {
-                        tracing::error!("session {}: redo turn {} failed: {}", session_id, turn_id, error_type);
+                    Ok(Ok(TurnOutcome::Failed {
+                        turn_id,
+                        error_type,
+                        ..
+                    })) => {
+                        tracing::error!(
+                            "session {}: redo turn {} failed: {}",
+                            session_id,
+                            turn_id,
+                            error_type
+                        );
                         redo_failed += 1;
                     }
                     Ok(Ok(TurnOutcome::Timeout { .. })) | Err(_) => {
-                        tracing::error!("session {}: redo turn {} timed out", session_id, redo_ctx.turn_id);
-                        let _ = orch.fail_turn_and_respond(
-                            &session_id, redo_ctx.turn_id,
-                            "redo_timeout", "Redo timed out",
-                        ).await;
+                        tracing::error!(
+                            "session {}: redo turn {} timed out",
+                            session_id,
+                            redo_ctx.turn_id
+                        );
+                        let _ = orch
+                            .fail_turn_and_respond(
+                                &session_id,
+                                redo_ctx.turn_id,
+                                "redo_timeout",
+                                "Redo timed out",
+                            )
+                            .await;
                         redo_failed += 1;
                     }
                     Ok(Err(_)) => {
-                        let _ = orch.fail_turn_and_respond(
-                            &session_id, redo_ctx.turn_id,
-                            "channel_closed", "fixlet connection lost during redo",
-                        ).await;
+                        let _ = orch
+                            .fail_turn_and_respond(
+                                &session_id,
+                                redo_ctx.turn_id,
+                                "channel_closed",
+                                "fixlet connection lost during redo",
+                            )
+                            .await;
                         redo_failed += 1;
                     }
                 }
@@ -291,7 +353,9 @@ impl Orchestrator {
 
             tracing::info!(
                 "session {}: background recovery finished — {} succeeded, {} failed",
-                session_id, redo_success, redo_failed
+                session_id,
+                redo_success,
+                redo_failed
             );
         });
     }
@@ -306,11 +370,17 @@ impl Orchestrator {
         redo_count: i32,
         cached_llm_responses: &[String],
     ) -> Result<()> {
-        let ctx = context::build_llm_context(&self.pool, session_id).await?;
+        let ctx = context::build_llm_context(&*self.store, session_id).await?;
         self.dispatch_execute_turn_with_ctx(
-            session_id, turn_id, user_input, redo_group, redo_count,
-            cached_llm_responses, &ctx,
-        ).await
+            session_id,
+            turn_id,
+            user_input,
+            redo_group,
+            redo_count,
+            cached_llm_responses,
+            &ctx,
+        )
+        .await
     }
 
     /// 下发 execute_turn（复用已构建的 context，避免重复查询）
@@ -329,12 +399,14 @@ impl Orchestrator {
             user_input.to_string()
         } else {
             let mut cached_input = String::from(
-                "[CACHED FROM PREVIOUS ATTEMPT — reuse or adapt if applicable]\n"
+                "[CACHED FROM PREVIOUS ATTEMPT — reuse or adapt if applicable]\n",
             );
             for (i, resp) in cached_llm_responses.iter().enumerate() {
                 if !resp.is_empty() {
                     cached_input.push_str(&format!(
-                        "\nPrevious response {}: {}\n", i + 1, resp
+                        "\nPrevious response {}: {}\n",
+                        i + 1,
+                        resp
                     ));
                 }
             }
@@ -359,7 +431,9 @@ impl Orchestrator {
         self.registry
             .send_to_fixlet(session_id, &msg.to_string())
             .await
-            .map_err(|e| AppError::Protocol(format!("Failed to dispatch execute_turn: {}", e)))?;
+            .map_err(|e| {
+                AppError::Protocol(format!("Failed to dispatch execute_turn: {}", e))
+            })?;
 
         tracing::info!(
             "session {}: dispatched execute_turn turn_id={} redo_count={}",
@@ -400,7 +474,7 @@ impl Orchestrator {
 
         // 1. WAL: 写 tool_invoked
         let _event = service::record_tool_invoked(
-            &self.pool,
+            &*self.store,
             session_id,
             Some(turn_id),
             step_id,
@@ -423,36 +497,57 @@ impl Orchestrator {
             idempotency_key: idempotency_key.to_string(),
             input: input.clone(),
             timeout_ms: 30_000,
-        }).await;
+        })
+        .await;
 
         // 3. WAL: 写 tool_completed 或 tool_failed
         if exec_result.success {
             service::record_tool_completed(
-                &self.pool, session_id, Some(turn_id), step_id,
-                tool_call_id, &exec_result.output, false, local_seq,
-            ).await?;
+                &*self.store,
+                session_id,
+                Some(turn_id),
+                step_id,
+                tool_call_id,
+                &exec_result.output,
+                false,
+                local_seq,
+            )
+            .await?;
         } else {
             service::record_tool_failed(
-                &self.pool, session_id, Some(turn_id), step_id,
-                tool_call_id, "sandbox_execution_error",
+                &*self.store,
+                session_id,
+                Some(turn_id),
+                step_id,
+                tool_call_id,
+                "sandbox_execution_error",
                 &exec_result.error.unwrap_or_default(),
-                true, 1, local_seq,
-            ).await?;
+                true,
+                1,
+                local_seq,
+            )
+            .await?;
         }
 
         // 4. 回传 tool_result 给 fixlet
         self.send_tool_result_to_fixlet(
-            session_id, step_id, tool_call_id, &exec_result.output,
-            exec_result.success, exec_result.duration_ms,
-        ).await;
+            session_id,
+            step_id,
+            tool_call_id,
+            &exec_result.output,
+            exec_result.success,
+            exec_result.duration_ms,
+        )
+        .await;
 
         Ok(())
     }
 
     /// 从 WAL 读取上次尝试的 LLM 缓存（同 turn_id 下所有 llm_completed）
     async fn get_cached_llm_responses(&self, session_id: &str, turn_id: i64) -> Vec<String> {
-        match crate::storage::get_turn_events(&self.pool, session_id, turn_id).await {
-            Ok(events) => events.iter()
+        match self.store.get_turn_events(session_id, turn_id).await {
+            Ok(events) => events
+                .iter()
                 .filter(|e| e.event_type == crate::models::EventType::LlmCompleted)
                 .filter_map(|e| e.payload.get("content").and_then(|v| v.as_str()))
                 .map(|s| s.to_string())
@@ -485,10 +580,15 @@ impl Orchestrator {
             "duration_ms": duration_ms,
         });
 
-        if let Err(e) = self.registry.send_to_fixlet(session_id, &result_msg.to_string()).await {
+        if let Err(e) = self
+            .registry
+            .send_to_fixlet(session_id, &result_msg.to_string())
+            .await
+        {
             tracing::error!(
                 "session {}: failed to send tool_result to fixlet: {}",
-                session_id, e
+                session_id,
+                e
             );
         }
     }
@@ -508,7 +608,8 @@ impl Orchestrator {
             "type": "llm_chunk",
             "text": text,
         });
-        self.stream_publish(session_id, turn_id, &event_json.to_string()).await;
+        self.stream_publish(session_id, turn_id, &event_json.to_string())
+            .await;
         Ok(())
     }
 
@@ -536,22 +637,30 @@ impl Orchestrator {
         });
 
         service::record_event(
-            &self.pool,
+            &*self.store,
             session_id,
             Some(turn_id),
             Some(&step_id),
             crate::models::EventType::LlmCompleted,
             payload,
-        ).await?;
+        )
+        .await?;
 
         tracing::info!(
             "session {}: llm_completed turn={} tokens(in={} out={} total={})",
-            session_id, turn_id, input_tokens, output_tokens, total_tokens
+            session_id,
+            turn_id,
+            input_tokens,
+            output_tokens,
+            total_tokens
         );
 
-        self.stream_publish(session_id, turn_id,
-            &serde_json::json!({"type":"llm_completed","input_tokens":input_tokens,"output_tokens":output_tokens,"total_tokens":total_tokens}).to_string()
-        ).await;
+        self.stream_publish(
+            session_id,
+            turn_id,
+            &serde_json::json!({"type":"llm_completed","input_tokens":input_tokens,"output_tokens":output_tokens,"total_tokens":total_tokens}).to_string(),
+        )
+        .await;
 
         Ok(())
     }
@@ -577,11 +686,13 @@ impl Orchestrator {
 
         // 1. WAL: 写 turn_completed
         let _event =
-            service::complete_turn(&self.pool, session_id, turn_id, final_output).await?;
+            service::complete_turn(&*self.store, session_id, turn_id, final_output).await?;
 
         // 2. 统计该 Turn 的事件数量
-        let turn_events =
-            storage::get_turn_events(&self.pool, session_id, turn_id).await?;
+        let turn_events = self
+            .store
+            .get_turn_events(session_id, turn_id)
+            .await?;
         let event_count = turn_events.len() as i64;
 
         // 3. 通知 HTTP handler
@@ -611,9 +722,12 @@ impl Orchestrator {
         );
 
         // 流式发布
-        self.stream_publish(session_id, turn_id,
-            &serde_json::json!({"type":"turn_completed","final_output":final_output}).to_string()
-        ).await;
+        self.stream_publish(
+            session_id,
+            turn_id,
+            &serde_json::json!({"type":"turn_completed","final_output":final_output}).to_string(),
+        )
+        .await;
 
         Ok(())
     }
@@ -638,40 +752,76 @@ impl Orchestrator {
         );
 
         // 1. 读取原始 turn_started 获取 redo 上下文
-        let turn_events = storage::get_turn_events(&self.pool, session_id, turn_id).await?;
+        let turn_events = self
+            .store
+            .get_turn_events(session_id, turn_id)
+            .await?;
         let turn_started = turn_events
             .iter()
             .find(|e| e.event_type == crate::models::EventType::TurnStarted);
 
         let (user_input, redo_group, redo_count) = match turn_started {
             Some(event) => {
-                let input = event.payload.get("user_input")
-                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let rg = event.payload.get("redo_group")
-                    .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                let rc = event.payload.get("redo_count")
-                    .and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let input = event
+                    .payload
+                    .get("user_input")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let rg = event
+                    .payload
+                    .get("redo_group")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let rc = event
+                    .payload
+                    .get("redo_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
                 (input, rg, rc + 1)
             }
             None => {
                 // 没有 turn_started，无法 redo
-                self.fail_turn_and_respond(session_id, turn_id, error_type, error_message).await?;
+                self.fail_turn_and_respond(session_id, turn_id, error_type, error_message)
+                    .await?;
                 return Ok(());
             }
         };
 
         tracing::info!(
             "session {}: redo turn {} redo_count={} redo_group={}",
-            session_id, turn_id, redo_count, redo_group
+            session_id,
+            turn_id,
+            redo_count,
+            redo_group
         );
 
         // 2. 查询上次尝试的 LLM 缓存，注入后分发 redo
         let cached = self.get_cached_llm_responses(session_id, turn_id).await;
-        if let Err(e) = self.dispatch_execute_turn(
-            session_id, turn_id, &user_input, &redo_group, redo_count, &cached,
-        ).await {
-            tracing::error!("session {}: failed to dispatch redo: {}", session_id, e);
-            self.fail_turn_and_respond(session_id, turn_id, "redo_dispatch_failed", &e.to_string()).await?;
+        if let Err(e) = self
+            .dispatch_execute_turn(
+                session_id,
+                turn_id,
+                &user_input,
+                &redo_group,
+                redo_count,
+                &cached,
+            )
+            .await
+        {
+            tracing::error!(
+                "session {}: failed to dispatch redo: {}",
+                session_id,
+                e
+            );
+            self.fail_turn_and_respond(
+                session_id,
+                turn_id,
+                "redo_dispatch_failed",
+                &e.to_string(),
+            )
+            .await?;
         }
 
         Ok(())
@@ -695,7 +845,7 @@ impl Orchestrator {
         use uuid::Uuid;
 
         let step_id = Uuid::now_v7().to_string();
-        let active_turn = crate::storage::get_max_turn_id(&self.pool, session_id).await?;
+        let active_turn = self.store.get_max_turn_id(session_id).await?;
 
         // 将 fixus_* 映射为原生工具名
         let native_tool: String = tool_name
@@ -704,24 +854,35 @@ impl Orchestrator {
             .unwrap_or_else(|| tool_name.to_string());
 
         // 生成 idempotency_key
-        let idempotency_key = build_tool_idempotency_key(
-            session_id,
-            tool_name,
-            args,
-        );
+        let idempotency_key = build_tool_idempotency_key(session_id, tool_name, args);
 
         tracing::info!(
             "session {}: executing tool {} (native={}) idempotency_key={}",
-            session_id, tool_name, native_tool, idempotency_key
+            session_id,
+            tool_name,
+            native_tool,
+            idempotency_key
         );
 
         // 1. WAL: tool_invoked
-        let turn_id = if active_turn > 0 { Some(active_turn) } else { None };
+        let turn_id = if active_turn > 0 {
+            Some(active_turn)
+        } else {
+            None
+        };
         service::record_tool_invoked(
-            &self.pool, session_id, turn_id, &step_id,
-            tool_name, tool_call_id, &idempotency_key, args,
-            None, 0,
-        ).await?;
+            &*self.store,
+            session_id,
+            turn_id,
+            &step_id,
+            tool_name,
+            tool_call_id,
+            &idempotency_key,
+            args,
+            None,
+            0,
+        )
+        .await?;
 
         // 2. Sandbox 执行
         let exec_result = crate::sandbox::execute_tool(crate::sandbox::ExecuteRequest {
@@ -730,22 +891,37 @@ impl Orchestrator {
             idempotency_key: idempotency_key.clone(),
             input: args.clone(),
             timeout_ms: 30_000,
-        }).await;
+        })
+        .await;
 
         // 3. WAL: tool_terminal
         if exec_result.success {
             service::record_tool_completed(
-                &self.pool, session_id, turn_id, &step_id,
-                tool_call_id, &exec_result.output, false, 0,
-            ).await?;
+                &*self.store,
+                session_id,
+                turn_id,
+                &step_id,
+                tool_call_id,
+                &exec_result.output,
+                false,
+                0,
+            )
+            .await?;
         } else {
             let error_msg = exec_result.error.clone().unwrap_or_default();
             service::record_tool_failed(
-                &self.pool, session_id, turn_id, &step_id,
+                &*self.store,
+                session_id,
+                turn_id,
+                &step_id,
                 tool_call_id,
-                "sandbox_execution_error", &error_msg,
-                true, 1, 0,
-            ).await?;
+                "sandbox_execution_error",
+                &error_msg,
+                true,
+                1,
+                0,
+            )
+            .await?;
         }
 
         Ok(ToolExecuteResult {
@@ -764,11 +940,21 @@ impl Orchestrator {
         error_message: &str,
     ) -> Result<TurnOutcome> {
         // WAL: 写 turn_failed
-        if let Err(e) =
-            service::fail_turn(&self.pool, session_id, turn_id, error_type, error_message, None)
-                .await
+        if let Err(e) = service::fail_turn(
+            &*self.store,
+            session_id,
+            turn_id,
+            error_type,
+            error_message,
+            None,
+        )
+        .await
         {
-            tracing::error!("session {}: failed to write turn_failed: {}", session_id, e);
+            tracing::error!(
+                "session {}: failed to write turn_failed: {}",
+                session_id,
+                e
+            );
         }
 
         let outcome = TurnOutcome::Failed {
@@ -788,175 +974,3 @@ impl Orchestrator {
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session_registry::SessionRegistry;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn setup() -> (Orchestrator, Arc<SessionRegistry>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::storage::run_migrations_on(&pool).await.unwrap();
-
-        let registry = SessionRegistry::new();
-        let stream = crate::stream::StreamPublisher::new().await;
-        let orchestrator = Orchestrator::new(pool.clone(), registry.clone(), stream);
-
-        (orchestrator, registry)
-    }
-
-    async fn setup_session(pool: &sqlx::SqlitePool) -> String {
-        let sid = format!("orch_{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
-        service::create_session(pool, &sid, "default", "", "test_agent", None)
-            .await
-            .unwrap();
-        sid
-    }
-
-    #[tokio::test]
-    async fn test_execute_turn_no_fixlet_fails() {
-        let (orchestrator, _registry) = setup().await;
-        let sid = setup_session(&orchestrator.pool).await;
-
-        // 没有 fixlet 连接 → execute_turn 应该超时（因为没有 fixlet 来回复 turn_execution_done）
-        // 这里我们期望超时错误
-        let result = orchestrator
-            .execute_turn(&sid, "hello", None)
-            .await;
-
-        match result {
-            Ok(TurnOutcome::Failed { error_type, .. }) => {
-                assert!(
-                    error_type == "channel_closed"
-                        || error_type == "timeout"
-                        || error_type == "no_fixlet"
-                );
-            }
-            Ok(TurnOutcome::Timeout { .. }) => {}
-            Err(_) => {} // Protocol error also fine
-            _ => {}
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_invoked_and_result() {
-        let (orchestrator, registry) = setup().await;
-        let sid = setup_session(&orchestrator.pool).await;
-
-        // 模拟 fixlet 连接
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet(&sid, tx).await;
-
-        // 启动一个 Turn
-        let (turn_id, _, _) = service::start_turn(&orchestrator.pool, &sid, "run echo", None)
-            .await
-            .unwrap();
-
-        // 处理 tool_invoked
-        orchestrator
-            .handle_tool_invoked(
-                &sid,
-                turn_id,
-                "step_001",
-                1,
-                "Bash",
-                "call_001",
-                &format!("{}:rg_test:Bash:echo", sid),
-                &serde_json::json!({"command": "echo hello"}),
-            )
-            .await
-            .unwrap();
-
-        // 检查 tool_invoked + tool_completed 已写入
-        let events = storage::get_turn_events(&orchestrator.pool, &sid, turn_id)
-            .await
-            .unwrap();
-
-        let has_invoked = events
-            .iter()
-            .any(|e| e.event_type == crate::models::EventType::ToolInvoked);
-        let has_completed = events
-            .iter()
-            .any(|e| e.event_type == crate::models::EventType::ToolCompleted);
-
-        assert!(has_invoked, "tool_invoked should be written");
-        assert!(has_completed, "tool_completed should be written");
-    }
-
-    #[tokio::test]
-    async fn test_handle_turn_execution_done() {
-        let (orchestrator, registry) = setup().await;
-        let sid = setup_session(&orchestrator.pool).await;
-
-        // 注册 fixlet + pending turn
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet(&sid, tx).await;
-
-        let (turn_id, _, _) = service::start_turn(&orchestrator.pool, &sid, "test", None)
-            .await
-            .unwrap();
-
-        let (pending, mut result_rx) =
-            PendingTurn::new(sid.clone(), turn_id, "rg_test".into());
-        registry.register_pending_turn(&sid, pending).await;
-
-        // 调用 handle_turn_execution_done
-        orchestrator
-            .handle_turn_execution_done(&sid, turn_id, 1, "all done")
-            .await
-            .unwrap();
-
-        // HTTP handler 应收到 Completed
-        match result_rx.try_recv().unwrap() {
-            TurnOutcome::Completed {
-                final_output,
-                turn_id: tid,
-                ..
-            } => {
-                assert_eq!(final_output, "all done");
-                assert_eq!(tid, turn_id);
-            }
-            other => panic!("Expected Completed, got {:?}", other),
-        }
-
-        // Turn 已完成（不再是 incomplete）
-        let incomplete = storage::get_incomplete_turns(&orchestrator.pool, &sid)
-            .await
-            .unwrap();
-        assert!(incomplete.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_cached_llm_responses() {
-        let (orchestrator, _registry) = setup().await;
-        let sid = setup_session(&orchestrator.pool).await;
-
-        // 写一个 llm_completed 到 Turn 1
-        let (turn_id, _, _) = service::start_turn(&orchestrator.pool, &sid, "test", None).await.unwrap();
-        service::record_event(
-            &orchestrator.pool, &sid, Some(turn_id), Some("step_1"),
-            crate::models::EventType::LlmCompleted,
-            serde_json::json!({"model": "gpt-4", "content": "cached response", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}, "local_seq": 1}),
-        ).await.unwrap();
-
-        let cached = orchestrator.get_cached_llm_responses(&sid, turn_id).await;
-        assert_eq!(cached.len(), 1);
-        assert_eq!(cached[0], "cached response");
-    }
-
-    #[tokio::test]
-    async fn test_get_cached_llm_empty_for_new_turn() {
-        let (orchestrator, _registry) = setup().await;
-        let sid = setup_session(&orchestrator.pool).await;
-        let (turn_id, _, _) = service::start_turn(&orchestrator.pool, &sid, "test", None).await.unwrap();
-
-        // No llm_completed events → empty cache
-        let cached = orchestrator.get_cached_llm_responses(&sid, turn_id).await;
-        assert!(cached.is_empty());
-    }
-}

@@ -3,10 +3,6 @@
 /// 所有 pub API 返回 `Result<T, AppError>`，不 panic。
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    // ── 数据库错误 ──
-    #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
-
     #[error("database migration error: {0}")]
     Migration(String),
 
