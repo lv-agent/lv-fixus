@@ -5,15 +5,17 @@
 //! 设计目标：
 //! - 不可变 append-only 事件存储
 //! - 简单读走 gRPC Read/Scan（零序列化开销）
-//! - 过滤/聚合查询走 logdbd SQL query cache
+//! - 过滤/聚合查询走 logdbd 原生结构化 QueryRequest（直读 segment,cr-027）
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
-use logdb_client::{Client, RecordExt};
-use logdbd_proto::pb::AppendRequest;
+use chrono::{TimeZone, Utc};
+use logdb_client::{
+    Client, QueryRequest, QueryResponse, QueryResult, query_response,
+};
+use logdbd_proto::pb::{AbsentMatch, AppendRequest, MetadataFilter};
 use tokio::sync::Mutex;
 
 use crate::error::{AppError, Result};
@@ -125,7 +127,7 @@ pub struct ArchiveResult {
 /// - namespace = self.namespace(单 namespace;tenant_id 仅作 metadata 字段,查询时按字段过滤)
 /// - stream   = session_id
 /// - 简单读：`client.read()` / `client.scan_all()` — content 直接是 `Vec<u8>`
-/// - 过滤查询：`client.query()` — SQL SELECT against logdbd's per-stream SQLite cache
+/// - 过滤查询：`client.query(QueryRequest)` — 原生结构化谓词,直读 segment(cr-027)
 pub struct LogdbdEventStore {
     client: Arc<Mutex<Client>>,
     namespace: String,
@@ -143,6 +145,22 @@ impl LogdbdEventStore {
         })
     }
 
+    /// 执行一次结构化查询。调用方构造请求体(谓词 + result 形态);本方法填入
+    /// `namespace = self.namespace`、`stream = stream`,并统一映射 gRPC 错误。
+    async fn run_query(
+        &self,
+        client: &mut Client,
+        stream: &str,
+        mut req: QueryRequest,
+    ) -> Result<QueryResponse> {
+        req.namespace = self.namespace.clone();
+        req.stream = stream.to_string();
+        client
+            .query(req)
+            .await
+            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))
+    }
+
     /// 校验 terminal 事件唯一性:同一 session/turn/step 最多一个 terminal 事件。
     /// append 前调用,违反则返回 `LifecycleInvariant`。
     /// 覆盖:session_ended / 4 种 turn terminal / step llm terminal / step tool terminal。
@@ -152,18 +170,21 @@ impl LogdbdEventStore {
         event: &AgentEvent,
     ) -> Result<()> {
         use EventType::*;
-        let (conflict_in, scope) = match event.event_type {
-            SessionEnded => ("('session_ended')", "session"),
-            TurnCompleted | TurnFailed | TurnCanceled | TurnBlocked => {
-                ("('turn_completed','turn_failed','turn_canceled','turn_blocked')", "turn")
-            }
-            LlmCompleted | LlmFailed => ("('llm_completed','llm_failed')", "step"),
-            ToolCompleted | ToolFailed => ("('tool_completed','tool_failed')", "step"),
+        let (conflict_types, scope): (Vec<&str>, &str) = match event.event_type {
+            SessionEnded => (vec!["session_ended"], "session"),
+            TurnCompleted | TurnFailed | TurnCanceled | TurnBlocked => (
+                vec!["turn_completed", "turn_failed", "turn_canceled", "turn_blocked"],
+                "turn",
+            ),
+            LlmCompleted | LlmFailed => (vec!["llm_completed", "llm_failed"], "step"),
+            ToolCompleted | ToolFailed => (vec!["tool_completed", "tool_failed"], "step"),
             // 非 terminal 事件不校验唯一性
             _ => return Ok(()),
         };
 
-        let where_scope = match scope {
+        // scope → metadata 等值过滤(session 级由 stream 本身限定,无需 metadata)。
+        let mut metadata = Vec::new();
+        match scope {
             "turn" => {
                 let tid = event.turn_id.ok_or_else(|| {
                     AppError::LifecycleInvariant(format!(
@@ -171,10 +192,10 @@ impl LogdbdEventStore {
                         event.event_type.as_str()
                     ))
                 })?;
-                format!(
-                    " AND json_extract(metadata_json,'$.turn_id') = {}",
-                    sql_quote(&tid.to_string())
-                )
+                metadata.push(MetadataFilter {
+                    key: "turn_id".into(),
+                    value: tid.to_string(),
+                });
             }
             "step" => {
                 let sid = event.step_id.as_ref().ok_or_else(|| {
@@ -183,34 +204,39 @@ impl LogdbdEventStore {
                         event.event_type.as_str()
                     ))
                 })?;
-                format!(
-                    " AND json_extract(metadata_json,'$.step_id') = {}",
-                    sql_quote(sid)
-                )
+                metadata.push(MetadataFilter {
+                    key: "step_id".into(),
+                    value: sid.clone(),
+                });
             }
-            _ => String::new(), // session 级:stream_id 已限定 session
+            _ => {} // session 级:stream 已限定 session
+        }
+
+        let resp = self
+            .run_query(
+                client,
+                &event.session_id,
+                QueryRequest {
+                    event_types: conflict_types.into_iter().map(String::from).collect(),
+                    metadata,
+                    result: QueryResult::Count as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let count = match resp.result {
+            Some(query_response::Result::Count(n)) => n,
+            _ => 0,
         };
-
-        let sql = format!(
-            "SELECT COUNT(*) AS c FROM records WHERE event_type IN {}{}",
-            conflict_in, where_scope
-        );
-        let rows = client
-            .query(&self.namespace, &event.session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-
-        if let Some(row) = rows.first() {
-            let v: serde_json::Value = serde_json::from_str(row).unwrap_or_default();
-            if v["c"].as_i64().unwrap_or(0) > 0 {
-                return Err(AppError::LifecycleInvariant(format!(
-                    "{} 已存在同类 terminal 事件(session={}, turn={:?}, step={:?})",
-                    event.event_type.as_str(),
-                    event.session_id,
-                    event.turn_id,
-                    event.step_id,
-                )));
-            }
+        if count > 0 {
+            return Err(AppError::LifecycleInvariant(format!(
+                "{} 已存在同类 terminal 事件(session={}, turn={:?}, step={:?})",
+                event.event_type.as_str(),
+                event.session_id,
+                event.turn_id,
+                event.step_id,
+            )));
         }
         Ok(())
     }
@@ -270,63 +296,6 @@ fn event_from_record(rec: &logdb_client::Record, session_id: &str) -> Result<Age
     })
 }
 
-/// SQL query row (JSON string) → AgentEvent
-fn event_from_query_row(row: &str) -> Result<AgentEvent> {
-    let v: serde_json::Value =
-        serde_json::from_str(row).map_err(|e| {
-            AppError::Internal(format!("parse query row: {}", e))
-        })?;
-
-    let seq = v["seq"].as_i64().unwrap_or(0);
-    let event_type_str = v["event_type"].as_str().unwrap_or("");
-    let event_type =
-        EventType::from_str(event_type_str).ok_or_else(|| {
-            AppError::InvalidEventType(event_type_str.into())
-        })?;
-
-    let meta_str = v["metadata_json"].as_str().unwrap_or("{}");
-    let meta: serde_json::Value =
-        serde_json::from_str(meta_str).unwrap_or_default();
-    let turn_id = meta["turn_id"].as_str().and_then(|s| s.parse().ok());
-    let step_id = meta["step_id"].as_str().map(|s| s.to_string());
-    let schema_version = meta["schema_version"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-    let session_id =
-        meta["session_id"].as_str().unwrap_or("").to_string();
-
-    // content 在 query 中为 hex 字符串（logdbd 内部 blob→hex）
-    let content_hex = v["content"].as_str().unwrap_or("");
-    let payload: serde_json::Value =
-        if content_hex.is_empty() || content_hex == "null" {
-            serde_json::Value::Null
-        } else {
-            let bytes = hex::decode(content_hex).map_err(|e| {
-                AppError::Internal(format!("decode content hex: {}", e))
-            })?;
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        };
-
-    let ts_ns = v["ts_ns"].as_i64().unwrap_or(0);
-    let created_at = Utc.timestamp_nanos(ts_ns);
-
-    Ok(AgentEvent {
-        session_id,
-        seq,
-        turn_id,
-        step_id,
-        event_type,
-        schema_version,
-        payload,
-        created_at,
-    })
-}
-
-fn sql_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
 // ── EventStore for LogdbdEventStore ─────────────────────────────────────────
 
 #[async_trait]
@@ -383,41 +352,44 @@ impl EventStore for LogdbdEventStore {
     }
 
     async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
-        let sql = format!(
-            "SELECT content, metadata_json FROM records WHERE event_type = {} ORDER BY seq LIMIT 1",
-            sql_quote("session_started")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["session_started".into()],
+                    result: QueryResult::Records as i32,
+                    limit: 1, // oldest (ascending is the default order)
+                    ..Default::default()
+                },
+            )
+            .await?;
 
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        let meta_str = v["metadata_json"].as_str().unwrap_or("{}");
-        let meta: serde_json::Value =
-            serde_json::from_str(meta_str).unwrap_or_default();
+        let rec = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records.into_iter().next(),
+            _ => None,
+        };
+        let Some(rec) = rec else { return Ok(None) };
 
-        let content_hex = v["content"].as_str().unwrap_or("");
-        let payload: serde_json::Value =
-            if content_hex.is_empty() || content_hex == "null" {
-                serde_json::Value::Null
-            } else {
-                let bytes = hex::decode(content_hex).unwrap_or_default();
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            };
+        let payload: serde_json::Value = if rec.content.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&rec.content).unwrap_or_default()
+        };
 
         Ok(Some(Session {
             session_id: session_id.to_string(),
-            tenant_id: meta["tenant_id"]
-                .as_str()
-                .unwrap_or("default")
-                .to_string(),
-            user_id: meta["user_id"].as_str().unwrap_or("").to_string(),
+            tenant_id: rec
+                .metadata
+                .get("tenant_id")
+                .cloned()
+                .unwrap_or_else(|| "default".into()),
+            user_id: rec
+                .metadata
+                .get("user_id")
+                .cloned()
+                .unwrap_or_default(),
             agent_type: payload["agent_type"]
                 .as_str()
                 .unwrap_or("unknown")
@@ -428,71 +400,80 @@ impl EventStore for LogdbdEventStore {
     }
 
     async fn session_exists(&self, session_id: &str) -> Result<bool> {
-        let sql = format!(
-            "SELECT COUNT(*) AS cnt FROM records WHERE event_type = {}",
-            sql_quote("session_started")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(false);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["cnt"].as_i64().unwrap_or(0) > 0)
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["session_started".into()],
+                    result: QueryResult::Exists as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(matches!(
+            resp.result,
+            Some(query_response::Result::Exists(true))
+        ))
     }
 
     async fn is_session_ended(&self, session_id: &str) -> Result<bool> {
-        let sql = format!(
-            "SELECT COUNT(*) AS cnt FROM records WHERE event_type = {}",
-            sql_quote("session_ended")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(false);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["cnt"].as_i64().unwrap_or(0) > 0)
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["session_ended".into()],
+                    result: QueryResult::Exists as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(matches!(
+            resp.result,
+            Some(query_response::Result::Exists(true))
+        ))
     }
 
     // ── Seq ─────────────────────────────────────────────────────────────
 
     async fn get_max_seq(&self, session_id: &str) -> Result<i64> {
-        let sql = "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM records";
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["max_seq"].as_i64().unwrap_or(0))
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    result: QueryResult::Max as i32, // aggregate_field="" ⇒ seq
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(match resp.result {
+            Some(query_response::Result::Max(n)) => n as i64,
+            _ => 0,
+        })
     }
 
     async fn get_max_turn_id(&self, session_id: &str) -> Result<i64> {
-        let sql = "SELECT COALESCE(MAX(CAST(json_extract(metadata_json, '$.turn_id') AS INTEGER)), 0) AS max_turn_id FROM records WHERE json_extract(metadata_json, '$.turn_id') IS NOT NULL";
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["max_turn_id"].as_i64().unwrap_or(0))
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    aggregate_field: "turn_id".into(),
+                    result: QueryResult::Max as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(match resp.result {
+            Some(query_response::Result::Max(n)) => n as i64,
+            _ => 0,
+        })
     }
 
     // ── Write ───────────────────────────────────────────────────────────
@@ -648,35 +629,53 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         turn_id: i64,
     ) -> Result<Vec<AgentEvent>> {
-        let sql = format!(
-            "SELECT * FROM records WHERE json_extract(metadata_json, '$.turn_id') = '{}' ORDER BY seq ASC",
-            turn_id
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        rows.iter().map(|r| event_from_query_row(r)).collect()
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    metadata: vec![MetadataFilter {
+                        key: "turn_id".into(),
+                        value: turn_id.to_string(),
+                    }],
+                    result: QueryResult::Records as i32,
+                    ..Default::default() // ascending by seq
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
+        recs.iter().map(|r| event_from_record(r, session_id)).collect()
     }
 
     async fn get_latest_summary(
         &self,
         session_id: &str,
     ) -> Result<Option<AgentEvent>> {
-        let sql = format!(
-            "SELECT * FROM records WHERE event_type = {} ORDER BY seq DESC LIMIT 1",
-            sql_quote("summary_marker")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(None);
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["summary_marker".into()],
+                    result: QueryResult::Records as i32,
+                    limit: 1,
+                    descending: true, // latest
+                    ..Default::default()
+                },
+            )
+            .await?;
+        match resp.result {
+            Some(query_response::Result::Records(r)) => match r.records.into_iter().next() {
+                Some(rec) => Ok(Some(event_from_record(&rec, session_id)?)),
+                None => Ok(None),
+            },
+            _ => Ok(None),
         }
-        Ok(Some(event_from_query_row(&rows[0])?))
     }
 
     async fn get_turn_steps(
@@ -684,48 +683,84 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         turn_id: i64,
     ) -> Result<Vec<StepExecution>> {
-        let sql = format!(
-            "SELECT json_extract(e_start.metadata_json, '$.step_id') AS step_id, e_start.content AS start_content, e_start.ts_ns AS started_ts, e_end.ts_ns AS ended_ts, e_end.event_type AS end_event FROM records e_start JOIN records e_end ON json_extract(e_end.metadata_json, '$.step_id') = json_extract(e_start.metadata_json, '$.step_id') AND e_end.event_type IN ('llm_completed','llm_failed','tool_completed','tool_failed') WHERE json_extract(e_start.metadata_json, '$.turn_id') = '{tid}' AND e_start.event_type IN ('llm_invoked','tool_invoked') ORDER BY e_start.seq ASC",
-            tid = turn_id
-        );
+        // 原实现是 records 自连接(按 step_id 把 invoked 配对到 completed/failed)。
+        // 结构化查询无 JOIN,故拉取该 turn 全部相关记录后客户端配对。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    metadata: vec![MetadataFilter {
+                        key: "turn_id".into(),
+                        value: turn_id.to_string(),
+                    }],
+                    event_types: vec![
+                        "llm_invoked".into(),
+                        "tool_invoked".into(),
+                        "llm_completed".into(),
+                        "llm_failed".into(),
+                        "tool_completed".into(),
+                        "tool_failed".into(),
+                    ],
+                    result: QueryResult::Records as i32,
+                    ..Default::default() // ascending by seq
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
+
+        // terminal(completion/failure)按 step_id 索引;原 SQL 是 INNER JOIN,
+        // 故只保留有 terminal 配对的 invoke(未配对的 invoke 见 get_incomplete_steps)。
+        let mut terminals: HashMap<String, &logdb_client::Record> = HashMap::new();
+        for r in &recs {
+            if matches!(
+                r.event_type.as_str(),
+                "llm_completed" | "llm_failed" | "tool_completed" | "tool_failed"
+            ) {
+                if let Some(sid) = r.metadata.get("step_id") {
+                    terminals.entry(sid.clone()).or_insert(r);
+                }
+            }
+        }
 
         let mut steps = Vec::new();
-        for row_str in &rows {
-            let v: serde_json::Value =
-                serde_json::from_str(row_str).unwrap_or_default();
-            // content 在 query 结果中为 hex 字符串(logdbd blob→hex);
-            // step_type 在事件 payload 里(metadata_json 不含它)。
-            let content_hex = v["start_content"].as_str().unwrap_or("");
-            let step_type = if content_hex.is_empty() || content_hex == "null" {
-                None
-            } else {
-                hex::decode(content_hex)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                    .and_then(|p| {
-                        p.get("step_type")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
+        for r in &recs {
+            if !matches!(r.event_type.as_str(), "llm_invoked" | "tool_invoked") {
+                continue;
+            }
+            let step_id = r.metadata.get("step_id").cloned().unwrap_or_default();
+            let Some(end) = terminals.get(&step_id) else {
+                continue; // INNER JOIN:无 terminal 配对则丢弃
             };
-            let started_ts = v["started_ts"].as_i64().unwrap_or(0);
-            let ended_ts = v["ended_ts"].as_i64().unwrap_or(0);
+
+            // step_type 在 invoke 的 payload 里(metadata 不含它)。
+            let payload: serde_json::Value = if r.content.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&r.content).unwrap_or_default()
+            };
+            let step_type = payload
+                .get("step_type")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+
+            let started_ts = r.timestamp_ns as i64;
+            let ended_ts = end.timestamp_ns as i64;
             let duration_ms = if ended_ts > started_ts {
                 Some(((ended_ts - started_ts) as f64) / 1_000_000.0)
             } else {
                 None
             };
             steps.push(StepExecution {
-                step_id: v["step_id"].as_str().unwrap_or("").to_string(),
+                step_id,
                 step_type,
                 started_at: Utc.timestamp_nanos(started_ts),
                 ended_at: Some(Utc.timestamp_nanos(ended_ts)),
-                end_event: v["end_event"].as_str().map(|s| s.to_string()),
+                end_event: Some(end.event_type.clone()),
                 duration_ms,
             });
         }
@@ -738,45 +773,58 @@ impl EventStore for LogdbdEventStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<IncompleteTurn>> {
-        let sql = "SELECT json_extract(metadata_json, '$.turn_id') AS tid, metadata_json, ts_ns, content FROM records WHERE event_type = 'turn_started' AND NOT EXISTS (SELECT 1 FROM records e2 WHERE json_extract(e2.metadata_json, '$.turn_id') = json_extract(records.metadata_json, '$.turn_id') AND e2.event_type IN ('turn_completed','turn_failed','turn_canceled','turn_blocked')) ORDER BY CAST(tid AS INTEGER) ASC";
+        // 反连接:turn_started 且同 turn_id 无任何 terminal(turn_completed/…/blocked)。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["turn_started".into()],
+                    absent: Some(AbsentMatch {
+                        peer_event_types: vec![
+                            "turn_completed".into(),
+                            "turn_failed".into(),
+                            "turn_canceled".into(),
+                            "turn_blocked".into(),
+                        ],
+                        join_key: "turn_id".into(),
+                    }),
+                    result: QueryResult::Records as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
 
         let mut turns = Vec::new();
-        for row_str in &rows {
-            let v: serde_json::Value =
-                serde_json::from_str(row_str).unwrap_or_default();
-            let turn_id = v["tid"]
-                .as_str()
+        for r in &recs {
+            let turn_id = r
+                .metadata
+                .get("turn_id")
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
-            let ts_ns = v["ts_ns"].as_i64().unwrap_or(0);
-
-            // 从 turn_started 的 content(hex)解 payload,取 redo_group/redo_count
-            let content_hex = v["content"].as_str().unwrap_or("");
-            let (redo_group, redo_count) = if content_hex.is_empty() || content_hex == "null" {
-                ("unknown".to_string(), 0)
+            // redo_group/redo_count 在 turn_started 的 payload 里。
+            let payload: serde_json::Value = if r.content.is_empty() {
+                serde_json::Value::Null
             } else {
-                let payload: serde_json::Value = hex::decode(content_hex)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default();
-                (
-                    payload["redo_group"].as_str().unwrap_or("unknown").to_string(),
-                    payload["redo_count"].as_i64().unwrap_or(0) as i32,
-                )
+                serde_json::from_slice(&r.content).unwrap_or_default()
             };
-
             turns.push(IncompleteTurn {
                 turn_id,
-                redo_group,
-                redo_count,
-                turn_started_at: Utc.timestamp_nanos(ts_ns),
+                redo_group: payload["redo_group"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string(),
+                redo_count: payload["redo_count"].as_i64().unwrap_or(0) as i32,
+                turn_started_at: Utc.timestamp_nanos(r.timestamp_ns as i64),
             });
         }
+        // 原 SQL:ORDER BY CAST(tid AS INTEGER) ASC。
+        turns.sort_by_key(|t| t.turn_id);
         Ok(turns)
     }
 
@@ -784,64 +832,90 @@ impl EventStore for LogdbdEventStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<IncompleteStep>> {
-        let sql = "SELECT e.seq, json_extract(e.metadata_json, '$.turn_id') AS tid, json_extract(e.metadata_json, '$.step_id') AS sid, e.event_type, e.content, e.ts_ns FROM records e WHERE e.event_type IN ('llm_invoked','tool_invoked') AND NOT EXISTS (SELECT 1 FROM records e2 WHERE json_extract(e2.metadata_json, '$.step_id') = json_extract(e.metadata_json, '$.step_id') AND e2.event_type IN ('llm_completed','llm_failed','tool_completed','tool_failed')) ORDER BY e.seq ASC";
+        // 反连接:llm/tool_invoked 且同 step_id 无任何 terminal。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["llm_invoked".into(), "tool_invoked".into()],
+                    absent: Some(AbsentMatch {
+                        peer_event_types: vec![
+                            "llm_completed".into(),
+                            "llm_failed".into(),
+                            "tool_completed".into(),
+                            "tool_failed".into(),
+                        ],
+                        join_key: "step_id".into(),
+                    }),
+                    result: QueryResult::Records as i32,
+                    ..Default::default() // ascending by seq
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
 
-        let mut steps = Vec::new();
-        for row_str in &rows {
-            let v: serde_json::Value =
-                serde_json::from_str(row_str).unwrap_or_default();
-            let content_hex = v["content"].as_str().unwrap_or("");
-            let payload: serde_json::Value =
-                if content_hex.is_empty() || content_hex == "null" {
+        recs.iter()
+            .map(|r| {
+                let payload: serde_json::Value = if r.content.is_empty() {
                     serde_json::Value::Null
                 } else {
-                    let bytes =
-                        hex::decode(content_hex).unwrap_or_default();
-                    serde_json::from_slice(&bytes).unwrap_or_default()
+                    serde_json::from_slice(&r.content).unwrap_or_default()
                 };
-            steps.push(IncompleteStep {
-                seq: v["seq"].as_i64().unwrap_or(0),
-                turn_id: v["tid"]
-                    .as_str()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0),
-                step_id: v["sid"].as_str().unwrap_or("").to_string(),
-                start_event_type: v["event_type"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                payload,
-                started_at: Utc.timestamp_nanos(
-                    v["ts_ns"].as_i64().unwrap_or(0),
-                ),
-            });
-        }
-        Ok(steps)
+                Ok(IncompleteStep {
+                    seq: r.seq as i64,
+                    turn_id: r
+                        .metadata
+                        .get("turn_id")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0),
+                    step_id: r.metadata.get("step_id").cloned().unwrap_or_default(),
+                    start_event_type: r.event_type.clone(),
+                    payload,
+                    started_at: Utc.timestamp_nanos(r.timestamp_ns as i64),
+                })
+            })
+            .collect()
     }
 
     async fn detect_seq_gaps(
         &self,
         session_id: &str,
     ) -> Result<Vec<i64>> {
-        let sql = "SELECT seq + 1 AS missing_seq FROM records e1 WHERE NOT EXISTS (SELECT 1 FROM records e2 WHERE e2.seq = e1.seq + 1) AND seq < (SELECT MAX(seq) FROM records)";
+        // 找 seq 空洞:对每个 seq < MAX(seq),若 seq+1 不存在则报告 seq+1。
+        // 结构化查询无此谓词,拉取全部记录后客户端计算。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                let v: serde_json::Value =
-                    serde_json::from_str(r).ok()?;
-                v["missing_seq"].as_i64()
-            })
-            .collect())
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    result: QueryResult::Records as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
+
+        let mut seqs: Vec<u64> = recs.iter().map(|r| r.seq).collect();
+        seqs.sort_unstable();
+        let set: std::collections::HashSet<u64> = seqs.iter().copied().collect();
+        let max_seq = *seqs.last().unwrap_or(&0);
+
+        let mut gaps = Vec::new();
+        for &s in seqs.iter().filter(|&&s| s < max_seq) {
+            if !set.contains(&(s + 1)) {
+                gaps.push((s + 1) as i64);
+            }
+        }
+        Ok(gaps)
     }
 
     async fn is_turn_seq_continuous(
@@ -850,26 +924,44 @@ impl EventStore for LogdbdEventStore {
         turn_id: i64,
     ) -> Result<bool> {
         let gaps = self.detect_seq_gaps(session_id).await?;
-        let sql = format!(
-            "SELECT MIN(seq) AS mn, MAX(seq) AS mx FROM records WHERE json_extract(metadata_json, '$.turn_id') = '{}'",
-            turn_id
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(true);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        match (v["mn"].as_i64(), v["mx"].as_i64()) {
-            (Some(lo), Some(hi)) => {
-                Ok(!gaps.iter().any(|g| *g >= lo && *g <= hi))
-            }
-            _ => Ok(true),
-        }
+        let meta = vec![MetadataFilter {
+            key: "turn_id".into(),
+            value: turn_id.to_string(),
+        }];
+        // 该 turn 的 seq 上下界(原 SQL 一次 MIN/MAX;结构化查询每次一个聚合,发两次)。
+        let lo = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    metadata: meta.clone(),
+                    result: QueryResult::Min as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let hi = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    metadata: meta,
+                    result: QueryResult::Max as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let lo = match lo.result {
+            Some(query_response::Result::Min(n)) => n as i64,
+            _ => 0,
+        };
+        let hi = match hi.result {
+            Some(query_response::Result::Max(n)) => n as i64,
+            _ => 0,
+        };
+        // turn 无记录 ⇒ lo=hi=0;seq 从 1 起,gap 不会落入 [0,0] ⇒ 自然返回 true。
+        Ok(!gaps.iter().any(|g| *g >= lo && *g <= hi))
     }
 
     // ── Stats ───────────────────────────────────────────────────────────
@@ -878,30 +970,31 @@ impl EventStore for LogdbdEventStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<TokenUsageStats>> {
-        let sql = format!(
-            "SELECT content FROM records WHERE event_type = {}",
-            sql_quote("llm_completed")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["llm_completed".into()],
+                    result: QueryResult::Records as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
 
+        // 按 model 客户端聚合(SQL 原本只拉 content 行,聚合也在客户端)。
         let mut map: HashMap<String, TokenUsageStats> = HashMap::new();
-        for row_str in &rows {
-            let v: serde_json::Value =
-                serde_json::from_str(row_str).unwrap_or_default();
-            let content_hex = v["content"].as_str().unwrap_or("");
-            if content_hex.is_empty() || content_hex == "null" {
+        for r in &recs {
+            if r.content.is_empty() {
                 continue;
             }
-            let bytes = match hex::decode(content_hex) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
             let payload: serde_json::Value =
-                serde_json::from_slice(&bytes).unwrap_or_default();
+                serde_json::from_slice(&r.content).unwrap_or_default();
             let model = payload
                 .get("model")
                 .and_then(|x| x.as_str())
@@ -941,22 +1034,26 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         after_seq: i64,
     ) -> Result<i64> {
-        let sql = format!(
-            "SELECT COUNT(DISTINCT json_extract(metadata_json, '$.turn_id')) AS cnt FROM records WHERE seq > {} AND json_extract(metadata_json, '$.turn_id') IS NOT NULL AND event_type = {}",
-            after_seq,
-            sql_quote("turn_started")
-        );
+        // SQL `seq > N` ⇒ from_seq = N+1(引擎 from_seq 含端点);turn_id 非空由
+        // 聚合跳过缺该字段的记录保证。COUNT(DISTINCT turn_id) where turn_started。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["cnt"].as_i64().unwrap_or(0))
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["turn_started".into()],
+                    from_seq: Some((after_seq + 1).max(1) as u64),
+                    aggregate_field: "turn_id".into(),
+                    result: QueryResult::CountDistinct as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(match resp.result {
+            Some(query_response::Result::CountDistinct(n)) => n as i64,
+            _ => 0,
+        })
     }
 
     async fn count_events_after_seq(
@@ -964,22 +1061,36 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         after_seq: i64,
     ) -> Result<i64> {
-        let sql = format!(
-            "SELECT COUNT(*) AS cnt FROM records WHERE seq > {} AND event_type IN ({})",
-            after_seq,
-            "'turn_pending','turn_started','turn_completed','turn_failed','turn_canceled','turn_blocked','llm_invoked','llm_completed','llm_failed','tool_invoked','tool_completed','tool_failed'"
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(&rows[0]).unwrap_or_default();
-        Ok(v["cnt"].as_i64().unwrap_or(0))
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec![
+                        "turn_pending".into(),
+                        "turn_started".into(),
+                        "turn_completed".into(),
+                        "turn_failed".into(),
+                        "turn_canceled".into(),
+                        "turn_blocked".into(),
+                        "llm_invoked".into(),
+                        "llm_completed".into(),
+                        "llm_failed".into(),
+                        "tool_invoked".into(),
+                        "tool_completed".into(),
+                        "tool_failed".into(),
+                    ],
+                    from_seq: Some((after_seq + 1).max(1) as u64),
+                    result: QueryResult::Count as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(match resp.result {
+            Some(query_response::Result::Count(n)) => n as i64,
+            _ => 0,
+        })
     }
 
     async fn get_llm_payloads_after_seq(
@@ -987,28 +1098,27 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         after_seq: i64,
     ) -> Result<Vec<String>> {
-        let sql = format!(
-            "SELECT content FROM records WHERE seq > {} AND event_type = {}",
-            after_seq,
-            sql_quote("llm_completed")
-        );
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        Ok(rows
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["llm_completed".into()],
+                    from_seq: Some((after_seq + 1).max(1) as u64),
+                    result: QueryResult::Records as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let recs = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
+        Ok(recs
             .iter()
-            .filter_map(|r| {
-                let v: serde_json::Value =
-                    serde_json::from_str(r).ok()?;
-                let h = v["content"].as_str().unwrap_or("");
-                if h.is_empty() || h == "null" {
-                    return None;
-                }
-                let bytes = hex::decode(h).ok()?;
-                Some(String::from_utf8_lossy(&bytes).to_string())
-            })
+            .filter(|r| !r.content.is_empty())
+            .map(|r| String::from_utf8_lossy(&r.content).to_string())
             .collect())
     }
 
@@ -1017,23 +1127,31 @@ impl EventStore for LogdbdEventStore {
         session_id: &str,
         limit: i64,
     ) -> Result<Vec<i64>> {
-        let sql = format!(
-            "SELECT DISTINCT CAST(json_extract(metadata_json, '$.turn_id') AS INTEGER) AS tid FROM records WHERE event_type = 'turn_started' ORDER BY tid DESC LIMIT {}",
-            limit
-        );
+        // 引擎 DISTINCT_VALUES 按 seq 返回字符串;原 SQL 要数值 DESC LIMIT n,故客户端排序截断。
         let mut client = self.client.lock().await;
-        let rows = client
-            .query(&self.namespace, session_id, &sql)
-            .await
-            .map_err(|e| AppError::Internal(format!("logdbd query: {}", e)))?;
-        Ok(rows
+        let resp = self
+            .run_query(
+                &mut client,
+                session_id,
+                QueryRequest {
+                    event_types: vec!["turn_started".into()],
+                    aggregate_field: "turn_id".into(),
+                    result: QueryResult::DistinctValues as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let values = match resp.result {
+            Some(query_response::Result::DistinctValues(d)) => d.values,
+            _ => vec![],
+        };
+        let mut ids: Vec<i64> = values
             .iter()
-            .filter_map(|r| {
-                let v: serde_json::Value =
-                    serde_json::from_str(r).ok()?;
-                v["tid"].as_i64()
-            })
-            .collect())
+            .filter_map(|s| s.parse::<i64>().ok())
+            .collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a)); // DESC
+        ids.truncate(limit.max(0) as usize);
+        Ok(ids)
     }
 
     // ── Archive ─────────────────────────────────────────────────────────
