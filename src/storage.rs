@@ -1176,20 +1176,17 @@ impl EventStore for LogdbdEventStore {
 
 #[cfg(test)]
 mod logdbd_tests {
-    //! LogdbdEventStore 集成测试 — 起真实 logdbd(内嵌 lib + Indexer)验证 EventStore 契约。
+    //! LogdbdEventStore 集成测试 — 起真实 logdbd(内嵌 lib)验证 EventStore 契约。
     //!
-    //! 与 logdb-client/tests/integration.rs 的关键区别:本 harness 额外启动 Indexer
-    //! 后台线程。query() RPC 读 per-stream SQLite 缓存,该缓存由 Indexer 异步填充
-    //!(~10ms 轮询 logdb durable_cursor);不启动 Indexer 则所有 query 返回空。
-    //! 故每次 append 后用 `wait_seq` 轮询缓存追平,再断言/写下一个依赖事件。
+    //! cr-027 后 query() 直读 segment 的 committed cursor(无 SQLite/无 Indexer)。
+    //! append 返回后 committed 游标在亚毫秒级推进,故每次 append 后用 `wait_seq`
+    //! 轮询 get_max_seq 追平,再断言/写下一个依赖事件。
 
     use super::{EventStore, LogdbdEventStore};
     use crate::error::AppError;
     use crate::models::{AgentEvent, EventType};
 
-    use logdbd::cache::Indexer;
     use logdbd::catalog::Catalog;
-    use logdbd::config::CacheConfig;
     use logdbd::consumer::ConsumerTracker;
     use logdbd::pb::log_db_service_server::LogDbServiceServer;
     use logdbd::service::LogDbServiceImpl;
@@ -1213,28 +1210,15 @@ mod logdbd_tests {
         Storage::new(db, 1)
     }
 
-    /// 起一个真实 logdbd gRPC server(含 Indexer 后台线程)。
-    /// 返回 (addr, tempdir);tempdir 必须在测试期间存活(持有 data_dir + cache_dir)。
+    /// 起一个真实 logdbd gRPC server(cr-027 后无 Indexer/SQLite;query 直读 segment)。
+    /// 返回 (addr, tempdir);tempdir 必须在测试期间存活(持有 data_dir)。
     async fn start_server() -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().join("cache");
-        std::fs::create_dir_all(&cache_dir).unwrap();
 
         let storage = Arc::new(test_storage(dir.path()));
         let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
         let subscribe_hub = Arc::new(SubscribeHub::new());
         let consumer_tracker = Arc::new(ConsumerTracker::new(None));
-
-        // Indexer:轮询 logdb durable_cursor,把记录写进 per-stream SQLite 缓存。
-        // query() 读这个缓存 — 不启动 Indexer 则所有 query 返回空。
-        let indexer = Arc::new(Indexer::new(
-            storage.db_arc(),
-            Arc::clone(&catalog),
-            cache_dir.clone(),
-            &CacheConfig::default(),
-            Arc::clone(&subscribe_hub),
-        ));
-        indexer.clone().start();
 
         let svc = LogDbServiceImpl::new(
             Arc::clone(&storage),
@@ -1243,7 +1227,6 @@ mod logdbd_tests {
             Arc::clone(&subscribe_hub),
             "test-node".into(),
             "primary".into(),
-            cache_dir,
         );
         let svc = LogDbServiceServer::new(svc);
 
@@ -1266,19 +1249,15 @@ mod logdbd_tests {
         (store, dir)
     }
 
-    /// 轮询直到 query 缓存的 max_seq >= expected(Indexer 异步追平)。
-    /// 这是测试与 logdbd 异步索引之间的同步点。
-    ///
-    /// 容忍瞬态 query 错误:Indexer 在处理某 stream 第一条记录时才建 `records`
-    /// 表,此前该 stream 的缓存 DB 不存在表,query 返回 "no such table"。
-    /// 这属正常竞态,轮询即可,不视作失败。
+    /// 轮询直到 committed cursor 的 max_seq >= expected。
+    /// append 返回后 committed 游标推进有亚毫秒级延迟,这是测试与 logdbd 的同步点。
     async fn wait_seq(store: &LogdbdEventStore, sid: &str, expected: i64) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             match store.get_max_seq(sid).await {
                 Ok(v) if v >= expected => return,
                 Ok(_) => {}
-                Err(_) => {} // 表尚未建(Indexer 未处理到)→ 继续等
+                Err(_) => {} // committed 游标尚未推进 → 继续等
             }
             if std::time::Instant::now() >= deadline {
                 panic!(
