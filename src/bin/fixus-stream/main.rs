@@ -43,6 +43,59 @@ fn is_terminal(et: &str) -> bool {
     TERMINAL_EVENTS.contains(&et)
 }
 
+// ── 历史回放(E3:晚 attach / 重连补回放)──
+
+/// `plan_history_replay` 的结果。
+struct ReplayPlan {
+    /// 按 seq 升序、已过滤本 turn 的 (event_type, payload_utf8)。
+    events: Vec<(String, String)>,
+    /// 历史中是否已出现终态 → turn 早已完成,发完即结束、无需再 tail。
+    hit_terminal: bool,
+    /// 本 turn 历史的最大 seq(含),用于 live 流去重。
+    last_seq: i64,
+}
+
+/// 从 scan_all 历史快照中挑出本 turn 事件,按 seq 升序生成 SSE 事件;
+/// 命中终态即截断(重连已完成 turn 的场景)。纯函数,可单测。
+fn plan_history_replay(history: &[logdb_client::Record], turn_id: i64) -> ReplayPlan {
+    let mut matching: Vec<&logdb_client::Record> = history
+        .iter()
+        .filter(|rec| {
+            rec.metadata
+                .get("turn_id")
+                .and_then(|s| s.parse::<i64>().ok())
+                == Some(turn_id)
+        })
+        .collect();
+    matching.sort_by_key(|rec| rec.seq);
+
+    let mut events: Vec<(String, String)> = Vec::new();
+    let mut hit_terminal = false;
+    let mut last_seq: i64 = 0;
+    for rec in matching {
+        last_seq = last_seq.max(rec.seq as i64);
+        events.push((
+            rec.event_type.clone(),
+            String::from_utf8_lossy(&rec.content).into_owned(),
+        ));
+        if is_terminal(&rec.event_type) {
+            hit_terminal = true;
+            break;
+        }
+    }
+
+    ReplayPlan {
+        events,
+        hit_terminal,
+        last_seq,
+    }
+}
+
+/// live 流去重:seq <= 已回放的历史最大 seq → 历史已发,跳过。
+fn should_emit_live(rec_seq: i64, last_history_seq: i64) -> bool {
+    rec_seq > last_history_seq
+}
+
 // ── Subscribe 的事件类型(Turn 级 + Step 级)──
 
 const SUBSCRIBE_EVENT_TYPES: &[&str] = &[
@@ -148,7 +201,53 @@ async fn stream_handler(
             tokio::spawn(token_loop(url.clone(), session_id.clone(), turn_id, tx2))
         });
 
-        // 事件循环:消费 logdbd Record,过滤 turn_id,转 SSE
+        // ── 历史回放(E3):subscribe 是纯 live tail,attach 前写入的事件(如
+        // turn_started)会丢。晚 attach / 重连时先 scan_all 回放本 turn 已提交事件。
+        // subscribe 已在 scan 前 attach,故 (last_seq, ∞) 仍由 live 流覆盖;
+        // live 端 seq <= last_seq 的事件去重跳过(should_emit_live)。
+        // 历史读失败不致命 → 退化为纯 live(旧行为)。
+        let mut last_history_seq: i64 = 0;
+        let mut history_hit_terminal = false;
+        {
+            let mut c = client.lock().await;
+            match c.scan_all(&namespace, &session_id, 1).await {
+                Ok(history) => {
+                    drop(c);
+                    let plan = plan_history_replay(&history, turn_id);
+                    last_history_seq = plan.last_seq;
+                    for (et, payload) in plan.events {
+                        if tx
+                            .send(Ok(Event::default().event(et).data(payload)))
+                            .await
+                            .is_err()
+                        {
+                            if let Some(h) = token_task {
+                                h.abort();
+                            }
+                            return; // 客户端断连
+                        }
+                    }
+                    history_hit_terminal = plan.hit_terminal;
+                }
+                Err(e) => {
+                    drop(c);
+                    tracing::warn!("scan_all history failed: {}", e);
+                }
+            }
+        }
+
+        // 历史中已出现终态 → turn 早已完成(重连查看历史),发 done 结束。
+        if history_hit_terminal {
+            let _ = tx
+                .send(Ok(Event::default().event("done").data("{}")))
+                .await;
+            if let Some(h) = token_task {
+                h.abort();
+            }
+            return;
+        }
+
+        // ── live 事件循环:subscribe,seq <= last_history_seq 去重。
         let mut sent_done = false;
         while let Some(record) = stream.next().await {
             let rec = match record {
@@ -158,6 +257,10 @@ async fn stream_handler(
                     break;
                 }
             };
+
+            if !should_emit_live(rec.seq as i64, last_history_seq) {
+                continue; // 历史已发,去重
+            }
 
             let rec_turn_id: Option<i64> = rec
                 .metadata
@@ -250,4 +353,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! E3 历史回放的核心逻辑单测(纯函数,不依赖 logdbd)。
+    use super::*;
+    use std::collections::HashMap;
+
+    fn rec(seq: u64, turn_id: i64, etype: &str, content: &str) -> logdb_client::Record {
+        let mut md = HashMap::new();
+        md.insert("turn_id".into(), turn_id.to_string());
+        logdb_client::Record {
+            seq,
+            event_type: etype.into(),
+            content: content.as_bytes().to_vec(),
+            metadata: md,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_replay_filters_by_turn_and_orders_by_seq() {
+        // 故意乱序:turn 1 有 seq 1/3,turn 2 有 seq 2,验证过滤 + seq 排序。
+        let history = vec![
+            rec(3, 1, "llm_invoked", r#""c3""#),
+            rec(1, 1, "turn_started", "{}"),
+            rec(2, 2, "turn_started", "{}"),
+        ];
+        let plan = plan_history_replay(&history, 1);
+        assert!(!plan.hit_terminal);
+        assert_eq!(plan.last_seq, 3);
+        assert_eq!(plan.events.len(), 2);
+        assert_eq!(plan.events[0].0, "turn_started"); // seq 1
+        assert_eq!(plan.events[1].0, "llm_invoked"); // seq 3
+    }
+
+    #[test]
+    fn plan_replay_stops_at_terminal_and_includes_it() {
+        let history = vec![
+            rec(1, 1, "turn_started", "{}"),
+            rec(2, 1, "llm_invoked", r#""c2""#),
+            rec(3, 1, "turn_completed", r#"{"output":"done"}"#),
+            rec(4, 1, "llm_invoked", r#""after-terminal""#),
+        ];
+        let plan = plan_history_replay(&history, 1);
+        assert!(plan.hit_terminal);
+        assert_eq!(plan.last_seq, 3);
+        assert_eq!(plan.events.len(), 3); // 含终态本身;其后的事件不发
+        assert_eq!(plan.events.last().unwrap().0, "turn_completed");
+    }
+
+    #[test]
+    fn plan_replay_empty_for_unknown_turn() {
+        let history = vec![rec(1, 9, "turn_started", "{}")];
+        let plan = plan_history_replay(&history, 1);
+        assert!(plan.events.is_empty());
+        assert!(!plan.hit_terminal);
+        assert_eq!(plan.last_seq, 0);
+    }
+
+    #[test]
+    fn should_emit_live_dedups_by_seq_threshold() {
+        assert!(!should_emit_live(3, 5)); // 历史 max=5,seq 3 已发
+        assert!(!should_emit_live(5, 5)); // 边界:等于历史 max → 已发
+        assert!(should_emit_live(6, 5)); // 新事件
+        assert!(should_emit_live(1, 0)); // 无历史(last=0)→ 全发
+    }
 }
