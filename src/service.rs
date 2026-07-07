@@ -81,8 +81,9 @@ pub async fn start_turn(
     redo_group: Option<&str>,
 ) -> Result<(i64, String, AgentEvent)> {
     // 检查 session 存在且未结束。
-    // session_exists 经 query cache(logdbd Indexer 异步索引),紧随 create_session
-    // 调用 start_turn 时可能短暂查不到(表未建 / 未索引)→ 容忍一个短窗口重试。
+    // session_exists 直读 committed cursor(cr-027,无 Indexer/SQLite);紧随
+    // create_session 调用 start_turn 时 committed 游标推进有亚毫秒级延迟,
+    // 可能短暂查不到 → 容忍一个短窗口重试。
     let mut exists = false;
     for _ in 0..30 {
         match store.session_exists(session_id).await {
@@ -90,7 +91,7 @@ pub async fn start_turn(
                 exists = true;
                 break;
             }
-            Ok(false) | Err(_) => {} // 缓存尚未追平,继续
+            Ok(false) | Err(_) => {} // committed 游标尚未推进,继续
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
