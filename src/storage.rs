@@ -20,7 +20,8 @@ use tokio::sync::Mutex;
 
 use crate::error::{AppError, Result};
 use crate::models::{
-    AgentEvent, EventType, IncompleteStep, IncompleteTurn, Task, StepExecution, TokenUsageStats,
+    AgentEvent, EventType, IncompleteStep, IncompleteTurn, Provenance, StepExecution, Task,
+    TaskState, TokenUsageStats,
 };
 
 // ── EventStore Trait ────────────────────────────────────────────────────────
@@ -34,16 +35,20 @@ pub trait EventStore: Send + Sync {
 
     async fn create_task(
         &self,
-        task_id: &str,
+        task_type: &str,
         tenant_id: &str,
         user_id: &str,
-        agent_type: &str,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<AgentEvent>;
+        provenance: &Provenance,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(String, AgentEvent)>;
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>>;
     async fn task_exists(&self, task_id: &str) -> Result<bool>;
     async fn is_task_ended(&self, task_id: &str) -> Result<bool>;
+
+    /// 派生 Task 当前状态(从 Task 级事件流投影,spec §4.4)。
+    /// 不存在 task_created → 返回 None(调用方判 TaskNotFound)。
+    async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>>;
 
     // ── Seq ─────────────────────────────────────────────────────────────
 
@@ -172,6 +177,10 @@ impl LogdbdEventStore {
         use EventType::*;
         let (conflict_types, scope): (Vec<&str>, &str) = match event.event_type {
             SessionEnded => (vec!["session_ended"], "session"),
+            TaskSucceeded | TaskFailed | TaskCanceled => (
+                vec!["task_succeeded", "task_failed", "task_canceled"],
+                "task",
+            ),
             TurnCompleted | TurnFailed | TurnCanceled | TurnBlocked => (
                 vec!["turn_completed", "turn_failed", "turn_canceled", "turn_blocked"],
                 "turn",
@@ -240,6 +249,78 @@ impl LogdbdEventStore {
         }
         Ok(())
     }
+
+    /// 从 Task 级事件流派生状态(spec §4.4 projection)。
+    ///
+    /// - 取最新 Task 迁移事件 → 基础态
+    /// - 基础态 == Claimed 且存在 task_claimed 之后的 turn_started → Executing
+    ///   (spec §8.2 只列 7 事件,§4 图有 8 态;executing 由 turn_started 派生)
+    async fn derive_task_state(
+        &self,
+        client: &mut Client,
+        task_id: &str,
+    ) -> Result<TaskState> {
+        let task_events = [
+            "task_created",
+            "task_ready",
+            "task_claimed",
+            "task_blocked",
+            "task_succeeded",
+            "task_failed",
+            "task_canceled",
+        ];
+        let resp = self
+            .run_query(
+                client,
+                task_id,
+                QueryRequest {
+                    event_types: task_events.iter().map(|s| s.to_string()).collect(),
+                    result: QueryResult::Records as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let records = match resp.result {
+            Some(query_response::Result::Records(r)) => r.records,
+            _ => vec![],
+        };
+
+        // 最新迁移事件(seq 最大者)
+        let latest = records.iter().max_by_key(|r| r.seq);
+        let base = match latest.map(|r| r.event_type.as_str()) {
+            Some("task_created") => TaskState::Created,
+            Some("task_ready") => TaskState::Ready,
+            Some("task_claimed") => TaskState::Claimed,
+            Some("task_blocked") => TaskState::Blocked,
+            Some("task_succeeded") => TaskState::Succeeded,
+            Some("task_failed") => TaskState::Failed,
+            Some("task_canceled") => TaskState::Canceled,
+            _ => TaskState::Created,
+        };
+
+        // Claimed → 检查是否有之后的 turn_started(派生 Executing)
+        if base == TaskState::Claimed {
+            let claimed_seq = latest.map(|r| r.seq).unwrap_or(0);
+            let resp = self
+                .run_query(
+                    client,
+                    task_id,
+                    QueryRequest {
+                        event_types: vec!["turn_started".into()],
+                        result: QueryResult::Max as i32,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            if let Some(query_response::Result::Max(ts_seq)) = resp.result {
+                if (ts_seq as i64) > (claimed_seq as i64) {
+                    return Ok(TaskState::Executing);
+                }
+            }
+        }
+
+        Ok(base)
+    }
 }
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────
@@ -304,24 +385,31 @@ impl EventStore for LogdbdEventStore {
 
     async fn create_task(
         &self,
-        task_id: &str,
+        task_type: &str,
         tenant_id: &str,
         user_id: &str,
-        agent_type: &str,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<AgentEvent> {
+        provenance: &Provenance,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(String, AgentEvent)> {
+        // fixus 分配 task_id(UUIDv7,全局唯一单调)— spec §8.4
+        let task_id = format!(
+            "task_{}",
+            uuid::Uuid::now_v7().to_string().replace('-', "")
+        );
+
         let payload = serde_json::json!({
-            "agent_type": agent_type,
-            "user_id": user_id,
-            "initial_config": metadata.unwrap_or(serde_json::Value::Null),
+            "task_type": task_type,
+            "provenance": provenance,
+            "body": body.cloned().unwrap_or(serde_json::Value::Null),
         });
         let content = serde_json::to_vec(&payload)
             .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
 
         let mut meta = HashMap::new();
-        meta.insert("task_id".into(), task_id.to_string());
+        meta.insert("task_id".into(), task_id.clone());
         meta.insert("tenant_id".into(), tenant_id.to_string());
         meta.insert("user_id".into(), user_id.to_string());
+        meta.insert("task_type".into(), task_type.to_string());
 
         let ts_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
 
@@ -329,8 +417,8 @@ impl EventStore for LogdbdEventStore {
         let resp = client
             .append_full(
                 &self.namespace,
-                task_id,
-                "session_started",
+                &task_id,
+                "task_created",
                 "application/json",
                 &meta,
                 ts_ns,
@@ -339,33 +427,36 @@ impl EventStore for LogdbdEventStore {
             .await
             .map_err(|e| AppError::Internal(format!("logdbd append: {}", e)))?;
 
-        Ok(AgentEvent {
-            task_id: task_id.to_string(),
+        let event = AgentEvent {
+            task_id: task_id.clone(),
             seq: resp.seq as i64,
             turn_id: None,
             step_id: None,
-            event_type: EventType::SessionStarted,
+            event_type: EventType::TaskCreated,
             schema_version: 1,
             payload,
             created_at: Utc::now(),
-        })
+        };
+
+        Ok((task_id, event))
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
         let mut client = self.client.lock().await;
+
+        // 读 task_created(head 事实:task_type / provenance / body)
         let resp = self
             .run_query(
                 &mut client,
                 task_id,
                 QueryRequest {
-                    event_types: vec!["session_started".into()],
+                    event_types: vec!["task_created".into()],
                     result: QueryResult::Records as i32,
-                    limit: 1, // oldest (ascending is the default order)
+                    limit: 1, // oldest(ascending 默认序)
                     ..Default::default()
                 },
             )
             .await?;
-
         let rec = match resp.result {
             Some(query_response::Result::Records(r)) => r.records.into_iter().next(),
             _ => None,
@@ -378,37 +469,51 @@ impl EventStore for LogdbdEventStore {
             serde_json::from_slice(&rec.content).unwrap_or_default()
         };
 
+        let provenance: Provenance = serde_json::from_value(
+            payload
+                .get("provenance")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .unwrap_or_else(|_| Provenance {
+            source_channel: "unknown".into(),
+            source_session_id: None,
+            source_user_id: None,
+            source_tenant_id: None,
+            source_message_id: None,
+            created_at: Utc::now(),
+            created_by: "unknown".into(),
+        });
+
+        let tenant_id = rec
+            .metadata
+            .get("tenant_id")
+            .cloned()
+            .or_else(|| provenance.source_tenant_id.clone())
+            .unwrap_or_else(|| "default".into());
+        let user_id = rec
+            .metadata
+            .get("user_id")
+            .cloned()
+            .or_else(|| provenance.source_user_id.clone())
+            .unwrap_or_default();
+
+        // 派生当前 state(spec §4.4 projection)
+        let state = self.derive_task_state(&mut client, task_id).await?;
+
         Ok(Some(Task {
             task_id: task_id.to_string(),
-            tenant_id: rec
-                .metadata
-                .get("tenant_id")
-                .cloned()
-                .unwrap_or_else(|| "default".into()),
-            user_id: rec
-                .metadata
-                .get("user_id")
-                .cloned()
-                .unwrap_or_default(),
-            task_type: payload["agent_type"]
+            tenant_id,
+            user_id,
+            task_type: payload["task_type"]
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string(),
-            // TODO(Plan B Task 4): derive state from task events; read provenance from task_created.
-            // 临时占位:create_task 仍发 session_started 时,head 无 state/provenance,填默认。
-            state: crate::models::TaskState::Created,
-            provenance: crate::models::Provenance {
-                source_channel: "api".into(),
-                source_session_id: None,
-                source_user_id: rec.metadata.get("user_id").cloned(),
-                source_tenant_id: rec.metadata.get("tenant_id").cloned(),
-                source_message_id: None,
-                created_at: Utc::now(),
-                created_by: "legacy".into(),
-            },
-            body: None,
+            state,
+            provenance,
+            body: payload.get("body").filter(|v| !v.is_null()).cloned(),
             created_at: Utc::now(),
-            metadata: payload.get("initial_config").cloned(),
+            metadata: None,
         }))
     }
 
@@ -419,7 +524,7 @@ impl EventStore for LogdbdEventStore {
                 &mut client,
                 task_id,
                 QueryRequest {
-                    event_types: vec!["session_started".into()],
+                    event_types: vec!["task_created".into()],
                     result: QueryResult::Exists as i32,
                     ..Default::default()
                 },
@@ -438,7 +543,11 @@ impl EventStore for LogdbdEventStore {
                 &mut client,
                 task_id,
                 QueryRequest {
-                    event_types: vec!["session_ended".into()],
+                    event_types: vec![
+                        "task_succeeded".into(),
+                        "task_failed".into(),
+                        "task_canceled".into(),
+                    ],
                     result: QueryResult::Exists as i32,
                     ..Default::default()
                 },
@@ -448,6 +557,29 @@ impl EventStore for LogdbdEventStore {
             resp.result,
             Some(query_response::Result::Exists(true))
         ))
+    }
+
+    async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>> {
+        let mut client = self.client.lock().await;
+        // 先确认 task_created 存在(无则 None)
+        let exists = self
+            .run_query(
+                &mut client,
+                task_id,
+                QueryRequest {
+                    event_types: vec!["task_created".into()],
+                    result: QueryResult::Exists as i32,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !matches!(
+            exists.result,
+            Some(query_response::Result::Exists(true))
+        ) {
+            return Ok(None);
+        }
+        self.derive_task_state(&mut client, task_id).await.map(Some)
     }
 
     // ── Seq ─────────────────────────────────────────────────────────────
@@ -1284,43 +1416,77 @@ mod logdbd_tests {
         }
     }
 
+    fn test_provenance() -> crate::models::Provenance {
+        crate::models::Provenance {
+            source_channel: "api".into(),
+            source_session_id: None,
+            source_user_id: Some("u".into()),
+            source_tenant_id: Some("t".into()),
+            source_message_id: None,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        }
+    }
+
+    /// 创建测试 Task,返回 fixus 分配的 task_id(create_task 新签名:fixus 分配 id)。
+    async fn create_test_task(store: &LogdbdEventStore, task_type: &str) -> String {
+        let prov = test_provenance();
+        let (tid, _ev) = store
+            .create_task(task_type, "t", "u", &prov, None)
+            .await
+            .unwrap();
+        tid
+    }
+
     // ── Session 生命周期 ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn create_session_round_trip() {
+    async fn create_task_round_trip() {
         let (store, _dir) = setup().await;
-        let sid = "sess-create";
-        let ev = store
-            .create_task(sid, "tenant-a", "user-1", "claude-code", None)
+        let prov = crate::models::Provenance {
+            source_channel: "api".into(),
+            source_session_id: None,
+            source_user_id: Some("user-1".into()),
+            source_tenant_id: Some("tenant-a".into()),
+            source_message_id: None,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        };
+        let (tid, ev) = store
+            .create_task("claude-code", "tenant-a", "user-1", &prov, None)
             .await
             .unwrap();
-        assert_eq!(ev.event_type, EventType::SessionStarted);
+        assert_eq!(ev.event_type, EventType::TaskCreated);
         assert_eq!(ev.seq, 1);
+        assert_eq!(ev.task_id, tid);
+        assert!(tid.starts_with("task_"), "fixus-assigned id: {}", tid);
 
-        wait_seq(&store, sid, 1).await;
-        assert!(store.task_exists(sid).await.unwrap());
+        wait_seq(&store, &tid, 1).await;
+        assert!(store.task_exists(&tid).await.unwrap());
 
-        let s = store.get_task(sid).await.unwrap().unwrap();
-        assert_eq!(s.task_id, sid);
+        let s = store.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(s.task_id, tid);
         assert_eq!(s.tenant_id, "tenant-a");
         assert_eq!(s.user_id, "user-1");
         assert_eq!(s.task_type, "claude-code");
-        assert!(!store.is_task_ended(sid).await.unwrap());
+        assert_eq!(s.state, crate::models::TaskState::Created);
+        assert!(!store.is_task_ended(&tid).await.unwrap());
     }
 
     #[tokio::test]
-    async fn session_ended_detected() {
+    async fn task_terminal_detected() {
         let (store, _dir) = setup().await;
-        let sid = "sess-end";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
         assert!(!store.is_task_ended(sid).await.unwrap());
 
+        // task_canceled(终态)→ is_task_ended true
         let end = AgentEvent::new(
             sid.into(),
             None,
             None,
-            EventType::SessionEnded,
+            EventType::TaskCanceled,
             serde_json::json!({"reason": "done"}),
         );
         assert_eq!(store.write_event(&end).await.unwrap(), 2);
@@ -1333,8 +1499,8 @@ mod logdbd_tests {
     #[tokio::test]
     async fn terminal_uniqueness_rejects_duplicate_turn_terminal() {
         let (store, _dir) = setup().await;
-        let sid = "sess-turn-term";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         let ts = AgentEvent::new(
@@ -1377,8 +1543,8 @@ mod logdbd_tests {
     #[tokio::test]
     async fn terminal_uniqueness_rejects_duplicate_step_terminal() {
         let (store, _dir) = setup().await;
-        let sid = "sess-step-term";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         let inv = AgentEvent::new(
@@ -1422,8 +1588,8 @@ mod logdbd_tests {
     #[tokio::test]
     async fn get_turn_steps_pairs_invoked_completed() {
         let (store, _dir) = setup().await;
-        let sid = "sess-steps";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         // step-1: llm_invoked → llm_completed
@@ -1486,15 +1652,13 @@ mod logdbd_tests {
     #[tokio::test]
     async fn seq_monotonic_and_no_gaps() {
         let (store, _dir) = setup().await;
-        let sid = "sess-seq";
-        assert_eq!(
-            store
-                .create_task(sid, "t", "u", "a", None)
-                .await
-                .unwrap()
-                .seq,
-            1
-        );
+        let prov = test_provenance();
+        let (sid, ev) = store
+            .create_task("a", "t", "u", &prov, None)
+            .await
+            .unwrap();
+        assert_eq!(ev.seq, 1, "task_created seq must be 1");
+        let sid = sid.as_str();
 
         for tid in 1..=3i64 {
             let e = AgentEvent::new(
@@ -1524,8 +1688,8 @@ mod logdbd_tests {
     #[tokio::test]
     async fn incomplete_turns_parse_redo_group() {
         let (store, _dir) = setup().await;
-        let sid = "sess-redo";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         // turn 7 started(带 redo_group/redo_count),未终止 → 应出现在 incomplete 列表
@@ -1556,8 +1720,8 @@ mod logdbd_tests {
     #[tokio::test]
     async fn write_events_batch_returns_contiguous_seqs() {
         let (store, _dir) = setup().await;
-        let sid = "sess-batch";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         let events = vec![
@@ -1596,19 +1760,86 @@ mod logdbd_tests {
     #[tokio::test]
     async fn get_event_reads_back_via_grpc() {
         let (store, _dir) = setup().await;
-        let sid = "sess-read";
-        store.create_task(sid, "t", "u", "a", None).await.unwrap();
+        let sid = create_test_task(&store, "a").await;
+        let sid = sid.as_str();
         wait_seq(&store, sid, 1).await;
 
         // get_event 走原生 gRPC read(不经 query cache)
         let ev = store.get_event(sid, 1).await.unwrap().unwrap();
-        assert_eq!(ev.event_type, EventType::SessionStarted);
+        assert_eq!(ev.event_type, EventType::TaskCreated);
         assert_eq!(ev.seq, 1);
-        assert_eq!(ev.payload["agent_type"], "a");
-        assert_eq!(ev.payload["user_id"], "u");
+        assert_eq!(ev.payload["task_type"], "a");
+        assert_eq!(ev.payload["provenance"]["source_user_id"], "u");
 
         // 不存在的 seq → None
         assert!(store.get_event(sid, 999).await.unwrap().is_none());
+    }
+
+    // ── Task 状态机投影(spec §4.4)──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_task_state_lifecycle_projection() {
+        let (store, _dir) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = store
+            .create_task("db.repair", "t", "u", &prov, None)
+            .await
+            .unwrap();
+        wait_seq(&store, &tid, 1).await;
+
+        // created
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Created)
+        );
+
+        // created → ready
+        store.write_event(&AgentEvent::new(
+            tid.clone(), None, None,
+            EventType::TaskReady, serde_json::json!({}),
+        )).await.unwrap();
+        wait_seq(&store, &tid, 2).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Ready)
+        );
+
+        // ready → claimed
+        store.write_event(&AgentEvent::new(
+            tid.clone(), None, None,
+            EventType::TaskClaimed, serde_json::json!({"claimant":"fixlet-1"}),
+        )).await.unwrap();
+        wait_seq(&store, &tid, 3).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Claimed)
+        );
+
+        // claimed + turn_started → executing(派生态)
+        store.write_event(&AgentEvent::new(
+            tid.clone(), Some(1), None,
+            EventType::TurnStarted,
+            serde_json::json!({"user_input":"x","redo_group":"rg1","redo_count":0}),
+        )).await.unwrap();
+        wait_seq(&store, &tid, 4).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Executing)
+        );
+
+        // executing → succeeded(终态)
+        store.write_event(&AgentEvent::new(
+            tid.clone(), None, None,
+            EventType::TaskSucceeded, serde_json::json!({"reason":"done"}),
+        )).await.unwrap();
+        wait_seq(&store, &tid, 5).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Succeeded)
+        );
+
+        // 不存在的 task → None
+        assert_eq!(store.get_task_state("nope").await.unwrap(), None);
     }
 }
 

@@ -48,6 +48,7 @@ impl IntoResponse for AppError {
             AppError::TurnAlreadyTerminal { .. } => (StatusCode::CONFLICT, self.to_string()),
             AppError::StepAlreadyTerminal { .. } => (StatusCode::CONFLICT, self.to_string()),
             AppError::LifecycleInvariant(_) => (StatusCode::CONFLICT, self.to_string()),
+            AppError::InvalidTaskStateTransition { .. } => (StatusCode::CONFLICT, self.to_string()),
             AppError::Validation(_) | AppError::PayloadValidation { .. } => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
@@ -212,18 +213,26 @@ async fn create_session_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let event = service::create_task(
+    let prov = crate::models::Provenance {
+        source_channel: "api".into(),
+        source_session_id: None,
+        source_user_id: Some(user_id.to_string()),
+        source_tenant_id: Some(tenant_id.to_string()),
+        source_message_id: None,
+        created_at: chrono::Utc::now(),
+        created_by: "api".into(),
+    };
+    // fixus 分配 task_id(spec §8.4);req.session_id(client 指定)被忽略。
+    let (task_id, event) = service::create_task(
         &*state.store,
-        &req.session_id,
-        tenant_id,
-        user_id,
         &req.agent_type,
-        req.metadata,
+        &prov,
+        req.metadata.as_ref(),
     )
     .await?;
 
     Ok(Json(ApiResponse::ok(CreateSessionResponse {
-        session_id: event.task_id.clone(),
+        session_id: task_id,
 
         seq: event.seq,
     })))

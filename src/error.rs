@@ -44,6 +44,13 @@ pub enum AppError {
     #[error("lifecycle invariant violation: {0}")]
     LifecycleInvariant(String),
 
+    #[error("invalid task state transition: {from} → {to} (task={task_id})")]
+    InvalidTaskStateTransition {
+        task_id: String,
+        from: String,
+        to: String,
+    },
+
     #[error("seq continuity gap detected: session={task_id}, missing after seq={seq}")]
     SeqGap { task_id: String, seq: i64 },
 

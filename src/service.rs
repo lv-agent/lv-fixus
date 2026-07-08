@@ -18,25 +18,23 @@ use crate::storage::EventStore;
 
 // ── Session 生命周期管理 ────────────────────────────────────────────────
 
-/// 创建新 Session
+/// 创建新 Task(spec §8.4)
 ///
-/// 执行设计文档 9.2 节的完整事务：
-/// 1. 写入 sessions 表
-/// 2. 初始化 seq counter
-/// 3. 写入 session_started (seq = 1)
+/// fixus 分配 task_id、存 head、发 task_created 事件。state 初始 = Created。
+/// tenant_id/user_id 从 provenance 派生。task_id 由 fixus 分配(UUIDv7,保证唯一)。
 pub async fn create_task(
     store: &dyn EventStore,
-    task_id: &str,
-    tenant_id: &str,
-    user_id: &str,
-    agent_type: &str,
-    metadata: Option<serde_json::Value>,
-) -> Result<AgentEvent> {
-    if store.task_exists(task_id).await? {
-        return Err(AppError::TaskAlreadyExists(task_id.to_string()));
-    }
+    task_type: &str,
+    provenance: &crate::models::Provenance,
+    body: Option<&serde_json::Value>,
+) -> Result<(String, AgentEvent)> {
+    let tenant_id = provenance
+        .source_tenant_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let user_id = provenance.source_user_id.clone().unwrap_or_default();
     store
-        .create_task(task_id, tenant_id, user_id, agent_type, metadata)
+        .create_task(task_type, &tenant_id, &user_id, provenance, body)
         .await
 }
 
