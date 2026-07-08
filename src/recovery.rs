@@ -101,7 +101,7 @@ pub enum RecoveryDecision {
 /// Session 恢复状态
 #[derive(Debug, Clone)]
 pub struct SessionRecoveryState {
-    pub session_id: String,
+    pub task_id: String,
     pub incomplete_turns: Vec<IncompleteTurn>,
 }
 
@@ -112,12 +112,12 @@ pub struct SessionRecoveryState {
 /// 返回所有未完成的 Turn。
 pub async fn check_session_recovery(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
 ) -> Result<SessionRecoveryState> {
-    let incomplete_turns = store.get_incomplete_turns(session_id).await?;
+    let incomplete_turns = store.get_incomplete_turns(task_id).await?;
 
     Ok(SessionRecoveryState {
-        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
         incomplete_turns,
     })
 }
@@ -127,14 +127,14 @@ pub async fn check_session_recovery(
 /// 分析 Turn 内未完成 Step 的 Tool 类型，决定恢复策略。
 pub async fn decide_turn_recovery(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     incomplete_turn: &IncompleteTurn,
 ) -> Result<RecoveryDecision> {
     let _turn_events = store
-        .get_turn_events(session_id, incomplete_turn.turn_id)
+        .get_turn_events(task_id, incomplete_turn.turn_id)
         .await?;
 
-    let all_incomplete = store.get_incomplete_steps(session_id).await?;
+    let all_incomplete = store.get_incomplete_steps(task_id).await?;
     let turn_incomplete: Vec<_> = all_incomplete
         .into_iter()
         .filter(|s| s.turn_id == incomplete_turn.turn_id)
@@ -192,7 +192,7 @@ pub async fn decide_turn_recovery(
 /// 对应设计文档 10.3 节：非幂等写 → 写 tool_failed → 人工介入。
 pub async fn skip_non_idempotent_step(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     turn_id: i64,
     step: &IncompleteStep,
 ) -> Result<AgentEvent> {
@@ -206,7 +206,7 @@ pub async fn skip_non_idempotent_step(
 
     service::record_tool_failed(
         store,
-        session_id,
+        task_id,
         Some(turn_id),
         &step.step_id,
         tool_call_id,
@@ -225,17 +225,17 @@ pub async fn skip_non_idempotent_step(
 /// 处理非幂等 Step 阻止的 Turn：写 tool_failed → turn_failed
 pub async fn fail_turn_with_non_idempotent_block(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     turn_id: i64,
     blocking_steps: &[IncompleteStep],
 ) -> Result<()> {
     for step in blocking_steps {
-        skip_non_idempotent_step(store, session_id, turn_id, step).await?;
+        skip_non_idempotent_step(store, task_id, turn_id, step).await?;
     }
 
     service::fail_turn(
         store,
-        session_id,
+        task_id,
         turn_id,
         "recovery_blocked",
         &format!(
@@ -254,7 +254,7 @@ pub async fn fail_turn_with_non_idempotent_block(
 /// 重做时 redo_count 递增，redo_group 不变。
 #[derive(Debug, Clone)]
 pub struct RedoContext {
-    pub session_id: String,
+    pub task_id: String,
     pub turn_id: i64,
     pub redo_group: String,
     pub redo_count: i32,
@@ -264,11 +264,11 @@ pub struct RedoContext {
 /// 从 turn_started payload 中提取 redo 上下文
 pub async fn build_redo_context(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     incomplete_turn: &IncompleteTurn,
 ) -> Result<Option<RedoContext>> {
     let events = store
-        .get_turn_events(session_id, incomplete_turn.turn_id)
+        .get_turn_events(task_id, incomplete_turn.turn_id)
         .await?;
 
     let turn_started = events
@@ -285,7 +285,7 @@ pub async fn build_redo_context(
                 .to_string();
 
             Ok(Some(RedoContext {
-                session_id: session_id.to_string(),
+                task_id: task_id.to_string(),
                 turn_id: incomplete_turn.turn_id,
                 redo_group: incomplete_turn.redo_group.clone(),
                 redo_count: incomplete_turn.redo_count + 1,
@@ -302,11 +302,11 @@ pub async fn build_redo_context(
 /// - SafeToRedo → 返回重做上下文，由上层分发 execute_turn (redo)
 /// - RequiresHumanIntervention → 自动写 tool_failed + turn_failed
 /// - None → 跳过
-pub async fn recover_session(
+pub async fn recover_task(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
 ) -> Result<Vec<RedoContext>> {
-    let state = check_session_recovery(store, session_id).await?;
+    let state = check_session_recovery(store, task_id).await?;
 
     if state.incomplete_turns.is_empty() {
         return Ok(vec![]);
@@ -315,11 +315,11 @@ pub async fn recover_session(
     let mut redo_queue = Vec::new();
 
     for incomplete_turn in &state.incomplete_turns {
-        let decision = decide_turn_recovery(store, session_id, incomplete_turn).await?;
+        let decision = decide_turn_recovery(store, task_id, incomplete_turn).await?;
 
         match decision {
             RecoveryDecision::SafeToRedo { .. } => {
-                if let Some(ctx) = build_redo_context(store, session_id, incomplete_turn).await? {
+                if let Some(ctx) = build_redo_context(store, task_id, incomplete_turn).await? {
                     redo_queue.push(ctx);
                 }
             }
@@ -335,7 +335,7 @@ pub async fn recover_session(
                 );
                 fail_turn_with_non_idempotent_block(
                     store,
-                    session_id,
+                    task_id,
                     turn_id,
                     &blocking_steps,
                 )
@@ -353,10 +353,10 @@ pub async fn recover_session(
 /// 检查 Turn 内 seq 是否连续（用于 Turn 级重做判断）
 pub async fn validate_turn_seq_continuity(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     turn_id: i64,
 ) -> Result<bool> {
-    store.is_turn_seq_continuous(session_id, turn_id).await
+    store.is_turn_seq_continuous(task_id, turn_id).await
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────

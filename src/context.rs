@@ -120,9 +120,9 @@ pub fn turn_to_messages(events: &[AgentEvent]) -> Vec<Message> {
 /// 3. 应用层构建 messages
 pub async fn build_llm_context(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
 ) -> Result<LlmContext> {
-    let latest_summary = store.get_latest_summary(session_id).await?;
+    let latest_summary = store.get_latest_summary(task_id).await?;
 
     let (summary_text, summarized_up_to_seq, summarized_up_to_turn_id) =
         if let Some(ref summary_event) = latest_summary {
@@ -147,7 +147,7 @@ pub async fn build_llm_context(
         };
 
     let incremental_events = store
-        .get_events_after_seq(session_id, summarized_up_to_seq)
+        .get_events_after_seq(task_id, summarized_up_to_seq)
         .await?;
 
     let messages = events_to_messages(&incremental_events);
@@ -164,9 +164,9 @@ pub async fn build_llm_context(
 /// 全量回放 — 将 Session 的所有事件转为 messages
 pub async fn full_replay(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
 ) -> Result<FullReplay> {
-    let events = store.get_events_after_seq(session_id, 0).await?;
+    let events = store.get_events_after_seq(task_id, 0).await?;
     let messages = events_to_messages(&events);
 
     Ok(FullReplay { events, messages })
@@ -175,24 +175,24 @@ pub async fn full_replay(
 /// 构建特定 Turn 的上下文（仅该 Turn 的 messages）
 pub async fn build_turn_context(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     turn_id: i64,
 ) -> Result<Vec<Message>> {
-    let events = store.get_turn_events(session_id, turn_id).await?;
+    let events = store.get_turn_events(task_id, turn_id).await?;
     Ok(events_to_messages(&events))
 }
 
 /// 构建最近 N 个 Turn 的上下文（不含摘要）
 pub async fn build_recent_turns_context(
     store: &dyn EventStore,
-    session_id: &str,
+    task_id: &str,
     recent_turns: i64,
 ) -> Result<Vec<Message>> {
-    let turn_ids = store.get_recent_turn_ids(session_id, recent_turns).await?;
+    let turn_ids = store.get_recent_turn_ids(task_id, recent_turns).await?;
 
     let mut all_messages = Vec::new();
     for turn_id in turn_ids.iter().rev() {
-        let events = store.get_turn_events(session_id, *turn_id).await?;
+        let events = store.get_turn_events(task_id, *turn_id).await?;
         all_messages.extend(events_to_messages(&events));
     }
 

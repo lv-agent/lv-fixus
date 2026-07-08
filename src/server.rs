@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::orchestrator::Orchestrator;
 use crate::protocol::*;
-use crate::session_registry::SessionRegistry;
+use crate::task_registry::TaskRegistry;
 use crate::storage::{EventStore, LogdbdEventStore};
 use crate::{context, recovery, service};
 
@@ -32,7 +32,7 @@ use crate::{context, recovery, service};
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn EventStore>,
-    pub registry: Arc<SessionRegistry>,
+    pub registry: Arc<TaskRegistry>,
     pub token_publisher: Arc<crate::stream::TokenPublisher>,
 }
 
@@ -41,9 +41,9 @@ pub struct AppState {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            AppError::SessionNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            AppError::SessionAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
-            AppError::SessionAlreadyEnded(_) => (StatusCode::GONE, self.to_string()),
+            AppError::TaskNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::TaskAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
+            AppError::TaskAlreadyEnded(_) => (StatusCode::GONE, self.to_string()),
             AppError::TurnNotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::TurnAlreadyTerminal { .. } => (StatusCode::CONFLICT, self.to_string()),
             AppError::StepAlreadyTerminal { .. } => (StatusCode::CONFLICT, self.to_string()),
@@ -75,7 +75,7 @@ pub async fn start() -> Result<(), AppError> {
     let db = LogdbdEventStore::connect(&addr, &namespace).await?;
     let store: Arc<dyn EventStore> = Arc::new(db);
 
-    let registry = SessionRegistry::new();
+    let registry = TaskRegistry::new();
     let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
     let state = AppState {
         store,
@@ -104,12 +104,12 @@ pub async fn start() -> Result<(), AppError> {
 }
 
 /// 流式端点 URL（环境变量 FIXUS_STREAM_URL，未设置时流式不可用）
-fn stream_url_for(session_id: &str, turn_id: i64) -> Option<String> {
+fn stream_url_for(task_id: &str, turn_id: i64) -> Option<String> {
     std::env::var("FIXUS_STREAM_URL").ok().map(|base| {
         format!(
             "{}/sessions/{}/turns/{}/stream",
             base.trim_end_matches('/'),
-            session_id,
+            task_id,
             turn_id
         )
     })
@@ -129,64 +129,64 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Session
         .route("/api/v1/sessions", post(create_session_handler))
-        .route("/api/v1/sessions/{session_id}", get(get_session_handler))
-        .route("/api/v1/sessions/{session_id}/end", post(end_session_handler))
+        .route("/api/v1/sessions/{task_id}", get(get_session_handler))
+        .route("/api/v1/sessions/{task_id}/end", post(end_session_handler))
         // Turn
         .route(
-            "/api/v1/sessions/{session_id}/turns",
+            "/api/v1/sessions/{task_id}/turns",
             post(start_turn_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/turns/{turn_id}",
+            "/api/v1/sessions/{task_id}/turns/{turn_id}",
             get(get_turn_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/turns/{turn_id}/complete",
+            "/api/v1/sessions/{task_id}/turns/{turn_id}/complete",
             post(complete_turn_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/turns/{turn_id}/fail",
+            "/api/v1/sessions/{task_id}/turns/{turn_id}/fail",
             post(fail_turn_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/turns/{turn_id}/cancel",
+            "/api/v1/sessions/{task_id}/turns/{turn_id}/cancel",
             post(cancel_turn_handler),
         )
         // Events
         .route(
-            "/api/v1/sessions/{session_id}/events",
+            "/api/v1/sessions/{task_id}/events",
             post(record_event_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/events/batch",
+            "/api/v1/sessions/{task_id}/events/batch",
             post(record_events_batch_handler),
         )
         // Context
         .route(
-            "/api/v1/sessions/{session_id}/context",
+            "/api/v1/sessions/{task_id}/context",
             get(get_context_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/turns/{turn_id}/context",
+            "/api/v1/sessions/{task_id}/turns/{turn_id}/context",
             get(get_turn_context_handler),
         )
         // Recovery
         .route(
-            "/api/v1/sessions/{session_id}/recovery",
+            "/api/v1/sessions/{task_id}/recovery",
             get(get_recovery_handler),
         )
         .route(
-            "/api/v1/sessions/{session_id}/recovery/apply",
+            "/api/v1/sessions/{task_id}/recovery/apply",
             post(apply_recovery_handler),
         )
         // Summary
         .route(
-            "/api/v1/sessions/{session_id}/summary",
+            "/api/v1/sessions/{task_id}/summary",
             post(write_summary_handler),
         )
         // Token stats
         .route(
-            "/api/v1/sessions/{session_id}/token-usage",
+            "/api/v1/sessions/{task_id}/token-usage",
             get(get_token_usage_handler),
         )
         // WebSocket
@@ -212,7 +212,7 @@ async fn create_session_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let event = service::create_session(
+    let event = service::create_task(
         &*state.store,
         &req.session_id,
         tenant_id,
@@ -223,25 +223,26 @@ async fn create_session_handler(
     .await?;
 
     Ok(Json(ApiResponse::ok(CreateSessionResponse {
-        session_id: event.session_id,
+        session_id: event.task_id.clone(),
+
         seq: event.seq,
     })))
 }
 
 async fn get_session_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<SessionInfo>>, AppError> {
-    let session = service::get_session_info(&*state.store, &session_id)
+    let session = service::get_task_info(&*state.store, &task_id)
         .await?
-        .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
+        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
 
-    let is_ended = service::is_session_ended(&*state.store, &session_id).await?;
-    let max_turn = service::get_max_turn_id(&*state.store, &session_id).await?;
-    let max_seq = service::get_max_seq(&*state.store, &session_id).await?;
+    let is_ended = service::is_task_ended(&*state.store, &task_id).await?;
+    let max_turn = service::get_max_turn_id(&*state.store, &task_id).await?;
+    let max_seq = service::get_max_seq(&*state.store, &task_id).await?;
 
     Ok(Json(ApiResponse::ok(SessionInfo {
-        session_id: session.session_id,
+        task_id: session.task_id,
         tenant_id: session.tenant_id,
         user_id: session.user_id,
         agent_type: session.agent_type,
@@ -255,7 +256,7 @@ async fn get_session_handler(
 
 #[derive(Debug, Clone, Serialize)]
 struct SessionInfo {
-    session_id: String,
+    task_id: String,
     tenant_id: String,
     user_id: String,
     agent_type: String,
@@ -268,7 +269,7 @@ struct SessionInfo {
 
 async fn end_session_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let reason = body
@@ -276,10 +277,10 @@ async fn end_session_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("client_requested");
 
-    let event = service::end_session(&*state.store, &session_id, reason).await?;
+    let event = service::end_task(&*state.store, &task_id, reason).await?;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
-        "session_id": event.session_id,
+        "task_id": event.task_id,
         "seq": event.seq,
         "reason": reason,
     }))))
@@ -289,7 +290,7 @@ async fn end_session_handler(
 
 async fn start_turn_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
     Json(req): Json<StartTurnRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let orch = orchestrator(&state);
@@ -297,13 +298,13 @@ async fn start_turn_handler(
     // 异步启动:写 turn_started 后立即返回 turn_id + stream_url,执行在后台进行。
     // 客户端凭 stream_url 连 fixus-stream SSE,实时看事件 + token 流式。
     match orch
-        .start_turn_async(&session_id, &req.user_input, req.redo_group.as_deref())
+        .start_turn_async(&task_id, &req.user_input, req.redo_group.as_deref())
         .await?
     {
         crate::orchestrator::AsyncTurnStart::Started { turn_id } => Ok(Json(ApiResponse::ok(
             serde_json::json!({
                 "turn_id": turn_id,
-                "stream_url": stream_url_for(&session_id, turn_id),
+                "stream_url": stream_url_for(&task_id, turn_id),
             }),
         ))),
         crate::orchestrator::AsyncTurnStart::RecoveryTriggered { incomplete_count } => {
@@ -321,17 +322,17 @@ async fn start_turn_handler(
 
 async fn get_turn_handler(
     State(state): State<AppState>,
-    Path((session_id, turn_id)): Path<(String, i64)>,
+    Path((task_id, turn_id)): Path<(String, i64)>,
 ) -> Result<Json<ApiResponse<TurnInfo>>, AppError> {
-    let events = service::get_turn_events(&*state.store, &session_id, turn_id).await?;
+    let events = service::get_turn_events(&*state.store, &task_id, turn_id).await?;
     if events.is_empty() {
         return Err(AppError::TurnNotFound {
-            session_id,
+            task_id,
             turn_id,
         });
     }
 
-    let steps = service::get_turn_steps(&*state.store, &session_id, turn_id).await?;
+    let steps = service::get_turn_steps(&*state.store, &task_id, turn_id).await?;
 
     let terminal = events
         .iter()
@@ -356,11 +357,11 @@ struct TurnInfo {
 
 async fn complete_turn_handler(
     State(state): State<AppState>,
-    Path((session_id, turn_id)): Path<(String, i64)>,
+    Path((task_id, turn_id)): Path<(String, i64)>,
     Json(req): Json<CompleteTurnRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let event =
-        service::complete_turn(&*state.store, &session_id, turn_id, &req.final_output).await?;
+        service::complete_turn(&*state.store, &task_id, turn_id, &req.final_output).await?;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "turn_id": turn_id,
@@ -370,11 +371,11 @@ async fn complete_turn_handler(
 
 async fn cancel_turn_handler(
     State(state): State<AppState>,
-    Path((session_id, turn_id)): Path<(String, i64)>,
+    Path((task_id, turn_id)): Path<(String, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("user_canceled");
-    let event = service::cancel_turn(&*state.store, &session_id, turn_id, reason).await?;
+    let event = service::cancel_turn(&*state.store, &task_id, turn_id, reason).await?;
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "turn_id": turn_id, "seq": event.seq, "state": "canceled"
     }))))
@@ -382,7 +383,7 @@ async fn cancel_turn_handler(
 
 async fn fail_turn_handler(
     State(state): State<AppState>,
-    Path((session_id, turn_id)): Path<(String, i64)>,
+    Path((task_id, turn_id)): Path<(String, i64)>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let error_type = body
@@ -399,7 +400,7 @@ async fn fail_turn_handler(
 
     let event = service::fail_turn(
         &*state.store,
-        &session_id,
+        &task_id,
         turn_id,
         error_type,
         error_message,
@@ -417,7 +418,7 @@ async fn fail_turn_handler(
 
 async fn record_event_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
     Json(req): Json<RecordEventRequest>,
 ) -> Result<Json<ApiResponse<RecordEventResponse>>, AppError> {
     let event_type = crate::models::EventType::from_str(&req.event_type)
@@ -425,7 +426,7 @@ async fn record_event_handler(
 
     let seq = service::record_event(
         &*state.store,
-        &session_id,
+        &task_id,
         req.turn_id,
         Some(&req.step_id),
         event_type,
@@ -438,7 +439,7 @@ async fn record_event_handler(
 
 async fn record_events_batch_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
     Json(req): Json<RecordEventsBatchRequest>,
 ) -> Result<Json<ApiResponse<RecordEventsBatchResponse>>, AppError> {
     let mut events = Vec::with_capacity(req.events.len());
@@ -448,7 +449,7 @@ async fn record_events_batch_handler(
             .ok_or_else(|| AppError::InvalidEventType(report.event_type.clone()))?;
 
         let event = crate::models::AgentEvent::new(
-            session_id.clone(),
+            task_id.clone(),
             Some(report.turn_id),
             Some(report.step_id.clone()),
             event_type,
@@ -466,9 +467,9 @@ async fn record_events_batch_handler(
 
 async fn get_context_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<ContextResponse>>, AppError> {
-    let ctx = context::build_llm_context(&*state.store, &session_id).await?;
+    let ctx = context::build_llm_context(&*state.store, &task_id).await?;
 
     Ok(Json(ApiResponse::ok(ContextResponse {
         summary: ctx.summary,
@@ -480,9 +481,9 @@ async fn get_context_handler(
 
 async fn get_turn_context_handler(
     State(state): State<AppState>,
-    Path((session_id, turn_id)): Path<(String, i64)>,
+    Path((task_id, turn_id)): Path<(String, i64)>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::Message>>>, AppError> {
-    let messages = context::build_turn_context(&*state.store, &session_id, turn_id).await?;
+    let messages = context::build_turn_context(&*state.store, &task_id, turn_id).await?;
     Ok(Json(ApiResponse::ok(messages)))
 }
 
@@ -490,14 +491,14 @@ async fn get_turn_context_handler(
 
 async fn get_recovery_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<RecoveryStatusResponse>>, AppError> {
-    let rec_state = recovery::check_session_recovery(&*state.store, &session_id).await?;
+    let rec_state = recovery::check_session_recovery(&*state.store, &task_id).await?;
 
     let mut redo_queue = Vec::new();
     for incomplete_turn in &rec_state.incomplete_turns {
         let decision =
-            recovery::decide_turn_recovery(&*state.store, &session_id, incomplete_turn).await?;
+            recovery::decide_turn_recovery(&*state.store, &task_id, incomplete_turn).await?;
 
         match decision {
             recovery::RecoveryDecision::SafeToRedo {
@@ -507,7 +508,7 @@ async fn get_recovery_handler(
                 ..
             } => {
                 if let Some(ctx) =
-                    recovery::build_redo_context(&*state.store, &session_id, incomplete_turn)
+                    recovery::build_redo_context(&*state.store, &task_id, incomplete_turn)
                         .await?
                 {
                     redo_queue.push(RedoInfo {
@@ -523,7 +524,7 @@ async fn get_recovery_handler(
     }
 
     Ok(Json(ApiResponse::ok(RecoveryStatusResponse {
-        session_id: rec_state.session_id,
+        session_id: rec_state.task_id.clone(),
         incomplete_turns: rec_state.incomplete_turns,
         redo_queue,
     })))
@@ -531,9 +532,9 @@ async fn get_recovery_handler(
 
 async fn apply_recovery_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<RedoInfo>>>, AppError> {
-    let redo_queue = recovery::recover_session(&*state.store, &session_id).await?;
+    let redo_queue = recovery::recover_task(&*state.store, &task_id).await?;
 
     let redo_infos: Vec<RedoInfo> = redo_queue
         .into_iter()
@@ -552,7 +553,7 @@ async fn apply_recovery_handler(
 
 async fn write_summary_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let summarized_up_to_turn_id = body
@@ -577,7 +578,7 @@ async fn write_summary_handler(
 
     let event = service::write_summary_marker(
         &*state.store,
-        &session_id,
+        &task_id,
         summarized_up_to_turn_id,
         summarized_up_to_seq,
         summary,
@@ -596,9 +597,9 @@ async fn write_summary_handler(
 
 async fn get_token_usage_handler(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<crate::models::TokenUsageStats>>>, AppError> {
-    let stats = service::get_token_usage_stats(&*state.store, &session_id).await?;
+    let stats = service::get_token_usage_stats(&*state.store, &task_id).await?;
     Ok(Json(ApiResponse::ok(stats)))
 }
 
@@ -640,7 +641,7 @@ async fn handle_fixlet_ws(
 
                             match msg_type {
                                 // fixlet 注册自己服务的 agent_type(按 agent_type 路由,
-                                // 不再绑定具体 session_id)
+                                // 不再绑定具体 task_id)
                                 "register" => {
                                     if let Some(at) = parsed.get("agent_type").and_then(|v| v.as_str()) {
                                         tracing::info!("fixlet registered for agent_type {}", at);
@@ -656,7 +657,7 @@ async fn handle_fixlet_ws(
 
                                 // Agent 请求执行 Tool
                                 "tool_invoked" => {
-                                    let session_id = parsed["session_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let step_id = parsed["step_id"].as_str().unwrap_or("");
                                     let local_seq = parsed["local_seq"].as_i64().unwrap_or(0);
@@ -666,7 +667,7 @@ async fn handle_fixlet_ws(
                                     let input = parsed.get("input").cloned().unwrap_or(serde_json::Value::Null);
 
                                     if let Err(e) = orch.handle_tool_invoked(
-                                        session_id, turn_id, step_id, local_seq,
+                                        task_id, turn_id, step_id, local_seq,
                                         tool_name, tool_call_id, idempotency_key, &input,
                                     ).await {
                                         tracing::error!("handle_tool_invoked failed: {}", e);
@@ -675,13 +676,13 @@ async fn handle_fixlet_ws(
 
                                 // Agent 完成 Turn
                                 "turn_execution_done" => {
-                                    let session_id = parsed["session_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let max_local_seq = parsed["max_local_seq"].as_i64().unwrap_or(0);
                                     let final_output = parsed["final_output"].as_str().unwrap_or("");
 
                                     if let Err(e) = orch.handle_turn_execution_done(
-                                        session_id, turn_id, max_local_seq, final_output,
+                                        task_id, turn_id, max_local_seq, final_output,
                                     ).await {
                                         tracing::error!("handle_turn_execution_done failed: {}", e);
                                     }
@@ -689,13 +690,13 @@ async fn handle_fixlet_ws(
 
                                 // Agent 进程异常退出
                                 "turn_execution_error" => {
-                                    let session_id = parsed["session_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let error_type = parsed["error_type"].as_str().unwrap_or("unknown");
                                     let error_message = parsed["error_message"].as_str().unwrap_or("");
 
                                     if let Err(e) = orch.handle_turn_execution_error(
-                                        session_id, turn_id, error_type, error_message,
+                                        task_id, turn_id, error_type, error_message,
                                     ).await {
                                         tracing::error!("handle_turn_execution_error failed: {}", e);
                                     }
@@ -703,15 +704,15 @@ async fn handle_fixlet_ws(
 
                                 // LLM 流式 token（实时转发）
                                 "llm_chunk" => {
-                                    let session_id = parsed["session_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let text = parsed["text"].as_str().unwrap_or("");
-                                    let _ = orch.handle_llm_chunk(session_id, turn_id, text).await;
+                                    let _ = orch.handle_llm_chunk(task_id, turn_id, text).await;
                                 }
 
                                 // LLM 调用完成（含 token 用量）
                                 "llm_completed" => {
-                                    let session_id = parsed["session_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let model = parsed["model"].as_str().unwrap_or("");
                                     let input_tokens = parsed["input_tokens"].as_i64().unwrap_or(0);
@@ -719,7 +720,7 @@ async fn handle_fixlet_ws(
                                     let total_tokens = parsed["total_tokens"].as_i64().unwrap_or(0);
 
                                     if let Err(e) = orch.handle_llm_completed(
-                                        session_id, turn_id, model,
+                                        task_id, turn_id, model,
                                         input_tokens, output_tokens, total_tokens,
                                     ).await {
                                         tracing::error!("handle_llm_completed failed: {}", e);
@@ -813,8 +814,8 @@ async fn handle_mcp(
         "initialize" => Json(mcp_initialize(body.id)),
         "tools/list"  => Json(mcp_tools_list(body.id)),
         "tools/call"  => {
-            // 从 X-Fixus-Session-Id header 获取 session_id
-            let session_id = headers
+            // 从 X-Fixus-Session-Id header 获取 task_id
+            let task_id = headers
                 .get("X-Fixus-Session-Id")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
@@ -836,7 +837,7 @@ async fn handle_mcp(
                 .unwrap_or(serde_json::Value::Null);
 
             let orch = orchestrator(&state);
-            match orch.execute_tool(session_id, tool_name, tool_call_id, &args).await {
+            match orch.execute_tool(task_id, tool_name, tool_call_id, &args).await {
                 Ok(result) => Json(mcp_tool_result(
                     body.id,
                     &result.output,

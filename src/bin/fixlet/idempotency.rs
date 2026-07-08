@@ -3,7 +3,7 @@
 //! ## idempotency_key 生成规则
 //!
 //! ```
-//! idempotency_key = "{session_id}:{redo_group}:{tool_name}:{canonical_input_hash}"
+//! idempotency_key = "{task_id}:{redo_group}:{tool_name}:{canonical_input_hash}"
 //! ```
 //!
 //! Turn 重做时，redo_group 不变，相同 Tool 对相同参数产生相同的 key。
@@ -70,17 +70,17 @@ pub fn generate_step_id() -> String {
 
 /// 构建 idempotency_key
 ///
-/// 格式: `{session_id}:{redo_group}:{tool_name}:{canonical_hash}`
+/// 格式: `{task_id}:{redo_group}:{tool_name}:{canonical_hash}`
 ///
 /// canonical_hash 是规范化输入参数的 SHA256 前 16 位（hex）。
 pub fn build_idempotency_key(
-    session_id: &str,
+    task_id: &str,
     redo_group: &str,
     tool_name: &str,
     input: &serde_json::Value,
 ) -> String {
     let hash = canonical_input_hash(input);
-    format!("{}:{}:{}:{}", session_id, redo_group, tool_name, hash)
+    format!("{}:{}:{}:{}", task_id, redo_group, tool_name, hash)
 }
 
 /// 计算输入参数的规范化哈希
@@ -129,7 +129,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
 /// Turn 结束后丢弃，不持久化。
 #[derive(Debug, Clone)]
 pub struct TurnContext {
-    pub session_id: String,
+    pub task_id: String,
     pub turn_id: i64,
     pub redo_group: String,
     pub redo_count: i32,
@@ -140,13 +140,13 @@ pub struct TurnContext {
 
 impl TurnContext {
     pub fn new(
-        session_id: String,
+        task_id: String,
         turn_id: i64,
         redo_group: String,
         redo_count: i32,
     ) -> Self {
         Self {
-            session_id,
+            task_id,
             turn_id,
             redo_group,
             redo_count,
@@ -165,7 +165,7 @@ impl TurnContext {
         let step_id = generate_step_id();
         let local_seq = self.local_seq.next();
         let idempotency_key = build_idempotency_key(
-            &self.session_id,
+            &self.task_id,
             &self.redo_group,
             tool_name,
             arguments,

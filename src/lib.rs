@@ -13,7 +13,7 @@ pub mod protocol;
 pub mod server;
 pub mod sandbox;
 pub mod sandbox_client;
-pub mod session_registry;
+pub mod task_registry;
 pub mod orchestrator;
 pub mod stream;
 
@@ -21,7 +21,7 @@ pub mod stream;
 pub use error::{AppError, Result};
 pub use models::{
     validate_payload_required_fields, AgentEvent, EventScope, EventType, IncompleteStep,
-    IncompleteTurn, LlmCompletedPayload, LlmFailedPayload, LlmInvokedPayload, Message, Session,
+    IncompleteTurn, LlmCompletedPayload, LlmFailedPayload, LlmInvokedPayload, Message, Task,
     SessionEndedPayload, SessionStartedPayload, StepExecution, SummaryMarkerPayload,
     TokenUsageStats, ToolCall, ToolCompletedPayload, ToolFailedPayload, ToolInvokedPayload,
     TurnCompletedPayload, TurnFailedPayload, TurnStartedPayload, Usage,

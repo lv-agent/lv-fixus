@@ -12,23 +12,23 @@ pub enum AppError {
 
     // ── 会话错误 ──
     #[error("session not found: {0}")]
-    SessionNotFound(String),
+    TaskNotFound(String),
 
     #[error("session already exists: {0}")]
-    SessionAlreadyExists(String),
+    TaskAlreadyExists(String),
 
     #[error("session already ended: {0}")]
-    SessionAlreadyEnded(String),
+    TaskAlreadyEnded(String),
 
     // ── Turn 错误 ──
-    #[error("turn not found: session={session_id}, turn={turn_id}")]
-    TurnNotFound { session_id: String, turn_id: i64 },
+    #[error("turn not found: session={task_id}, turn={turn_id}")]
+    TurnNotFound { task_id: String, turn_id: i64 },
 
-    #[error("turn already has terminal event: session={session_id}, turn={turn_id}")]
-    TurnAlreadyTerminal { session_id: String, turn_id: i64 },
+    #[error("turn already has terminal event: session={task_id}, turn={turn_id}")]
+    TurnAlreadyTerminal { task_id: String, turn_id: i64 },
 
-    #[error("turn has no started event: session={session_id}, turn={turn_id}")]
-    TurnNotStarted { session_id: String, turn_id: i64 },
+    #[error("turn has no started event: session={task_id}, turn={turn_id}")]
+    TurnNotStarted { task_id: String, turn_id: i64 },
 
     // ── Step 错误 ──
     #[error("step not found: step_id={step_id}")]
@@ -44,8 +44,8 @@ pub enum AppError {
     #[error("lifecycle invariant violation: {0}")]
     LifecycleInvariant(String),
 
-    #[error("seq continuity gap detected: session={session_id}, missing after seq={seq}")]
-    SeqGap { session_id: String, seq: i64 },
+    #[error("seq continuity gap detected: session={task_id}, missing after seq={seq}")]
+    SeqGap { task_id: String, seq: i64 },
 
     // ── 校验错误 ──
     #[error("validation error: {0}")]

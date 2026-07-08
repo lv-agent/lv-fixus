@@ -346,7 +346,7 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
                     tracing::warn!("Agent process exited unexpectedly");
                     if let Some(ref ctx) = active_turn {
                         let error_msg = FixletToFixus::TurnExecutionError {
-                            session_id: ctx.session_id.clone(),
+                            session_id: ctx.task_id.clone(),
                             turn_id: ctx.turn_id,
                             error_type: "agent_process_exited".into(),
                             error_message: "Agent process exited unexpectedly".into(),
@@ -504,14 +504,14 @@ async fn handle_fixus_message(
                 let mut acp = AcpClient::new(
                     active_turn
                         .as_ref()
-                        .map(|c| c.session_id.clone())
+                        .map(|c| c.task_id.clone())
                         .unwrap_or_default(),
                 );
                 acp.set_stdin_tx(stdin_tx.clone());
 
                 let session_id = active_turn
                     .as_ref()
-                    .map(|c| format!("{}:turn_{}", c.session_id, c.turn_id))
+                    .map(|c| format!("{}:turn_{}", c.task_id, c.turn_id))
                     .unwrap_or_default();
 
                 acp.tool_result(&session_id, &tr.tool_call_id, &result_json);
@@ -546,7 +546,7 @@ async fn handle_agent_message(
 
             // 实时转发每个 token 给 fixus（用于 SSE 流式输出）
             let chunk_msg = FixletToFixus::LlmChunk {
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.task_id.clone(),
                 turn_id: ctx.turn_id,
                 text: chunk.clone(),
             };
@@ -573,7 +573,7 @@ async fn handle_agent_message(
             );
 
             let msg = FixletToFixus::ToolInvoked {
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.task_id.clone(),
                 turn_id: ctx.turn_id,
                 step_id: meta.step_id,
                 local_seq: meta.local_seq,
@@ -593,7 +593,7 @@ async fn handle_agent_message(
             // 先发送 llm_completed（含 usage + model 数据）
             if let Some(ref u) = usage {
                 let llm_msg = FixletToFixus::LlmCompleted {
-                    session_id: ctx.session_id.clone(),
+                    session_id: ctx.task_id.clone(),
                     turn_id: ctx.turn_id,
                     model: ctx.model.clone(),
                     input_tokens: u.input_tokens,
@@ -618,7 +618,7 @@ async fn handle_agent_message(
             );
 
             let done_msg = FixletToFixus::TurnExecutionDone {
-                session_id: ctx.session_id.clone(),
+                session_id: ctx.task_id.clone(),
                 turn_id: ctx.turn_id,
                 max_local_seq: ctx.local_seq.current(),
                 final_output: final_text,

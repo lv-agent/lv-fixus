@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{AppError, Result};
 use crate::models::{
-    AgentEvent, EventType, IncompleteStep, IncompleteTurn, Session, StepExecution, TokenUsageStats,
+    AgentEvent, EventType, IncompleteStep, IncompleteTurn, Task, StepExecution, TokenUsageStats,
 };
 
 // ── EventStore Trait ────────────────────────────────────────────────────────
@@ -32,23 +32,23 @@ use crate::models::{
 pub trait EventStore: Send + Sync {
     // ── Session ─────────────────────────────────────────────────────────
 
-    async fn create_session(
+    async fn create_task(
         &self,
-        session_id: &str,
+        task_id: &str,
         tenant_id: &str,
         user_id: &str,
         agent_type: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<AgentEvent>;
 
-    async fn get_session(&self, session_id: &str) -> Result<Option<Session>>;
-    async fn session_exists(&self, session_id: &str) -> Result<bool>;
-    async fn is_session_ended(&self, session_id: &str) -> Result<bool>;
+    async fn get_task(&self, task_id: &str) -> Result<Option<Task>>;
+    async fn task_exists(&self, task_id: &str) -> Result<bool>;
+    async fn is_task_ended(&self, task_id: &str) -> Result<bool>;
 
     // ── Seq ─────────────────────────────────────────────────────────────
 
-    async fn get_max_seq(&self, session_id: &str) -> Result<i64>;
-    async fn get_max_turn_id(&self, session_id: &str) -> Result<i64>;
+    async fn get_max_seq(&self, task_id: &str) -> Result<i64>;
+    async fn get_max_turn_id(&self, task_id: &str) -> Result<i64>;
 
     // ── Write ───────────────────────────────────────────────────────────
 
@@ -57,56 +57,56 @@ pub trait EventStore: Send + Sync {
 
     // ── Read ────────────────────────────────────────────────────────────
 
-    async fn get_event(&self, session_id: &str, seq: i64) -> Result<Option<AgentEvent>>;
-    async fn get_turn_events(&self, session_id: &str, turn_id: i64)
+    async fn get_event(&self, task_id: &str, seq: i64) -> Result<Option<AgentEvent>>;
+    async fn get_turn_events(&self, task_id: &str, turn_id: i64)
         -> Result<Vec<AgentEvent>>;
     async fn get_events_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<Vec<AgentEvent>>;
-    async fn get_latest_summary(&self, session_id: &str) -> Result<Option<AgentEvent>>;
+    async fn get_latest_summary(&self, task_id: &str) -> Result<Option<AgentEvent>>;
     async fn get_turn_steps(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
     ) -> Result<Vec<StepExecution>>;
 
     // ── Recovery ────────────────────────────────────────────────────────
 
-    async fn get_incomplete_turns(&self, session_id: &str)
+    async fn get_incomplete_turns(&self, task_id: &str)
         -> Result<Vec<IncompleteTurn>>;
     async fn get_incomplete_steps(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<IncompleteStep>>;
-    async fn detect_seq_gaps(&self, session_id: &str) -> Result<Vec<i64>>;
-    async fn is_turn_seq_continuous(&self, session_id: &str, turn_id: i64)
+    async fn detect_seq_gaps(&self, task_id: &str) -> Result<Vec<i64>>;
+    async fn is_turn_seq_continuous(&self, task_id: &str, turn_id: i64)
         -> Result<bool>;
 
     // ── Stats ───────────────────────────────────────────────────────────
 
     async fn get_token_usage_stats(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<TokenUsageStats>>;
 
     // ── Summary helpers ─────────────────────────────────────────────────
 
-    async fn count_turns_after_seq(&self, session_id: &str, after_seq: i64) -> Result<i64>;
-    async fn count_events_after_seq(&self, session_id: &str, after_seq: i64) -> Result<i64>;
+    async fn count_turns_after_seq(&self, task_id: &str, after_seq: i64) -> Result<i64>;
+    async fn count_events_after_seq(&self, task_id: &str, after_seq: i64) -> Result<i64>;
     async fn get_llm_payloads_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<Vec<String>>;
-    async fn get_recent_turn_ids(&self, session_id: &str, limit: i64) -> Result<Vec<i64>>;
+    async fn get_recent_turn_ids(&self, task_id: &str, limit: i64) -> Result<Vec<i64>>;
 
     // ── Archive ─────────────────────────────────────────────────────────
 
     async fn archive_events_before_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         before_seq: i64,
     ) -> Result<ArchiveResult>;
 }
@@ -125,7 +125,7 @@ pub struct ArchiveResult {
 ///
 /// 通过 gRPC 与 logdbd 通信。
 /// - namespace = self.namespace(单 namespace;tenant_id 仅作 metadata 字段,查询时按字段过滤)
-/// - stream   = session_id
+/// - stream   = task_id
 /// - 简单读：`client.read()` / `client.scan_all()` — content 直接是 `Vec<u8>`
 /// - 过滤查询：`client.query(QueryRequest)` — 原生结构化谓词,直读 segment(cr-027)
 pub struct LogdbdEventStore {
@@ -215,7 +215,7 @@ impl LogdbdEventStore {
         let resp = self
             .run_query(
                 client,
-                &event.session_id,
+                &event.task_id,
                 QueryRequest {
                     event_types: conflict_types.into_iter().map(String::from).collect(),
                     metadata,
@@ -233,7 +233,7 @@ impl LogdbdEventStore {
             return Err(AppError::LifecycleInvariant(format!(
                 "{} 已存在同类 terminal 事件(session={}, turn={:?}, step={:?})",
                 event.event_type.as_str(),
-                event.session_id,
+                event.task_id,
                 event.turn_id,
                 event.step_id,
             )));
@@ -247,7 +247,7 @@ impl LogdbdEventStore {
 /// AgentEvent → logdbd metadata HashMap
 fn event_meta(event: &AgentEvent) -> HashMap<String, String> {
     let mut m = HashMap::new();
-    m.insert("session_id".into(), event.session_id.clone());
+    m.insert("task_id".into(), event.task_id.clone());
     if let Some(tid) = event.turn_id {
         m.insert("turn_id".into(), tid.to_string());
     }
@@ -259,7 +259,7 @@ fn event_meta(event: &AgentEvent) -> HashMap<String, String> {
 }
 
 /// proto Record → AgentEvent（content 是原始 bytes，无 hex 编解码）
-fn event_from_record(rec: &logdb_client::Record, session_id: &str) -> Result<AgentEvent> {
+fn event_from_record(rec: &logdb_client::Record, task_id: &str) -> Result<AgentEvent> {
     let event_type =
         EventType::from_str(&rec.event_type).ok_or_else(|| {
             AppError::InvalidEventType(rec.event_type.clone())
@@ -285,7 +285,7 @@ fn event_from_record(rec: &logdb_client::Record, session_id: &str) -> Result<Age
     let created_at = Utc.timestamp_nanos(rec.timestamp_ns as i64);
 
     Ok(AgentEvent {
-        session_id: session_id.to_string(),
+        task_id: task_id.to_string(),
         seq: rec.seq as i64,
         turn_id,
         step_id,
@@ -302,9 +302,9 @@ fn event_from_record(rec: &logdb_client::Record, session_id: &str) -> Result<Age
 impl EventStore for LogdbdEventStore {
     // ── Session ─────────────────────────────────────────────────────────
 
-    async fn create_session(
+    async fn create_task(
         &self,
-        session_id: &str,
+        task_id: &str,
         tenant_id: &str,
         user_id: &str,
         agent_type: &str,
@@ -319,7 +319,7 @@ impl EventStore for LogdbdEventStore {
             .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
 
         let mut meta = HashMap::new();
-        meta.insert("session_id".into(), session_id.to_string());
+        meta.insert("task_id".into(), task_id.to_string());
         meta.insert("tenant_id".into(), tenant_id.to_string());
         meta.insert("user_id".into(), user_id.to_string());
 
@@ -329,7 +329,7 @@ impl EventStore for LogdbdEventStore {
         let resp = client
             .append_full(
                 &self.namespace,
-                session_id,
+                task_id,
                 "session_started",
                 "application/json",
                 &meta,
@@ -340,7 +340,7 @@ impl EventStore for LogdbdEventStore {
             .map_err(|e| AppError::Internal(format!("logdbd append: {}", e)))?;
 
         Ok(AgentEvent {
-            session_id: session_id.to_string(),
+            task_id: task_id.to_string(),
             seq: resp.seq as i64,
             turn_id: None,
             step_id: None,
@@ -351,12 +351,12 @@ impl EventStore for LogdbdEventStore {
         })
     }
 
-    async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+    async fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["session_started".into()],
                     result: QueryResult::Records as i32,
@@ -378,8 +378,8 @@ impl EventStore for LogdbdEventStore {
             serde_json::from_slice(&rec.content).unwrap_or_default()
         };
 
-        Ok(Some(Session {
-            session_id: session_id.to_string(),
+        Ok(Some(Task {
+            task_id: task_id.to_string(),
             tenant_id: rec
                 .metadata
                 .get("tenant_id")
@@ -399,12 +399,12 @@ impl EventStore for LogdbdEventStore {
         }))
     }
 
-    async fn session_exists(&self, session_id: &str) -> Result<bool> {
+    async fn task_exists(&self, task_id: &str) -> Result<bool> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["session_started".into()],
                     result: QueryResult::Exists as i32,
@@ -418,12 +418,12 @@ impl EventStore for LogdbdEventStore {
         ))
     }
 
-    async fn is_session_ended(&self, session_id: &str) -> Result<bool> {
+    async fn is_task_ended(&self, task_id: &str) -> Result<bool> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["session_ended".into()],
                     result: QueryResult::Exists as i32,
@@ -439,12 +439,12 @@ impl EventStore for LogdbdEventStore {
 
     // ── Seq ─────────────────────────────────────────────────────────────
 
-    async fn get_max_seq(&self, session_id: &str) -> Result<i64> {
+    async fn get_max_seq(&self, task_id: &str) -> Result<i64> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     result: QueryResult::Max as i32, // aggregate_field="" ⇒ seq
                     ..Default::default()
@@ -457,12 +457,12 @@ impl EventStore for LogdbdEventStore {
         })
     }
 
-    async fn get_max_turn_id(&self, session_id: &str) -> Result<i64> {
+    async fn get_max_turn_id(&self, task_id: &str) -> Result<i64> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     aggregate_field: "turn_id".into(),
                     result: QueryResult::Max as i32,
@@ -498,7 +498,7 @@ impl EventStore for LogdbdEventStore {
         let resp = client
             .append_full(
                 &self.namespace,
-                &event.session_id,
+                &event.task_id,
                 event.event_type.as_str(),
                 "application/json",
                 &meta,
@@ -539,7 +539,7 @@ impl EventStore for LogdbdEventStore {
 
             requests.push(AppendRequest {
                 namespace: self.namespace.clone(),
-                stream: event.session_id.clone(),
+                stream: event.task_id.clone(),
                 event_type: event.event_type.as_str().to_string(),
                 content_type: "application/json".to_string(),
                 metadata: meta,
@@ -568,15 +568,15 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_event(
         &self,
-        session_id: &str,
+        task_id: &str,
         seq: i64,
     ) -> Result<Option<AgentEvent>> {
         let mut client = self.client.lock().await;
         match client
-            .read(&self.namespace, session_id, seq as u64)
+            .read(&self.namespace, task_id, seq as u64)
             .await
         {
-            Ok(Some(rec)) => Ok(Some(event_from_record(&rec, session_id)?)),
+            Ok(Some(rec)) => Ok(Some(event_from_record(&rec, task_id)?)),
             Ok(None) => Ok(None),
             Err(e) => Err(AppError::Internal(format!(
                 "logdbd read: {}",
@@ -588,13 +588,13 @@ impl EventStore for LogdbdEventStore {
     /// 原生 gRPC scan — 不需要 SQL，content 直接是 bytes
     async fn get_events_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<Vec<AgentEvent>> {
         let from = (after_seq + 1).max(1) as u64;
         let mut client = self.client.lock().await;
         let records = client
-            .scan_all(&self.namespace, session_id, from)
+            .scan_all(&self.namespace, task_id, from)
             .await
             .map_err(|e| {
                 AppError::Internal(format!("logdbd scan: {}", e))
@@ -618,7 +618,7 @@ impl EventStore for LogdbdEventStore {
         records
             .iter()
             .filter(|r| KEEP_TYPES.contains(&r.event_type.as_str()))
-            .map(|r| event_from_record(r, session_id))
+            .map(|r| event_from_record(r, task_id))
             .collect()
     }
 
@@ -626,14 +626,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_turn_events(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
     ) -> Result<Vec<AgentEvent>> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     metadata: vec![MetadataFilter {
                         key: "turn_id".into(),
@@ -648,18 +648,18 @@ impl EventStore for LogdbdEventStore {
             Some(query_response::Result::Records(r)) => r.records,
             _ => vec![],
         };
-        recs.iter().map(|r| event_from_record(r, session_id)).collect()
+        recs.iter().map(|r| event_from_record(r, task_id)).collect()
     }
 
     async fn get_latest_summary(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Option<AgentEvent>> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["summary_marker".into()],
                     result: QueryResult::Records as i32,
@@ -671,7 +671,7 @@ impl EventStore for LogdbdEventStore {
             .await?;
         match resp.result {
             Some(query_response::Result::Records(r)) => match r.records.into_iter().next() {
-                Some(rec) => Ok(Some(event_from_record(&rec, session_id)?)),
+                Some(rec) => Ok(Some(event_from_record(&rec, task_id)?)),
                 None => Ok(None),
             },
             _ => Ok(None),
@@ -680,7 +680,7 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_turn_steps(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
     ) -> Result<Vec<StepExecution>> {
         // 原实现是 records 自连接(按 step_id 把 invoked 配对到 completed/failed)。
@@ -689,7 +689,7 @@ impl EventStore for LogdbdEventStore {
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     metadata: vec![MetadataFilter {
                         key: "turn_id".into(),
@@ -771,14 +771,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_incomplete_turns(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<IncompleteTurn>> {
         // 反连接:turn_started 且同 turn_id 无任何 terminal(turn_completed/…/blocked)。
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["turn_started".into()],
                     absent: Some(AbsentMatch {
@@ -830,14 +830,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_incomplete_steps(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<IncompleteStep>> {
         // 反连接:llm/tool_invoked 且同 step_id 无任何 terminal。
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["llm_invoked".into(), "tool_invoked".into()],
                     absent: Some(AbsentMatch {
@@ -884,7 +884,7 @@ impl EventStore for LogdbdEventStore {
 
     async fn detect_seq_gaps(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<i64>> {
         // 找 seq 空洞:对每个 seq < MAX(seq),若 seq+1 不存在则报告 seq+1。
         // 结构化查询无此谓词,拉取全部记录后客户端计算。
@@ -892,7 +892,7 @@ impl EventStore for LogdbdEventStore {
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     result: QueryResult::Records as i32,
                     ..Default::default()
@@ -920,10 +920,10 @@ impl EventStore for LogdbdEventStore {
 
     async fn is_turn_seq_continuous(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
     ) -> Result<bool> {
-        let gaps = self.detect_seq_gaps(session_id).await?;
+        let gaps = self.detect_seq_gaps(task_id).await?;
         let mut client = self.client.lock().await;
         let meta = vec![MetadataFilter {
             key: "turn_id".into(),
@@ -933,7 +933,7 @@ impl EventStore for LogdbdEventStore {
         let lo = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     metadata: meta.clone(),
                     result: QueryResult::Min as i32,
@@ -944,7 +944,7 @@ impl EventStore for LogdbdEventStore {
         let hi = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     metadata: meta,
                     result: QueryResult::Max as i32,
@@ -968,13 +968,13 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_token_usage_stats(
         &self,
-        session_id: &str,
+        task_id: &str,
     ) -> Result<Vec<TokenUsageStats>> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["llm_completed".into()],
                     result: QueryResult::Records as i32,
@@ -1031,7 +1031,7 @@ impl EventStore for LogdbdEventStore {
 
     async fn count_turns_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<i64> {
         // SQL `seq > N` ⇒ from_seq = N+1(引擎 from_seq 含端点);turn_id 非空由
@@ -1040,7 +1040,7 @@ impl EventStore for LogdbdEventStore {
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["turn_started".into()],
                     from_seq: Some((after_seq + 1).max(1) as u64),
@@ -1058,14 +1058,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn count_events_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<i64> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec![
                         "turn_pending".into(),
@@ -1095,14 +1095,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_llm_payloads_after_seq(
         &self,
-        session_id: &str,
+        task_id: &str,
         after_seq: i64,
     ) -> Result<Vec<String>> {
         let mut client = self.client.lock().await;
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["llm_completed".into()],
                     from_seq: Some((after_seq + 1).max(1) as u64),
@@ -1124,7 +1124,7 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_recent_turn_ids(
         &self,
-        session_id: &str,
+        task_id: &str,
         limit: i64,
     ) -> Result<Vec<i64>> {
         // 引擎 DISTINCT_VALUES 按 seq 返回字符串;原 SQL 要数值 DESC LIMIT n,故客户端排序截断。
@@ -1132,7 +1132,7 @@ impl EventStore for LogdbdEventStore {
         let resp = self
             .run_query(
                 &mut client,
-                session_id,
+                task_id,
                 QueryRequest {
                     event_types: vec!["turn_started".into()],
                     aggregate_field: "turn_id".into(),
@@ -1158,7 +1158,7 @@ impl EventStore for LogdbdEventStore {
 
     async fn archive_events_before_seq(
         &self,
-        _session_id: &str,
+        _task_id: &str,
         before_seq: i64,
     ) -> Result<ArchiveResult> {
         tracing::info!(
@@ -1278,30 +1278,30 @@ mod logdbd_tests {
         let (store, _dir) = setup().await;
         let sid = "sess-create";
         let ev = store
-            .create_session(sid, "tenant-a", "user-1", "claude-code", None)
+            .create_task(sid, "tenant-a", "user-1", "claude-code", None)
             .await
             .unwrap();
         assert_eq!(ev.event_type, EventType::SessionStarted);
         assert_eq!(ev.seq, 1);
 
         wait_seq(&store, sid, 1).await;
-        assert!(store.session_exists(sid).await.unwrap());
+        assert!(store.task_exists(sid).await.unwrap());
 
-        let s = store.get_session(sid).await.unwrap().unwrap();
-        assert_eq!(s.session_id, sid);
+        let s = store.get_task(sid).await.unwrap().unwrap();
+        assert_eq!(s.task_id, sid);
         assert_eq!(s.tenant_id, "tenant-a");
         assert_eq!(s.user_id, "user-1");
         assert_eq!(s.agent_type, "claude-code");
-        assert!(!store.is_session_ended(sid).await.unwrap());
+        assert!(!store.is_task_ended(sid).await.unwrap());
     }
 
     #[tokio::test]
     async fn session_ended_detected() {
         let (store, _dir) = setup().await;
         let sid = "sess-end";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
-        assert!(!store.is_session_ended(sid).await.unwrap());
+        assert!(!store.is_task_ended(sid).await.unwrap());
 
         let end = AgentEvent::new(
             sid.into(),
@@ -1312,7 +1312,7 @@ mod logdbd_tests {
         );
         assert_eq!(store.write_event(&end).await.unwrap(), 2);
         wait_seq(&store, sid, 2).await;
-        assert!(store.is_session_ended(sid).await.unwrap());
+        assert!(store.is_task_ended(sid).await.unwrap());
     }
 
     // ── 终态唯一性(B2)──────────────────────────────────────────────────────
@@ -1321,7 +1321,7 @@ mod logdbd_tests {
     async fn terminal_uniqueness_rejects_duplicate_turn_terminal() {
         let (store, _dir) = setup().await;
         let sid = "sess-turn-term";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         let ts = AgentEvent::new(
@@ -1365,7 +1365,7 @@ mod logdbd_tests {
     async fn terminal_uniqueness_rejects_duplicate_step_terminal() {
         let (store, _dir) = setup().await;
         let sid = "sess-step-term";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         let inv = AgentEvent::new(
@@ -1410,7 +1410,7 @@ mod logdbd_tests {
     async fn get_turn_steps_pairs_invoked_completed() {
         let (store, _dir) = setup().await;
         let sid = "sess-steps";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         // step-1: llm_invoked → llm_completed
@@ -1476,7 +1476,7 @@ mod logdbd_tests {
         let sid = "sess-seq";
         assert_eq!(
             store
-                .create_session(sid, "t", "u", "a", None)
+                .create_task(sid, "t", "u", "a", None)
                 .await
                 .unwrap()
                 .seq,
@@ -1512,7 +1512,7 @@ mod logdbd_tests {
     async fn incomplete_turns_parse_redo_group() {
         let (store, _dir) = setup().await;
         let sid = "sess-redo";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         // turn 7 started(带 redo_group/redo_count),未终止 → 应出现在 incomplete 列表
@@ -1544,7 +1544,7 @@ mod logdbd_tests {
     async fn write_events_batch_returns_contiguous_seqs() {
         let (store, _dir) = setup().await;
         let sid = "sess-batch";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         let events = vec![
@@ -1584,7 +1584,7 @@ mod logdbd_tests {
     async fn get_event_reads_back_via_grpc() {
         let (store, _dir) = setup().await;
         let sid = "sess-read";
-        store.create_session(sid, "t", "u", "a", None).await.unwrap();
+        store.create_task(sid, "t", "u", "a", None).await.unwrap();
         wait_seq(&store, sid, 1).await;
 
         // get_event 走原生 gRPC read(不经 query cache)

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{AppError, Result};
-use crate::session_registry::{PendingTurn, SessionRegistry, TurnOutcome};
+use crate::task_registry::{PendingTurn, TaskRegistry, TurnOutcome};
 use crate::storage::EventStore;
 use crate::{context, recovery, sandbox, service};
 
@@ -27,18 +27,18 @@ pub struct ToolExecuteResult {
 
 /// 为 MCP tool 构建 idempotency_key
 ///
-/// 格式: `{session_id}:mcp:{tool_name}:{canonical_hash}`
+/// 格式: `{task_id}:mcp:{tool_name}:{canonical_hash}`
 /// MCP tool 的 idempotency_key 与 Turn 无关（不包含 redo_group），
 /// 因为 MCP tool 在 Turn 级别恢复时不参与重做。
 fn build_tool_idempotency_key(
-    session_id: &str,
+    task_id: &str,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> String {
     use sha2::{Digest, Sha256};
     let canonical = canonical_json(args);
     let hash = hex::encode(Sha256::digest(canonical.as_bytes()).as_slice());
-    format!("{}:mcp:{}:{}", session_id, tool_name, &hash[..16])
+    format!("{}:mcp:{}:{}", task_id, tool_name, &hash[..16])
 }
 
 /// 规范化为确定性的 JSON 字符串
@@ -81,7 +81,7 @@ fn capitalize_first(s: &str) -> String {
 /// Turn 编排器
 pub struct Orchestrator {
     store: Arc<dyn EventStore>,
-    registry: Arc<SessionRegistry>,
+    registry: Arc<TaskRegistry>,
     /// Turn 级超时（默认 5 分钟）
     turn_timeout: Duration,
     /// Token 逐字流式发布(Redis ephemeral 快路径,仅 llm_chunk)
@@ -100,7 +100,7 @@ pub enum AsyncTurnStart {
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
-        registry: Arc<SessionRegistry>,
+        registry: Arc<TaskRegistry>,
         token_publisher: crate::stream::TokenPublisher,
     ) -> Self {
         Self {
@@ -113,12 +113,12 @@ impl Orchestrator {
 
     /// 解析 session 的 agent_type(用于按 agent_type 路由到 fixlet)。
     /// agent_type 是 session 创建时落库的独立业务字段,非事件派生。
-    async fn resolve_agent_type(&self, session_id: &str) -> Result<String> {
+    async fn resolve_agent_type(&self, task_id: &str) -> Result<String> {
         let session = self
             .store
-            .get_session(session_id)
+            .get_task(task_id)
             .await?
-            .ok_or_else(|| AppError::SessionNotFound(session_id.to_string()))?;
+            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
         Ok(session.agent_type)
     }
 
@@ -130,20 +130,20 @@ impl Orchestrator {
     /// 自动处理恢复、context 构建、fixlet 下发、Sandbox 调度、结果返回。
     pub async fn execute_turn(
         &self,
-        session_id: &str,
+        task_id: &str,
         user_input: &str,
         redo_group: Option<&str>,
     ) -> Result<TurnOutcome> {
         // 1. 恢复检查 — 检测到未完成 Turn 时触发后台恢复，不阻塞当前请求
-        let incomplete = self.store.get_incomplete_turns(session_id).await?;
+        let incomplete = self.store.get_incomplete_turns(task_id).await?;
         if !incomplete.is_empty() {
             let count = incomplete.len();
             tracing::warn!(
                 "session {}: {} incomplete turns detected, triggering background recovery",
-                session_id,
+                task_id,
                 count
             );
-            self.spawn_background_recovery(session_id.to_string());
+            self.spawn_background_recovery(task_id.to_string());
 
             return Ok(TurnOutcome::Completed {
                 final_output: format!(
@@ -157,16 +157,16 @@ impl Orchestrator {
 
         // 2. 启动新 Turn（WAL: turn_started）
         let (turn_id, redo_group, _turn_started) =
-            service::start_turn(&*self.store, session_id, user_input, redo_group).await?;
+            service::start_turn(&*self.store, task_id, user_input, redo_group).await?;
         tracing::info!(
             "session {}: turn {} started, redo_group={}",
-            session_id,
+            task_id,
             turn_id,
             redo_group
         );
 
         // 3-7. 执行体
-        self.run_turn_to_completion(session_id, turn_id, user_input, &redo_group)
+        self.run_turn_to_completion(task_id, turn_id, user_input, &redo_group)
             .await
     }
 
@@ -175,26 +175,26 @@ impl Orchestrator {
     /// 被 `execute_turn`(同步)与 `start_turn_async`(后台)复用。
     async fn run_turn_to_completion(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         user_input: &str,
         redo_group: &str,
     ) -> Result<TurnOutcome> {
         // 3. 构建 context（只构建一次，传递给 dispatch）
-        let ctx = context::build_llm_context(&*self.store, session_id).await?;
+        let ctx = context::build_llm_context(&*self.store, task_id).await?;
 
-        // 3b. 解析 agent_type —— 按 agent_type 路由到 fixlet(不再按 session_id)
-        let agent_type = self.resolve_agent_type(session_id).await?;
+        // 3b. 解析 agent_type —— 按 agent_type 路由到 fixlet(不再按 task_id)
+        let agent_type = self.resolve_agent_type(task_id).await?;
 
         // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知;记录 agent_type 便于 fixlet 断连快速失败）
         let (pending, result_rx) = PendingTurn::new(
-            session_id.to_string(),
+            task_id.to_string(),
             agent_type.clone(),
             turn_id,
             redo_group.to_string(),
         );
         self.registry
-            .register_pending_turn(session_id, pending)
+            .register_pending_turn(task_id, pending)
             .await;
 
         // 5. 检查服务于该 agent_type 的 fixlet 是否已连接
@@ -205,7 +205,7 @@ impl Orchestrator {
             .is_none()
         {
             self.fail_turn_and_respond(
-                session_id,
+                task_id,
                 turn_id,
                 "no_fixlet",
                 &format!("No fixlet connected for agent_type {}", agent_type),
@@ -213,13 +213,13 @@ impl Orchestrator {
             .await?;
             return Err(AppError::Protocol(format!(
                 "No fixlet connected for agent_type {} (session {})",
-                agent_type, session_id
+                agent_type, task_id
             )));
         }
 
         // 6. 下发 execute_turn 给 fixlet（复用已构建的 context）
         self.dispatch_execute_turn_with_ctx(
-            session_id,
+            task_id,
             turn_id,
             user_input,
             redo_group,
@@ -236,10 +236,10 @@ impl Orchestrator {
                 // oneshot sender 被 dropped（fixlet 断开等）
                 tracing::error!(
                     "session {}: pending turn channel closed unexpectedly",
-                    session_id
+                    task_id
                 );
                 self.fail_turn_and_respond(
-                    session_id,
+                    task_id,
                     turn_id,
                     "channel_closed",
                     "fixlet connection lost",
@@ -248,9 +248,9 @@ impl Orchestrator {
             }
             Err(_elapsed) => {
                 // Turn 超时
-                tracing::warn!("session {}: turn {} timed out", session_id, turn_id);
+                tracing::warn!("session {}: turn {} timed out", task_id, turn_id);
                 self.fail_turn_and_respond(
-                    session_id,
+                    task_id,
                     turn_id,
                     "timeout",
                     &format!("Turn timed out after {}s", self.turn_timeout.as_secs()),
@@ -264,29 +264,29 @@ impl Orchestrator {
     /// 客户端凭 turn_id 连 fixus-stream SSE,实时看事件 + token 流式。
     pub async fn start_turn_async(
         &self,
-        session_id: &str,
+        task_id: &str,
         user_input: &str,
         redo_group: Option<&str>,
     ) -> Result<AsyncTurnStart> {
         // 1. 恢复检查
-        let incomplete = self.store.get_incomplete_turns(session_id).await?;
+        let incomplete = self.store.get_incomplete_turns(task_id).await?;
         if !incomplete.is_empty() {
             let count = incomplete.len();
             tracing::warn!(
                 "session {}: {} incomplete turns, triggering background recovery",
-                session_id,
+                task_id,
                 count
             );
-            self.spawn_background_recovery(session_id.to_string());
+            self.spawn_background_recovery(task_id.to_string());
             return Ok(AsyncTurnStart::RecoveryTriggered { incomplete_count: count });
         }
 
         // 2. 启动新 Turn（WAL: turn_started）— turn_id 在此确定
         let (turn_id, redo_group, _turn_started) =
-            service::start_turn(&*self.store, session_id, user_input, redo_group).await?;
+            service::start_turn(&*self.store, task_id, user_input, redo_group).await?;
         tracing::info!(
             "session {}: turn {} started (async), redo_group={}",
-            session_id,
+            task_id,
             turn_id,
             redo_group
         );
@@ -298,7 +298,7 @@ impl Orchestrator {
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
         };
-        let sid = session_id.to_string();
+        let sid = task_id.to_string();
         let ui = user_input.to_string();
         tokio::spawn(async move {
             match orch.run_turn_to_completion(&sid, turn_id, &ui, &redo_group).await {
@@ -322,25 +322,25 @@ impl Orchestrator {
     /// 后台恢复：检测未完成 Turn，逐个 redo，不阻塞 HTTP 请求。
     ///
     /// 恢复完成后客户端可以重新发起 execute_turn。
-    fn spawn_background_recovery(&self, session_id: String) {
+    fn spawn_background_recovery(&self, task_id: String) {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let turn_timeout = self.turn_timeout;
         let token_publisher = self.token_publisher.clone();
 
         tokio::spawn(async move {
-            tracing::info!("session {}: background recovery started", session_id);
+            tracing::info!("session {}: background recovery started", task_id);
 
-            let redo_queue = match recovery::recover_session(&*store, &session_id).await {
+            let redo_queue = match recovery::recover_task(&*store, &task_id).await {
                 Ok(q) => q,
                 Err(e) => {
-                    tracing::error!("session {}: recovery failed: {}", session_id, e);
+                    tracing::error!("session {}: recovery failed: {}", task_id, e);
                     return;
                 }
             };
 
             if redo_queue.is_empty() {
-                tracing::info!("session {}: no turns to redo", session_id);
+                tracing::info!("session {}: no turns to redo", task_id);
                 return;
             }
 
@@ -356,12 +356,12 @@ impl Orchestrator {
             let mut redo_failed = 0;
 
             // agent_type 是 session 级常量,循环外解析一次(按 agent_type 路由 redo)
-            let agent_type = match orch.resolve_agent_type(&session_id).await {
+            let agent_type = match orch.resolve_agent_type(&task_id).await {
                 Ok(at) => at,
                 Err(e) => {
                     tracing::error!(
                         "session {}: recovery cannot resolve agent_type: {}",
-                        session_id,
+                        task_id,
                         e
                     );
                     return;
@@ -371,26 +371,26 @@ impl Orchestrator {
             for redo_ctx in &redo_queue {
                 tracing::info!(
                     "session {}: redo turn {} redo_count={} redo_group={}",
-                    session_id,
+                    task_id,
                     redo_ctx.turn_id,
                     redo_ctx.redo_count,
                     redo_ctx.redo_group
                 );
 
                 let (pending, result_rx) = PendingTurn::new(
-                    session_id.clone(),
+                    task_id.clone(),
                     agent_type.clone(),
                     redo_ctx.turn_id,
                     redo_ctx.redo_group.clone(),
                 );
-                registry.register_pending_turn(&session_id, pending).await;
+                registry.register_pending_turn(&task_id, pending).await;
 
                 let cached = orch
-                    .get_cached_llm_responses(&session_id, redo_ctx.turn_id)
+                    .get_cached_llm_responses(&task_id, redo_ctx.turn_id)
                     .await;
                 if let Err(e) = orch
                     .dispatch_execute_turn(
-                        &session_id,
+                        &task_id,
                         redo_ctx.turn_id,
                         &redo_ctx.user_input,
                         &redo_ctx.redo_group,
@@ -401,13 +401,13 @@ impl Orchestrator {
                 {
                     tracing::error!(
                         "session {}: redo dispatch failed for turn {}: {}",
-                        session_id,
+                        task_id,
                         redo_ctx.turn_id,
                         e
                     );
                     let _ = orch
                         .fail_turn_and_respond(
-                            &session_id,
+                            &task_id,
                             redo_ctx.turn_id,
                             "redo_dispatch_failed",
                             &e.to_string(),
@@ -421,7 +421,7 @@ impl Orchestrator {
                     Ok(Ok(TurnOutcome::Completed { turn_id, .. })) => {
                         tracing::info!(
                             "session {}: redo turn {} succeeded",
-                            session_id,
+                            task_id,
                             turn_id
                         );
                         redo_success += 1;
@@ -433,7 +433,7 @@ impl Orchestrator {
                     })) => {
                         tracing::error!(
                             "session {}: redo turn {} failed: {}",
-                            session_id,
+                            task_id,
                             turn_id,
                             error_type
                         );
@@ -442,12 +442,12 @@ impl Orchestrator {
                     Ok(Ok(TurnOutcome::Timeout { .. })) | Err(_) => {
                         tracing::error!(
                             "session {}: redo turn {} timed out",
-                            session_id,
+                            task_id,
                             redo_ctx.turn_id
                         );
                         let _ = orch
                             .fail_turn_and_respond(
-                                &session_id,
+                                &task_id,
                                 redo_ctx.turn_id,
                                 "redo_timeout",
                                 "Redo timed out",
@@ -458,7 +458,7 @@ impl Orchestrator {
                     Ok(Err(_)) => {
                         let _ = orch
                             .fail_turn_and_respond(
-                                &session_id,
+                                &task_id,
                                 redo_ctx.turn_id,
                                 "channel_closed",
                                 "fixlet connection lost during redo",
@@ -471,7 +471,7 @@ impl Orchestrator {
 
             tracing::info!(
                 "session {}: background recovery finished — {} succeeded, {} failed",
-                session_id,
+                task_id,
                 redo_success,
                 redo_failed
             );
@@ -481,16 +481,16 @@ impl Orchestrator {
     /// 下发 execute_turn 消息给 fixlet（redo 路径，需刷新 context）
     async fn dispatch_execute_turn(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         user_input: &str,
         redo_group: &str,
         redo_count: i32,
         cached_llm_responses: &[String],
     ) -> Result<()> {
-        let ctx = context::build_llm_context(&*self.store, session_id).await?;
+        let ctx = context::build_llm_context(&*self.store, task_id).await?;
         self.dispatch_execute_turn_with_ctx(
-            session_id,
+            task_id,
             turn_id,
             user_input,
             redo_group,
@@ -504,7 +504,7 @@ impl Orchestrator {
     /// 下发 execute_turn（复用已构建的 context，避免重复查询）
     async fn dispatch_execute_turn_with_ctx(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         user_input: &str,
         redo_group: &str,
@@ -534,7 +534,7 @@ impl Orchestrator {
 
         let msg = serde_json::json!({
             "type": "execute_turn",
-            "session_id": session_id,
+            "task_id": task_id,
             "turn_id": turn_id,
             "input": {"user_input": &user_input_with_cache},
             "context": {
@@ -547,7 +547,7 @@ impl Orchestrator {
         });
 
         // 按 session 的 agent_type 路由到对应 fixlet
-        let agent_type = self.resolve_agent_type(session_id).await?;
+        let agent_type = self.resolve_agent_type(task_id).await?;
         self.registry
             .send_to_fixlet_for_agent_type(&agent_type, &msg.to_string())
             .await
@@ -557,7 +557,7 @@ impl Orchestrator {
 
         tracing::info!(
             "session {}: dispatched execute_turn turn_id={} redo_count={}",
-            session_id,
+            task_id,
             turn_id,
             redo_count
         );
@@ -575,7 +575,7 @@ impl Orchestrator {
     /// 4. 回传 tool_result 给 fixlet
     pub async fn handle_tool_invoked(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         step_id: &str,
         local_seq: i64,
@@ -586,7 +586,7 @@ impl Orchestrator {
     ) -> Result<()> {
         tracing::info!(
             "session {}: tool_invoked {} step_id={} idempotency_key={}",
-            session_id,
+            task_id,
             tool_name,
             step_id,
             idempotency_key
@@ -595,7 +595,7 @@ impl Orchestrator {
         // 1. WAL: 写 tool_invoked
         let _event = service::record_tool_invoked(
             &*self.store,
-            session_id,
+            task_id,
             Some(turn_id),
             step_id,
             tool_name,
@@ -624,7 +624,7 @@ impl Orchestrator {
         if exec_result.success {
             service::record_tool_completed(
                 &*self.store,
-                session_id,
+                task_id,
                 Some(turn_id),
                 step_id,
                 tool_call_id,
@@ -636,7 +636,7 @@ impl Orchestrator {
         } else {
             service::record_tool_failed(
                 &*self.store,
-                session_id,
+                task_id,
                 Some(turn_id),
                 step_id,
                 tool_call_id,
@@ -651,7 +651,7 @@ impl Orchestrator {
 
         // 4. 回传 tool_result 给 fixlet
         self.send_tool_result_to_fixlet(
-            session_id,
+            task_id,
             step_id,
             tool_call_id,
             &exec_result.output,
@@ -664,8 +664,8 @@ impl Orchestrator {
     }
 
     /// 从 WAL 读取上次尝试的 LLM 缓存（同 turn_id 下所有 llm_completed）
-    async fn get_cached_llm_responses(&self, session_id: &str, turn_id: i64) -> Vec<String> {
-        match self.store.get_turn_events(session_id, turn_id).await {
+    async fn get_cached_llm_responses(&self, task_id: &str, turn_id: i64) -> Vec<String> {
+        match self.store.get_turn_events(task_id, turn_id).await {
             Ok(events) => events
                 .iter()
                 .filter(|e| e.event_type == crate::models::EventType::LlmCompleted)
@@ -679,7 +679,7 @@ impl Orchestrator {
     /// 回传 tool_result 到 fixlet
     async fn send_tool_result_to_fixlet(
         &self,
-        session_id: &str,
+        task_id: &str,
         step_id: &str,
         tool_call_id: &str,
         output: &serde_json::Value,
@@ -696,12 +696,12 @@ impl Orchestrator {
         });
 
         // tool_result 也按 agent_type 路由回对应 fixlet
-        let agent_type = match self.resolve_agent_type(session_id).await {
+        let agent_type = match self.resolve_agent_type(task_id).await {
             Ok(at) => at,
             Err(e) => {
                 tracing::error!(
                     "session {}: cannot resolve agent_type for tool_result: {}",
-                    session_id,
+                    task_id,
                     e
                 );
                 return;
@@ -714,7 +714,7 @@ impl Orchestrator {
         {
             tracing::error!(
                 "session {}: failed to send tool_result to fixlet (agent_type {}): {}",
-                session_id,
+                task_id,
                 agent_type,
                 e
             );
@@ -729,13 +729,13 @@ impl Orchestrator {
     /// fixus-stream SUBSCRIBE 同一通道,与 logdbd 事件流 fan-in 转 SSE。
     pub async fn handle_llm_chunk(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         text: &str,
     ) -> Result<()> {
         self.token_publisher
             .publish(
-                session_id,
+                task_id,
                 turn_id,
                 &serde_json::json!({ "type": "llm_chunk", "text": text }).to_string(),
             )
@@ -748,7 +748,7 @@ impl Orchestrator {
     /// 写入 llm_completed Event 到 WAL，包含 token 用量。
     pub async fn handle_llm_completed(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         model: &str,
         input_tokens: i64,
@@ -768,7 +768,7 @@ impl Orchestrator {
 
         service::record_event(
             &*self.store,
-            session_id,
+            task_id,
             Some(turn_id),
             Some(&step_id),
             crate::models::EventType::LlmCompleted,
@@ -778,7 +778,7 @@ impl Orchestrator {
 
         tracing::info!(
             "session {}: llm_completed turn={} tokens(in={} out={} total={})",
-            session_id,
+            task_id,
             turn_id,
             input_tokens,
             output_tokens,
@@ -794,14 +794,14 @@ impl Orchestrator {
     /// 2. 通知 HTTP handler（oneshot）
     pub async fn handle_turn_execution_done(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         max_local_seq: i64,
         final_output: &str,
     ) -> Result<()> {
         tracing::info!(
             "session {}: turn_execution_done turn_id={} max_local_seq={} output_len={}",
-            session_id,
+            task_id,
             turn_id,
             max_local_seq,
             final_output.len()
@@ -809,12 +809,12 @@ impl Orchestrator {
 
         // 1. WAL: 写 turn_completed
         let _event =
-            service::complete_turn(&*self.store, session_id, turn_id, final_output).await?;
+            service::complete_turn(&*self.store, task_id, turn_id, final_output).await?;
 
         // 2. 统计该 Turn 的事件数量
         let turn_events = self
             .store
-            .get_turn_events(session_id, turn_id)
+            .get_turn_events(task_id, turn_id)
             .await?;
         let event_count = turn_events.len() as i64;
 
@@ -827,19 +827,19 @@ impl Orchestrator {
 
         if let Err(e) = self
             .registry
-            .complete_pending_turn(session_id, outcome)
+            .complete_pending_turn(task_id, outcome)
             .await
         {
             tracing::warn!(
                 "session {}: failed to complete pending turn: {} (client may have disconnected)",
-                session_id,
+                task_id,
                 e
             );
         }
 
         tracing::info!(
             "session {}: turn {} completed, {} events",
-            session_id,
+            task_id,
             turn_id,
             event_count
         );
@@ -853,14 +853,14 @@ impl Orchestrator {
     /// 不立即 fail——先尝试 redo。只有 redo 也失败才写 turn_failed。
     pub async fn handle_turn_execution_error(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         error_type: &str,
         error_message: &str,
     ) -> Result<()> {
         tracing::error!(
             "session {}: turn_execution_error turn_id={} type={}: {} — attempting redo",
-            session_id,
+            task_id,
             turn_id,
             error_type,
             error_message
@@ -869,7 +869,7 @@ impl Orchestrator {
         // 1. 读取原始 turn_started 获取 redo 上下文
         let turn_events = self
             .store
-            .get_turn_events(session_id, turn_id)
+            .get_turn_events(task_id, turn_id)
             .await?;
         let turn_started = turn_events
             .iter()
@@ -898,7 +898,7 @@ impl Orchestrator {
             }
             None => {
                 // 没有 turn_started，无法 redo
-                self.fail_turn_and_respond(session_id, turn_id, error_type, error_message)
+                self.fail_turn_and_respond(task_id, turn_id, error_type, error_message)
                     .await?;
                 return Ok(());
             }
@@ -906,17 +906,17 @@ impl Orchestrator {
 
         tracing::info!(
             "session {}: redo turn {} redo_count={} redo_group={}",
-            session_id,
+            task_id,
             turn_id,
             redo_count,
             redo_group
         );
 
         // 2. 查询上次尝试的 LLM 缓存，注入后分发 redo
-        let cached = self.get_cached_llm_responses(session_id, turn_id).await;
+        let cached = self.get_cached_llm_responses(task_id, turn_id).await;
         if let Err(e) = self
             .dispatch_execute_turn(
-                session_id,
+                task_id,
                 turn_id,
                 &user_input,
                 &redo_group,
@@ -927,11 +927,11 @@ impl Orchestrator {
         {
             tracing::error!(
                 "session {}: failed to dispatch redo: {}",
-                session_id,
+                task_id,
                 e
             );
             self.fail_turn_and_respond(
-                session_id,
+                task_id,
                 turn_id,
                 "redo_dispatch_failed",
                 &e.to_string(),
@@ -952,7 +952,7 @@ impl Orchestrator {
     /// 4. 返回执行结果
     pub async fn execute_tool(
         &self,
-        session_id: &str,
+        task_id: &str,
         tool_name: &str, // "fixus_bash"
         tool_call_id: &str,
         args: &serde_json::Value,
@@ -960,7 +960,7 @@ impl Orchestrator {
         use uuid::Uuid;
 
         let step_id = Uuid::now_v7().to_string();
-        let active_turn = self.store.get_max_turn_id(session_id).await?;
+        let active_turn = self.store.get_max_turn_id(task_id).await?;
 
         // 将 fixus_* 映射为原生工具名
         let native_tool: String = tool_name
@@ -969,11 +969,11 @@ impl Orchestrator {
             .unwrap_or_else(|| tool_name.to_string());
 
         // 生成 idempotency_key
-        let idempotency_key = build_tool_idempotency_key(session_id, tool_name, args);
+        let idempotency_key = build_tool_idempotency_key(task_id, tool_name, args);
 
         tracing::info!(
             "session {}: executing tool {} (native={}) idempotency_key={}",
-            session_id,
+            task_id,
             tool_name,
             native_tool,
             idempotency_key
@@ -987,7 +987,7 @@ impl Orchestrator {
         };
         service::record_tool_invoked(
             &*self.store,
-            session_id,
+            task_id,
             turn_id,
             &step_id,
             tool_name,
@@ -1013,7 +1013,7 @@ impl Orchestrator {
         if exec_result.success {
             service::record_tool_completed(
                 &*self.store,
-                session_id,
+                task_id,
                 turn_id,
                 &step_id,
                 tool_call_id,
@@ -1026,7 +1026,7 @@ impl Orchestrator {
             let error_msg = exec_result.error.clone().unwrap_or_default();
             service::record_tool_failed(
                 &*self.store,
-                session_id,
+                task_id,
                 turn_id,
                 &step_id,
                 tool_call_id,
@@ -1049,7 +1049,7 @@ impl Orchestrator {
     /// 写 turn_failed 并通知 HTTP handler
     async fn fail_turn_and_respond(
         &self,
-        session_id: &str,
+        task_id: &str,
         turn_id: i64,
         error_type: &str,
         error_message: &str,
@@ -1057,7 +1057,7 @@ impl Orchestrator {
         // WAL: 写 turn_failed
         if let Err(e) = service::fail_turn(
             &*self.store,
-            session_id,
+            task_id,
             turn_id,
             error_type,
             error_message,
@@ -1067,7 +1067,7 @@ impl Orchestrator {
         {
             tracing::error!(
                 "session {}: failed to write turn_failed: {}",
-                session_id,
+                task_id,
                 e
             );
         }
@@ -1081,7 +1081,7 @@ impl Orchestrator {
         // 通知 HTTP handler
         let _ = self
             .registry
-            .complete_pending_turn(session_id, outcome.clone())
+            .complete_pending_turn(task_id, outcome.clone())
             .await;
 
         Ok(outcome)

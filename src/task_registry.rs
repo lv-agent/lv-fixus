@@ -2,11 +2,11 @@
 //!
 //! 维护两个映射：
 //! - **agent_type → fixlet WebSocket sender**(按 agent_type 路由 execute_turn 给 fixlet)
-//! - session_id → PendingTurn(Turn 完成时通知 HTTP handler;turn 属 session,仍按 session_id)
+//! - task_id → PendingTurn(Turn 完成时通知 HTTP handler;turn 属 session,仍按 task_id)
 //!
-//! 为什么按 agent_type 而非 session_id:上游(如 nuntius)每次创建随机 session_id,
+//! 为什么按 agent_type 而非 task_id:上游(如 nuntius)每次创建随机 task_id,
 //! 但 fixlet 实例按它服务的 agent_type 注册。按 agent_type 路由让任意同类型 session
-//! 都能命中对应 fixlet,无需 session_id 协调。
+//! 都能命中对应 fixlet,无需 task_id 协调。
 //!
 //! 线程安全：使用 RwLock，写少读多。
 
@@ -43,7 +43,7 @@ pub enum TurnOutcome {
 
 /// 一个正在等待结果的 Turn
 pub struct PendingTurn {
-    pub session_id: String,
+    pub task_id: String,
     /// 该 turn 所属 session 的 agent_type(fixlet 断连时按它快速失败同类型 pending turn)
     pub agent_type: String,
     pub turn_id: i64,
@@ -54,7 +54,7 @@ pub struct PendingTurn {
 
 impl PendingTurn {
     pub fn new(
-        session_id: String,
+        task_id: String,
         agent_type: String,
         turn_id: i64,
         redo_group: String,
@@ -62,7 +62,7 @@ impl PendingTurn {
         let (tx, rx) = oneshot::channel();
         (
             Self {
-                session_id,
+                task_id,
                 agent_type,
                 turn_id,
                 redo_group,
@@ -73,17 +73,17 @@ impl PendingTurn {
     }
 }
 
-// ── SessionRegistry ─────────────────────────────────────────────────────
+// ── TaskRegistry ─────────────────────────────────────────────────────
 
 /// 全局 fixlet 连接注册表(按 agent_type 路由)+ 活跃 Turn
-pub struct SessionRegistry {
+pub struct TaskRegistry {
     /// agent_type → fixlet WebSocket sender(一种 agent_type 一个 fixlet;worker-pool 待扩展)
     by_agent_type: RwLock<HashMap<String, WsSender>>,
-    /// session_id → 当前活跃的 PendingTurn
+    /// task_id → 当前活跃的 PendingTurn
     active_turns: RwLock<HashMap<String, PendingTurn>>,
 }
 
-impl SessionRegistry {
+impl TaskRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             by_agent_type: RwLock::new(HashMap::new()),
@@ -161,12 +161,12 @@ impl SessionRegistry {
     ///
     /// 如果该 session 已有 pending turn（前一轮尚未清理），
     /// 先向旧的 oneshot 发送 Failed 通知，避免 HTTP handler 收到无意义的 RecvError。
-    pub async fn register_pending_turn(&self, session_id: &str, turn: PendingTurn) {
+    pub async fn register_pending_turn(&self, task_id: &str, turn: PendingTurn) {
         let mut turns = self.active_turns.write().await;
-        if let Some(old) = turns.insert(session_id.to_string(), turn) {
+        if let Some(old) = turns.insert(task_id.to_string(), turn) {
             tracing::warn!(
                 "session {}: replacing existing pending turn (turn_id={})",
-                session_id, old.turn_id
+                task_id, old.turn_id
             );
             // 通知旧 HTTP handler：Turn 被新请求取代
             let _ = old.result_tx.send(TurnOutcome::Failed {
@@ -175,31 +175,31 @@ impl SessionRegistry {
                 error_message: "Turn replaced by new request".into(),
             });
         }
-        tracing::debug!("session {}: registered pending turn", session_id);
+        tracing::debug!("session {}: registered pending turn", task_id);
     }
 
     /// 取出并移除 PendingTurn
-    pub async fn take_pending_turn(&self, session_id: &str) -> Option<PendingTurn> {
+    pub async fn take_pending_turn(&self, task_id: &str) -> Option<PendingTurn> {
         let mut turns = self.active_turns.write().await;
-        turns.remove(session_id)
+        turns.remove(task_id)
     }
 
     /// 完成一个 PendingTurn 并通知 HTTP handler
     pub async fn complete_pending_turn(
         &self,
-        session_id: &str,
+        task_id: &str,
         outcome: TurnOutcome,
     ) -> Result<(), String> {
         let pending = self
-            .take_pending_turn(session_id)
+            .take_pending_turn(task_id)
             .await
-            .ok_or_else(|| format!("No pending turn for session {}", session_id))?;
+            .ok_or_else(|| format!("No pending turn for session {}", task_id))?;
 
         // 通过 oneshot 发送结果给 HTTP handler
         if pending.result_tx.send(outcome).is_err() {
             tracing::warn!(
                 "session {}: HTTP handler already dropped (client disconnected?)",
-                session_id
+                task_id
             );
         }
 
@@ -215,7 +215,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_and_send() {
-        let registry = SessionRegistry::new();
+        let registry = TaskRegistry::new();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.register_fixlet("database.repair", tx).await;
@@ -231,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_to_unknown_agent_type_fails() {
-        let registry = SessionRegistry::new();
+        let registry = TaskRegistry::new();
         let result = registry
             .send_to_fixlet_for_agent_type("nonexistent", "msg")
             .await;
@@ -240,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unregister_cleanup() {
-        let registry = SessionRegistry::new();
+        let registry = TaskRegistry::new();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         registry.register_fixlet("database.repair", tx).await;
@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_turn_lifecycle() {
-        let registry = SessionRegistry::new();
+        let registry = TaskRegistry::new();
 
         let (pending, mut rx) =
             PendingTurn::new("sess_1".into(), "database.repair".into(), 1, "rg_001".into());
@@ -285,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unregister_fails_pending_turns_of_agent_type() {
-        let registry = SessionRegistry::new();
+        let registry = TaskRegistry::new();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         registry.register_fixlet("database.repair", tx).await;

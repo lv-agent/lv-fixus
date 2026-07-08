@@ -1,4 +1,4 @@
-//! 数据模型 — AgentEvent, EventType, Session 等核心数据结构
+//! 数据模型 — AgentEvent, EventType, Task 等核心数据结构
 //!
 //! 类型命名与设计文档 8.1 节 Rust 侧定义保持一致。
 //!
@@ -220,16 +220,16 @@ pub enum EventScope {
 /// Agent 不可变事件 — 一切状态的唯一来源
 ///
 /// 每个 Event 通过 `turn_id` 和 `step_id` 标注自己的归属。
-/// `seq` 是 Session 内的全局单调递增序号。
+/// `seq` 是 Task 内的全局单调递增序号。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
-    /// Session 命名空间
-    pub session_id: String,
-    /// Session 内全局单调递增序号（物理坐标）
+    /// Task 命名空间
+    pub task_id: String,
+    /// Task 内全局单调递增序号（物理坐标）
     pub seq: i64,
     /// Turn 归属标签（Turn 级和 Step 级事件有值）
     pub turn_id: Option<i64>,
-    /// Step 归属标签（Session 内全局唯一，Step 级事件有值）
+    /// Step 归属标签（Task 内全局唯一，Step 级事件有值）
     pub step_id: Option<String>,
     /// 事件语义类型
     pub event_type: EventType,
@@ -244,14 +244,14 @@ pub struct AgentEvent {
 impl AgentEvent {
     /// 创建新的事件（seq 和 created_at 由数据库填充）
     pub fn new(
-        session_id: String,
+        task_id: String,
         turn_id: Option<i64>,
         step_id: Option<String>,
         event_type: EventType,
         payload: serde_json::Value,
     ) -> Self {
         Self {
-            session_id,
+            task_id,
             seq: 0, // 由数据库分配
             turn_id,
             step_id,
@@ -312,7 +312,7 @@ impl AgentEvent {
     }
 }
 
-// ── Session ─────────────────────────────────────────────────────────────
+// ── Task ─────────────────────────────────────────────────────────────────
 
 /// Tenant — 多租户隔离单元
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,12 +322,12 @@ pub struct Tenant {
     pub created_at: DateTime<Utc>,
 }
 
-/// Session — 唯一有独立存储的实体
+/// Task — 唯一有独立存储的实体
 ///
 /// `agent_type`、初始配置等信息不来自任何 Event，是真正独立的业务信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub session_id: String,
+pub struct Task {
+    pub task_id: String,
     pub tenant_id: String,
     pub user_id: String,
     pub agent_type: String,
@@ -335,16 +335,16 @@ pub struct Session {
     pub metadata: Option<serde_json::Value>,
 }
 
-impl Session {
+impl Task {
     pub fn new(
-        session_id: String,
+        task_id: String,
         tenant_id: String,
         user_id: String,
         agent_type: String,
         metadata: Option<serde_json::Value>,
     ) -> Self {
         Self {
-            session_id,
+            task_id,
             tenant_id,
             user_id,
             agent_type,

@@ -627,6 +627,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1300,7 +1310,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "logdb"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1318,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "logdb-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "logdbd-proto",
  "tokio",
@@ -1327,10 +1337,11 @@ dependencies = [
 
 [[package]]
 name = "logdbd"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32c",
  "fs2",
+ "hex",
  "logdb",
  "logdbd-proto",
  "metrics",
@@ -1338,6 +1349,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "tar",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -1348,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "logdbd-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "prost",
  "tonic",
@@ -2337,6 +2350,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3212,6 +3236,16 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "yoke"
