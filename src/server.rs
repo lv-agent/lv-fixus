@@ -1099,3 +1099,157 @@ async fn health_handler() -> Json<ApiResponse<&'static str>> {
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Provenance;
+    use crate::storage::LogdbdEventStore;
+
+    use logdbd::catalog::Catalog;
+    use logdbd::consumer::ConsumerTracker;
+    use logdbd::pb::log_db_service_server::LogDbServiceServer;
+    use logdbd::service::LogDbServiceImpl;
+    use logdbd::storage::Storage;
+    use logdbd::subscribe::SubscribeHub;
+    use logdb::Config as LogdbConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    fn test_provenance() -> Provenance {
+        Provenance {
+            source_channel: "api".into(),
+            source_session_id: None,
+            source_user_id: Some("u".into()),
+            source_tenant_id: Some("t".into()),
+            source_message_id: None,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        }
+    }
+
+    async fn setup() -> (AppState, Arc<TaskRegistry>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = LogdbConfig::default();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.durability_mode = logdb::DurabilityMode::Sync;
+        cfg.ring_size = 256;
+        cfg.shards = 1;
+        cfg.flush_timeout = Duration::from_secs(5);
+        let db = logdb::LogDb::open(cfg).unwrap();
+        let storage = Arc::new(Storage::new(db, 1));
+        let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+        let subscribe_hub = Arc::new(SubscribeHub::new());
+        let consumer_tracker = Arc::new(ConsumerTracker::new(None));
+        let svc = LogDbServiceImpl::new(
+            Arc::clone(&storage),
+            Arc::clone(&catalog),
+            Arc::clone(&consumer_tracker),
+            Arc::clone(&subscribe_hub),
+            "test-node".into(),
+            "primary".into(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(LogDbServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let store: Arc<dyn EventStore> = Arc::new(LogdbdEventStore::connect(&addr, "fixus-srv-test").await.unwrap());
+        let registry = TaskRegistry::new();
+        let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
+        let state = AppState {
+            store,
+            registry: registry.clone(),
+            token_publisher,
+        };
+        (state, registry, dir)
+    }
+
+    async fn wait_seq(state: &AppState, sid: &str, expected: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(v) = state.store.get_max_seq(sid).await {
+                if v >= expected {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("seq {} not reached for {}", expected, sid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 直调 handler(不经 HTTP 栈),验证 /ready 端到端:写 task_ready + 入 claim 队列
+    #[tokio::test]
+    async fn mark_ready_handler_writes_event_and_enqueues() {
+        let (state, registry, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None)
+            .await
+            .unwrap();
+        wait_seq(&state, &tid, 1).await;
+        assert_eq!(
+            state.store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Created)
+        );
+
+        // 调 /ready handler
+        let resp = mark_ready_handler(State(state.clone()), Path(tid.clone())).await;
+        let Json(api) = resp.unwrap();
+        assert!(api.success);
+        assert_eq!(api.data.as_ref().unwrap()["state"], "ready");
+
+        // state 投影到 ready
+        wait_seq(&state, &tid, 2).await;
+        assert_eq!(
+            state.store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Ready)
+        );
+
+        // 已入 claim 队列 → claim_next 能取到
+        let claimed = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
+        assert_eq!(claimed.task_id, tid);
+    }
+
+    /// 直调 /state handler
+    #[tokio::test]
+    async fn get_task_state_handler_returns_projection() {
+        let (state, _reg, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None)
+            .await
+            .unwrap();
+        wait_seq(&state, &tid, 1).await;
+
+        // created
+        let Json(api) = get_task_state_handler(State(state.clone()), Path(tid.clone()))
+            .await
+            .unwrap();
+        assert!(api.success);
+        assert_eq!(api.data.unwrap()["state"], "created");
+
+        // mark_ready → ready
+        service::mark_task_ready(&*state.store, &tid).await.unwrap();
+        wait_seq(&state, &tid, 2).await;
+        let Json(api) = get_task_state_handler(State(state.clone()), Path(tid.clone()))
+            .await
+            .unwrap();
+        assert_eq!(api.data.unwrap()["state"], "ready");
+    }
+
+    /// /ready 对不存在的 Task → TaskNotFound(Err)
+    #[tokio::test]
+    async fn mark_ready_handler_missing_task_errors() {
+        let (state, _reg, _d) = setup().await;
+        let err = mark_ready_handler(State(state), Path("task_nonexistent".into())).await;
+        assert!(matches!(err, Err(AppError::TaskNotFound(_))));
+    }
+}

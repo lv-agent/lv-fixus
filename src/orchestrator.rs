@@ -1160,3 +1160,198 @@ impl Orchestrator {
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{EventType, Provenance, TaskState};
+    use crate::storage::LogdbdEventStore;
+    use crate::stream::TokenPublisher;
+    use crate::task_registry::TaskRegistry;
+
+    use logdbd::catalog::Catalog;
+    use logdbd::consumer::ConsumerTracker;
+    use logdbd::pb::log_db_service_server::LogDbServiceServer;
+    use logdbd::service::LogDbServiceImpl;
+    use logdbd::storage::Storage;
+    use logdbd::subscribe::SubscribeHub;
+    use logdb::Config as LogdbConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    fn test_provenance() -> Provenance {
+        Provenance {
+            source_channel: "api".into(),
+            source_session_id: None,
+            source_user_id: Some("u".into()),
+            source_tenant_id: Some("t".into()),
+            source_message_id: None,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        }
+    }
+
+    async fn setup() -> (LogdbdEventStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = LogdbConfig::default();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.durability_mode = logdb::DurabilityMode::Sync;
+        cfg.ring_size = 256;
+        cfg.shards = 1;
+        cfg.flush_timeout = Duration::from_secs(5);
+        let db = logdb::LogDb::open(cfg).unwrap();
+        let storage = Arc::new(Storage::new(db, 1));
+        let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+        let subscribe_hub = Arc::new(SubscribeHub::new());
+        let consumer_tracker = Arc::new(ConsumerTracker::new(None));
+        let svc = LogDbServiceImpl::new(
+            Arc::clone(&storage),
+            Arc::clone(&catalog),
+            Arc::clone(&consumer_tracker),
+            Arc::clone(&subscribe_hub),
+            "test-node".into(),
+            "primary".into(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(LogDbServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let store = LogdbdEventStore::connect(&addr, "fixus-orch-test").await.unwrap();
+        (store, dir)
+    }
+
+    async fn wait_seq(store: &dyn EventStore, sid: &str, expected: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(v) = store.get_max_seq(sid).await {
+                if v >= expected {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("seq {} not reached for {}", expected, sid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 构建一个接好 store + registry 的 Orchestrator(TokenPublisher 无 Redis 降级)
+    fn make_orch(
+        store: Arc<dyn EventStore>,
+        registry: Arc<TaskRegistry>,
+        token_publisher: TokenPublisher,
+    ) -> Orchestrator {
+        Orchestrator::new(store, registry, token_publisher)
+    }
+
+    #[tokio::test]
+    async fn handle_claim_denied_when_no_ready_task() {
+        let (store, _d) = setup().await;
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(Arc::new(store), registry, tp);
+
+        // 空队列 → Denied
+        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
+            ClaimOutcome::Denied { reason } => {
+                assert!(reason.contains("no ready task"), "reason: {}", reason);
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_claim_granted_writes_task_claimed_and_brief() {
+        let (store, _d) = setup().await;
+        let store_arc: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(store_arc.clone(), registry.clone(), tp);
+
+        // 创建 Task,body 带 task_brief
+        let body = serde_json::json!({ "task_brief": "fix db1 deadlocks" });
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, Some(&body))
+            .await
+            .unwrap();
+        wait_seq(&*store_arc, &tid, 1).await;
+
+        // readiness 通过 + 入 claim 队列
+        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
+        wait_seq(&*store_arc, &tid, 2).await;
+        registry
+            .enqueue_ready(tid.clone(), "db.repair".into(), None)
+            .await;
+
+        // claim → Granted
+        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
+            ClaimOutcome::Granted {
+                task_id,
+                task_type,
+                task_brief,
+            } => {
+                assert_eq!(task_id, tid);
+                assert_eq!(task_type, "db.repair");
+                assert_eq!(task_brief, "fix db1 deadlocks");
+            }
+            other => panic!("expected Granted, got {:?}", other),
+        }
+
+        // task_claimed 已写入 → state == Claimed
+        wait_seq(&*store_arc, &tid, 3).await;
+        assert_eq!(
+            store_arc.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Claimed)
+        );
+
+        // 队列已消费 → 再 claim 同类型 → Denied
+        match orch.handle_claim("db.repair", "fixlet-2").await.unwrap() {
+            ClaimOutcome::Denied { .. } => {}
+            other => panic!("expected Denied after drain, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_claim_denied_when_state_not_ready_invariant_guard() {
+        // 队列里塞了一个尚未 ready(Created 态)的 Task → claim_task 应拒绝(不变量)
+        let (store, _d) = setup().await;
+        let store_arc: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(store_arc.clone(), registry.clone(), tp);
+
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
+            .await
+            .unwrap();
+        wait_seq(&*store_arc, &tid, 1).await;
+        // 故意不 mark_task_ready 就入队(模拟竞态/bug)
+        registry
+            .enqueue_ready(tid.clone(), "db.repair".into(), None)
+            .await;
+
+        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
+            ClaimOutcome::Denied { reason } => {
+                assert!(
+                    reason.contains("claim transition failed"),
+                    "reason: {}",
+                    reason
+                );
+            }
+            other => panic!("expected Denied (invariant), got {:?}", other),
+        }
+        // 状态仍是 Created(未被错误迁移)
+        assert_eq!(
+            store_arc.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Created)
+        );
+    }
+}
