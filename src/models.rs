@@ -26,6 +26,15 @@ pub enum EventType {
     SessionEnded,
     SummaryMarker,
 
+    // Task 级别事件 (turn_id = NULL, step_id = NULL) — Task 生命周期状态机(spec §8.2)
+    TaskCreated,
+    TaskReady,
+    TaskClaimed,
+    TaskBlocked,
+    TaskSucceeded,
+    TaskFailed,
+    TaskCanceled,
+
     // Turn 级别事件 (turn_id NOT NULL, step_id = NULL)
     TurnPending,   // 排队等待
     TurnStarted,
@@ -52,6 +61,13 @@ impl EventType {
             "session_started" => Some(Self::SessionStarted),
             "session_ended" => Some(Self::SessionEnded),
             "summary_marker" => Some(Self::SummaryMarker),
+            "task_created" => Some(Self::TaskCreated),
+            "task_ready" => Some(Self::TaskReady),
+            "task_claimed" => Some(Self::TaskClaimed),
+            "task_blocked" => Some(Self::TaskBlocked),
+            "task_succeeded" => Some(Self::TaskSucceeded),
+            "task_failed" => Some(Self::TaskFailed),
+            "task_canceled" => Some(Self::TaskCanceled),
             "turn_pending" => Some(Self::TurnPending),
             "turn_started" => Some(Self::TurnStarted),
             "turn_completed" => Some(Self::TurnCompleted),
@@ -74,6 +90,13 @@ impl EventType {
             Self::SessionStarted => "session_started",
             Self::SessionEnded => "session_ended",
             Self::SummaryMarker => "summary_marker",
+            Self::TaskCreated => "task_created",
+            Self::TaskReady => "task_ready",
+            Self::TaskClaimed => "task_claimed",
+            Self::TaskBlocked => "task_blocked",
+            Self::TaskSucceeded => "task_succeeded",
+            Self::TaskFailed => "task_failed",
+            Self::TaskCanceled => "task_canceled",
             Self::TurnPending => "turn_pending",
             Self::TurnStarted => "turn_started",
             Self::TurnCompleted => "turn_completed",
@@ -87,6 +110,20 @@ impl EventType {
             Self::ToolCompleted => "tool_completed",
             Self::ToolFailed => "tool_failed",
         }
+    }
+
+    /// 是否为 Task 级别事件 (turn_id = NULL, step_id = NULL) — Task 生命周期
+    pub fn is_task_level(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskCreated
+                | Self::TaskReady
+                | Self::TaskClaimed
+                | Self::TaskBlocked
+                | Self::TaskSucceeded
+                | Self::TaskFailed
+                | Self::TaskCanceled
+        )
     }
 
     /// 是否为 Session 级别事件 (turn_id = NULL, step_id = NULL)
@@ -151,7 +188,9 @@ impl EventType {
 
     /// 获取事件所属的作用域级别
     pub fn scope(&self) -> EventScope {
-        if self.is_session_level() {
+        if self.is_task_level() {
+            EventScope::Task
+        } else if self.is_session_level() {
             EventScope::Session
         } else if self.is_turn_level() {
             EventScope::Turn
@@ -188,6 +227,13 @@ impl EventType {
             "session_started",
             "session_ended",
             "summary_marker",
+            "task_created",
+            "task_ready",
+            "task_claimed",
+            "task_blocked",
+            "task_succeeded",
+            "task_failed",
+            "task_canceled",
             "turn_pending",
             "turn_started",
             "turn_completed",
@@ -207,12 +253,25 @@ impl EventType {
 /// 事件作用域级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventScope {
+    /// Task 级别 — turn_id = NULL, step_id = NULL(Task 生命周期事件)
+    Task,
     /// Session 级别 — turn_id = NULL, step_id = NULL
     Session,
     /// Turn 级别 — turn_id NOT NULL, step_id = NULL
     Turn,
     /// Step 级别 — step_id NOT NULL
     Step,
+}
+
+impl EventScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Session => "session",
+            Self::Turn => "turn",
+            Self::Step => "step",
+        }
+    }
 }
 
 // ── AgentEvent ──────────────────────────────────────────────────────────
@@ -270,16 +329,18 @@ impl AgentEvent {
     /// - Step 级别：step_id NOT NULL
     pub fn validate_scope(&self) -> Result<(), String> {
         match self.event_type.scope() {
-            EventScope::Session => {
+            EventScope::Task | EventScope::Session => {
                 if self.turn_id.is_some() {
                     return Err(format!(
-                        "Session-level event {} must have turn_id = NULL",
+                        "{}-level event {} must have turn_id = NULL",
+                        self.event_type.scope().as_str(),
                         self.event_type.as_str()
                     ));
                 }
                 if self.step_id.is_some() {
                     return Err(format!(
-                        "Session-level event {} must have step_id = NULL",
+                        "{}-level event {} must have step_id = NULL",
+                        self.event_type.scope().as_str(),
                         self.event_type.as_str()
                     ));
                 }
@@ -447,6 +508,47 @@ pub struct SessionStartedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEndedPayload {
     pub reason: String,
+}
+
+/// Task 溯源元数据(spec §3 head.provenance)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provenance {
+    /// 下发渠道:nuntius-chat / api / schedule / derived
+    pub source_channel: String,
+    /// nuntius chat session(下发对话)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tenant_id: Option<String>,
+    /// 触发提交的那条对话消息/澄清轮(精确溯源)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// 下发系统标识(如 "nuntius")
+    pub created_by: String,
+}
+
+/// task_created 的 payload(spec §3 head: task_type + provenance + body)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCreatedPayload {
+    pub task_type: String,
+    pub provenance: Provenance,
+    /// body(fixus opaque 透传):contract / schema_ref / task_brief / acceptance_result
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+/// Task 迁移事件的 payload(ready/claimed/blocked/succeeded/failed/canceled 通用)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskTransitionPayload {
+    /// 迁移原因(自由文本)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 认领/执行该 Task 的执行器标识(claimed 时填,用于 preferred_claimant)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant: Option<String>,
 }
 
 /// summary_marker 的 payload
@@ -887,7 +989,7 @@ mod tests {
     #[test]
     fn test_all_event_types_have_str_repr() {
         let all = EventType::all_str_variants();
-        assert_eq!(all.len(), 15, "Expected 15 event types");
+        assert_eq!(all.len(), 22, "Expected 22 event types");
         for s in all {
             assert!(EventType::from_str(s).is_some(), "failed for: {}", s);
         }
@@ -965,5 +1067,55 @@ mod tests {
         assert!(!Created.is_terminal());
         assert!(!Executing.is_terminal());
         assert!(!Blocked.is_terminal());
+    }
+
+    #[test]
+    fn test_task_event_type_roundtrip() {
+        let cases = [
+            (EventType::TaskCreated, "task_created"),
+            (EventType::TaskReady, "task_ready"),
+            (EventType::TaskClaimed, "task_claimed"),
+            (EventType::TaskBlocked, "task_blocked"),
+            (EventType::TaskSucceeded, "task_succeeded"),
+            (EventType::TaskFailed, "task_failed"),
+            (EventType::TaskCanceled, "task_canceled"),
+        ];
+        for (variant, s) in cases {
+            assert_eq!(variant.as_str(), s);
+            assert_eq!(EventType::from_str(s), Some(variant.clone()));
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{}\"", s));
+            // Task 级事件:turn_id=NULL, step_id=NULL
+            assert_eq!(variant.scope(), EventScope::Task);
+        }
+    }
+
+    #[test]
+    fn test_task_event_scope_validation() {
+        // Task 级事件必须 turn_id=NULL, step_id=NULL
+        let e = AgentEvent::new(
+            "t_1".into(),
+            None,
+            None,
+            EventType::TaskReady,
+            serde_json::json!({}),
+        );
+        assert!(e.validate_scope().is_ok());
+
+        // 带 turn_id 非法
+        let e = AgentEvent::new(
+            "t_1".into(),
+            Some(1),
+            None,
+            EventType::TaskReady,
+            serde_json::json!({}),
+        );
+        assert!(e.validate_scope().is_err());
+    }
+
+    #[test]
+    fn test_all_event_types_count_after_task_add() {
+        // 原 15 + 新 7 Task 级 = 22
+        assert_eq!(EventType::all_str_variants().len(), 22);
     }
 }
