@@ -312,6 +312,85 @@ impl AgentEvent {
     }
 }
 
+// ── TaskState ──────────────────────────────────────────────────────────
+
+/// Task 状态机(spec §4)
+///
+/// 8 态:`created → ready → claimed → executing → (blocked ⇄ ready) → succeeded | failed`
+/// 任意活态 → `canceled`(终态)。
+///
+/// 状态是事件的投影(spec §4.4):本枚举只描述合法迁移,实际状态由
+/// `storage::get_task_state` 从 Task 级事件流派生。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Created,
+    Ready,
+    Claimed,
+    Executing,
+    Blocked,
+    Succeeded,
+    Failed,
+    Canceled,
+}
+
+impl TaskState {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "created" => Some(Self::Created),
+            "ready" => Some(Self::Ready),
+            "claimed" => Some(Self::Claimed),
+            "executing" => Some(Self::Executing),
+            "blocked" => Some(Self::Blocked),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Ready => "ready",
+            Self::Claimed => "claimed",
+            Self::Executing => "executing",
+            Self::Blocked => "blocked",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    /// 是否终态(不可再迁出)
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Canceled)
+    }
+
+    /// `from → to` 是否合法迁移(spec §4 状态机)
+    pub fn can_transition(from: Self, to: Self) -> bool {
+        use TaskState::*;
+        if from.is_terminal() {
+            return false;
+        }
+        matches!(
+            (from, to),
+            (Created, Ready)
+                | (Ready, Claimed)
+                | (Ready, Canceled)
+                | (Claimed, Executing)
+                | (Claimed, Canceled)
+                | (Executing, Blocked)
+                | (Executing, Succeeded)
+                | (Executing, Failed)
+                | (Executing, Canceled)
+                | (Blocked, Ready)
+                | (Blocked, Canceled)
+                | (Created, Canceled)
+        )
+    }
+}
+
 // ── Task ─────────────────────────────────────────────────────────────────
 
 /// Tenant — 多租户隔离单元
@@ -812,5 +891,79 @@ mod tests {
         for s in all {
             assert!(EventType::from_str(s).is_some(), "failed for: {}", s);
         }
+    }
+
+    #[test]
+    fn test_task_state_serde_roundtrip() {
+        for (variant, s) in [
+            (TaskState::Created, "created"),
+            (TaskState::Ready, "ready"),
+            (TaskState::Claimed, "claimed"),
+            (TaskState::Executing, "executing"),
+            (TaskState::Blocked, "blocked"),
+            (TaskState::Succeeded, "succeeded"),
+            (TaskState::Failed, "failed"),
+            (TaskState::Canceled, "canceled"),
+        ] {
+            assert_eq!(variant.as_str(), s);
+            assert_eq!(TaskState::from_str(s), Some(variant));
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{}\"", s));
+        }
+    }
+
+    #[test]
+    fn test_task_state_legal_transitions() {
+        use TaskState::*;
+        // spec §4 状态机
+        let legal = [
+            (Created, Ready),
+            (Ready, Claimed),
+            (Claimed, Executing),
+            (Executing, Blocked),
+            (Blocked, Ready),
+            (Executing, Succeeded),
+            (Executing, Failed),
+        ];
+        for (from, to) in legal {
+            assert!(
+                TaskState::can_transition(from, to),
+                "{:?}→{:?} should be legal",
+                from,
+                to
+            );
+        }
+    }
+
+    #[test]
+    fn test_task_state_illegal_transitions() {
+        use TaskState::*;
+        let illegal = [
+            (Created, Claimed),   // 必须 ready→claimed,跳过 ready 非法
+            (Ready, Executing),   // 必须 claimed→executing
+            (Succeeded, Ready),   // 终态不可迁出
+            (Failed, Created),
+            (Canceled, Ready),
+            (Blocked, Succeeded), // blocked→ready→claimed→executing→succeeded,不可直达
+        ];
+        for (from, to) in illegal {
+            assert!(
+                !TaskState::can_transition(from, to),
+                "{:?}→{:?} should be illegal",
+                from,
+                to
+            );
+        }
+    }
+
+    #[test]
+    fn test_task_state_terminal() {
+        use TaskState::*;
+        assert!(Succeeded.is_terminal());
+        assert!(Failed.is_terminal());
+        assert!(Canceled.is_terminal());
+        assert!(!Created.is_terminal());
+        assert!(!Executing.is_terminal());
+        assert!(!Blocked.is_terminal());
     }
 }
