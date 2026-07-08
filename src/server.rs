@@ -245,7 +245,7 @@ async fn get_session_handler(
         task_id: session.task_id,
         tenant_id: session.tenant_id,
         user_id: session.user_id,
-        agent_type: session.agent_type,
+        agent_type: session.task_type,
         created_at: session.created_at.to_rfc3339(),
         metadata: session.metadata,
         is_ended,

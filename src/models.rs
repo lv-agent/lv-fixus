@@ -462,16 +462,26 @@ pub struct Tenant {
     pub created_at: DateTime<Utc>,
 }
 
-/// Task — 唯一有独立存储的实体
+/// Task — 唯一有独立存储的实体(spec §3 head)
 ///
-/// `agent_type`、初始配置等信息不来自任何 Event，是真正独立的业务信息。
+/// head 字段:task_id / task_type / state / provenance。
+/// body(fixus opaque)整体存 `body: Option<Value>`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub task_id: String,
     pub tenant_id: String,
     pub user_id: String,
-    pub agent_type: String,
+    /// 路由键(原 agent_type,spec §8.3 改名)
+    pub task_type: String,
+    /// 当前状态(事件投影,由 storage::get_task_state 派生后填入)
+    pub state: TaskState,
+    /// 溯源
+    pub provenance: Provenance,
+    /// body(opaque):contract / schema_ref / task_brief / acceptance_result
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -480,16 +490,21 @@ impl Task {
         task_id: String,
         tenant_id: String,
         user_id: String,
-        agent_type: String,
-        metadata: Option<serde_json::Value>,
+        task_type: String,
+        state: TaskState,
+        provenance: Provenance,
+        body: Option<serde_json::Value>,
     ) -> Self {
         Self {
             task_id,
             tenant_id,
             user_id,
-            agent_type,
+            task_type,
+            state,
+            provenance,
+            body,
             created_at: Utc::now(),
-            metadata,
+            metadata: None,
         }
     }
 }
@@ -1117,5 +1132,31 @@ mod tests {
     fn test_all_event_types_count_after_task_add() {
         // 原 15 + 新 7 Task 级 = 22
         assert_eq!(EventType::all_str_variants().len(), 22);
+    }
+
+    #[test]
+    fn test_task_struct_has_task_type_and_state() {
+        let prov = Provenance {
+            source_channel: "nuntius-chat".into(),
+            source_session_id: Some("chat_1".into()),
+            source_user_id: Some("u1".into()),
+            source_tenant_id: Some("t1".into()),
+            source_message_id: None,
+            created_at: Utc::now(),
+            created_by: "nuntius".into(),
+        };
+        let task = Task::new(
+            "t_abc".into(),
+            "t1".into(),
+            "u1".into(),
+            "database.repair".into(),
+            TaskState::Created,
+            prov.clone(),
+            None,
+        );
+        assert_eq!(task.task_type, "database.repair");
+        assert_eq!(task.state, TaskState::Created);
+        assert_eq!(task.provenance.source_channel, "nuntius-chat");
+        assert!(task.body.is_none());
     }
 }

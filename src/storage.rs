@@ -390,10 +390,23 @@ impl EventStore for LogdbdEventStore {
                 .get("user_id")
                 .cloned()
                 .unwrap_or_default(),
-            agent_type: payload["agent_type"]
+            task_type: payload["agent_type"]
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string(),
+            // TODO(Plan B Task 4): derive state from task events; read provenance from task_created.
+            // 临时占位:create_task 仍发 session_started 时,head 无 state/provenance,填默认。
+            state: crate::models::TaskState::Created,
+            provenance: crate::models::Provenance {
+                source_channel: "api".into(),
+                source_session_id: None,
+                source_user_id: rec.metadata.get("user_id").cloned(),
+                source_tenant_id: rec.metadata.get("tenant_id").cloned(),
+                source_message_id: None,
+                created_at: Utc::now(),
+                created_by: "legacy".into(),
+            },
+            body: None,
             created_at: Utc::now(),
             metadata: payload.get("initial_config").cloned(),
         }))
@@ -1291,7 +1304,7 @@ mod logdbd_tests {
         assert_eq!(s.task_id, sid);
         assert_eq!(s.tenant_id, "tenant-a");
         assert_eq!(s.user_id, "user-1");
-        assert_eq!(s.agent_type, "claude-code");
+        assert_eq!(s.task_type, "claude-code");
         assert!(!store.is_task_ended(sid).await.unwrap());
     }
 

@@ -119,7 +119,7 @@ impl Orchestrator {
             .get_task(task_id)
             .await?
             .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
-        Ok(session.agent_type)
+        Ok(session.task_type)
     }
 
     // ── Turn 执行入口 ────────────────────────────────────────────────
