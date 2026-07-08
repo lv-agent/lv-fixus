@@ -97,6 +97,21 @@ pub enum AsyncTurnStart {
     RecoveryTriggered { incomplete_count: usize },
 }
 
+/// claim 处理结果(spec §8.3 pull-based 认领)
+#[derive(Debug)]
+pub enum ClaimOutcome {
+    /// 认领成功:已写 task_claimed,下发 claim_granted 给执行器
+    Granted {
+        task_id: String,
+        task_type: String,
+        task_brief: String,
+    },
+    /// 认领拒绝:无 ready Task 或状态迁移失败
+    Denied {
+        reason: String,
+    },
+}
+
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
@@ -120,6 +135,62 @@ impl Orchestrator {
             .await?
             .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
         Ok(session.task_type)
+    }
+
+    /// 处理 fixlet claim 请求(spec §8.3 pull-based 认领)。
+    ///
+    /// 1. 从 registry claim 队列匹配一个 ready Task(按 preferred_claimant 优先)
+    /// 2. service 层写 task_claimed(校验状态不变量;ready → claimed)
+    /// 3. 取 task_brief(body 编译产物),随 ClaimOutcome 返回,由 server 层下发 claim_granted
+    ///
+    /// 注:claim_granted 的 fixlet 侧执行(Turn 启动 + executing/succeeded 流转)在 Plan D 串联。
+    pub async fn handle_claim(
+        &self,
+        task_type: &str,
+        claimant: &str,
+    ) -> Result<ClaimOutcome> {
+        let Some(claimed) = self.registry.claim_next(task_type, claimant).await else {
+            return Ok(ClaimOutcome::Denied {
+                reason: format!("no ready task for task_type {}", task_type),
+            });
+        };
+
+        if let Err(e) = service::claim_task(&*self.store, &claimed.task_id, claimant).await {
+            tracing::warn!(
+                "claim_task failed for {}: {} (state race? re-enqueue skipped)",
+                claimed.task_id,
+                e
+            );
+            return Ok(ClaimOutcome::Denied {
+                reason: format!("claim transition failed: {}", e),
+            });
+        }
+
+        let task = self
+            .store
+            .get_task(&claimed.task_id)
+            .await?
+            .ok_or_else(|| AppError::TaskNotFound(claimed.task_id.clone()))?;
+        let task_brief = task
+            .body
+            .as_ref()
+            .and_then(|b| b.get("task_brief"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        tracing::info!(
+            "task {}: claimed by {} (task_type={})",
+            claimed.task_id,
+            claimant,
+            claimed.task_type
+        );
+
+        Ok(ClaimOutcome::Granted {
+            task_id: claimed.task_id,
+            task_type: claimed.task_type,
+            task_brief,
+        })
     }
 
     // ── Turn 执行入口 ────────────────────────────────────────────────

@@ -17,7 +17,7 @@
 //! | 变量 | 默认值 | 说明 |
 //! |------|--------|------|
 //! | `FIXUS_URL` | `ws://127.0.0.1:3000/ws/fixlet` | fixus WebSocket 地址 |
-//! | `FIXUS_AGENT_TYPE` | `default` | 此 fixlet 服务的 agent_type(fixus 按它路由 execute_turn) |
+//! | `FIXUS_AGENT_TYPE` | `default` | 此 fixlet 服务的 task_type(fixus 按它路由 execute_turn;env 名保留 back-compat) |
 //! | `AGENT_COMMAND` | `claude-agent-acp` | Agent 启动命令 |
 //! | `AGENT_CWD` | (none) | Agent 工作目录 |
 
@@ -39,7 +39,7 @@ async fn main() {
     let config = FixletConfig {
         fixus_url: std::env::var("FIXUS_URL")
             .unwrap_or_else(|_| "ws://127.0.0.1:3000/ws/fixlet".into()),
-        agent_type: std::env::var("FIXUS_AGENT_TYPE").unwrap_or_else(|_| "default".into()),
+        task_type: std::env::var("FIXUS_AGENT_TYPE").unwrap_or_else(|_| "default".into()),
         agent_command: std::env::var("AGENT_COMMAND")
             .unwrap_or_else(|_| "claude-agent-acp".into()),
         agent_cwd: std::env::var("AGENT_CWD").ok(),
@@ -47,7 +47,7 @@ async fn main() {
 
     tracing::info!("fixlet starting");
     tracing::info!("  fixus_url: {}", config.fixus_url);
-    tracing::info!("  agent_type: {}", config.agent_type);
+    tracing::info!("  task_type: {}", config.task_type);
     tracing::info!("  agent_command: {}", config.agent_command);
 
     if let Err(e) = run(config).await {

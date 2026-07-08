@@ -132,6 +132,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sessions", post(create_session_handler))
         .route("/api/v1/sessions/{task_id}", get(get_session_handler))
         .route("/api/v1/sessions/{task_id}/end", post(end_session_handler))
+        .route("/api/v1/sessions/{task_id}/ready", post(mark_ready_handler))
+        .route("/api/v1/sessions/{task_id}/state", get(get_task_state_handler))
         // Turn
         .route(
             "/api/v1/sessions/{task_id}/turns",
@@ -255,6 +257,7 @@ async fn get_session_handler(
         tenant_id: session.tenant_id,
         user_id: session.user_id,
         agent_type: session.task_type,
+        state: session.state.as_str().to_string(),
         created_at: session.created_at.to_rfc3339(),
         metadata: session.metadata,
         is_ended,
@@ -269,6 +272,7 @@ struct SessionInfo {
     tenant_id: String,
     user_id: String,
     agent_type: String,
+    state: String,
     created_at: String,
     metadata: Option<serde_json::Value>,
     is_ended: bool,
@@ -292,6 +296,47 @@ async fn end_session_handler(
         "task_id": event.task_id,
         "seq": event.seq,
         "reason": reason,
+    }))))
+}
+
+/// POST /sessions/{task_id}/ready — nuntius 标记 readiness 通过(created → ready)
+///
+/// 写 task_ready 后入 claim 队列,等待执行器认领(spec §4.1 语义 gate + §8.3 claim)。
+async fn mark_ready_handler(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let event = service::mark_task_ready(&*state.store, &task_id).await?;
+
+    // 入 claim 队列(阻塞恢复时带 preferred_claimant,此处首次 ready 无 hint)
+    let task = service::get_task_info(&*state.store, &task_id)
+        .await?
+        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+    state
+        .registry
+        .enqueue_ready(task_id.clone(), task.task_type, None)
+        .await;
+
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "task_id": event.task_id,
+        "seq": event.seq,
+        "state": "ready",
+    }))))
+}
+
+/// GET /sessions/{task_id}/state — 查询 Task 当前状态(事件投影)
+async fn get_task_state_handler(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let st = state
+        .store
+        .get_task_state(&task_id)
+        .await?
+        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "task_id": task_id,
+        "state": st.as_str(),
     }))))
 }
 
@@ -634,8 +679,8 @@ async fn handle_fixlet_ws(
     // 创建 mpsc channel 用于 orchestrator → fixlet 的下行消息
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // 当前连接服务的 agent_type(收到 register 后确定,用于按 agent_type 路由)
-    let mut current_agent_type: Option<String> = None;
+    // 当前连接服务的 task_type(收到 register 后确定,用于按 task_type 路由)
+    let mut current_task_type: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -649,18 +694,77 @@ async fn handle_fixlet_ws(
                             let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                             match msg_type {
-                                // fixlet 注册自己服务的 agent_type(按 agent_type 路由,
+                                // fixlet 注册自己服务的 task_type(按 task_type 路由,
                                 // 不再绑定具体 task_id)
                                 "register" => {
-                                    if let Some(at) = parsed.get("agent_type").and_then(|v| v.as_str()) {
-                                        tracing::info!("fixlet registered for agent_type {}", at);
-                                        current_agent_type = Some(at.to_string());
+                                    if let Some(at) = parsed.get("task_type").and_then(|v| v.as_str()) {
+                                        tracing::info!("fixlet registered for task_type {}", at);
+                                        current_task_type = Some(at.to_string());
                                         state.registry.register_fixlet(at, msg_tx.clone()).await;
                                     } else {
                                         tracing::warn!(
-                                            "fixlet register missing agent_type: {}",
+                                            "fixlet register missing task_type: {}",
                                             text_str
                                         );
+                                    }
+                                }
+
+                                // 执行器认领 ready Task(spec §8.3 pull-based claim)
+                                "claim" => {
+                                    let task_type = parsed["task_type"].as_str().unwrap_or("");
+                                    let claimant = parsed["claimant"].as_str().unwrap_or("");
+                                    match orch.handle_claim(task_type, claimant).await {
+                                        Ok(crate::orchestrator::ClaimOutcome::Granted {
+                                            task_id,
+                                            task_type,
+                                            task_brief,
+                                        }) => {
+                                            // 构建 context(从事件流)并下发 claim_granted
+                                            let ctx = match crate::context::build_llm_context(
+                                                &*state.store,
+                                                &task_id,
+                                            )
+                                            .await
+                                            {
+                                                Ok(c) => c,
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "claim: build context failed for {}: {}",
+                                                        task_id,
+                                                        e
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            let granted = serde_json::json!({
+                                                "type": "claim_granted",
+                                                "session_id": task_id, // wire 名保留(值=task_id)
+                                                "task_type": task_type,
+                                                "task_brief": task_brief,
+                                                "context": {
+                                                    "summary": ctx.summary,
+                                                    "messages": ctx.messages,
+                                                },
+                                            });
+                                            if let Err(e) = state
+                                                .registry
+                                                .send_to_fixlet_for_task_type(&task_type, &granted.to_string())
+                                                .await
+                                            {
+                                                tracing::error!("claim: send claim_granted failed: {}", e);
+                                            }
+                                        }
+                                        Ok(crate::orchestrator::ClaimOutcome::Denied { reason }) => {
+                                            let denied = serde_json::json!({
+                                                "type": "claim_denied",
+                                                "reason": reason
+                                            });
+                                            let _ = state
+                                                .registry
+                                                .send_to_fixlet_for_task_type(task_type, &denied.to_string())
+                                                .await;
+                                        }
+                                        Err(e) => tracing::error!("handle_claim error: {}", e),
                                     }
                                 }
 
@@ -777,8 +881,8 @@ async fn handle_fixlet_ws(
         }
     }
 
-    // fixlet 断连时清理(按 agent_type 注销 + 快速失败该类型 pending turn)
-    if let Some(ref at) = current_agent_type {
+    // fixlet 断连时清理(按 task_type 注销 + 快速失败该类型 pending turn)
+    if let Some(ref at) = current_task_type {
         state.registry.unregister_fixlet(at).await;
     }
 }

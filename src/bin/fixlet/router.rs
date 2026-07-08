@@ -42,8 +42,8 @@ impl MessageAccumulator {
 pub struct FixletConfig {
     /// fixus Gateway WebSocket URL
     pub fixus_url: String,
-    /// 此 fixlet 服务的 agent_type(fixus 按它路由 execute_turn,不再绑定具体 session_id)
-    pub agent_type: String,
+    /// 此 fixlet 服务的 task_type(fixus 按它路由 execute_turn,不再绑定具体 session_id)
+    pub task_type: String,
     /// Agent 启动命令（例如 "claude-agent-acp"）
     pub agent_command: String,
     /// Agent 工作目录
@@ -54,7 +54,7 @@ impl Default for FixletConfig {
     fn default() -> Self {
         Self {
             fixus_url: "ws://127.0.0.1:3000/ws/fixlet".into(),
-            agent_type: "default".into(),
+            task_type: "default".into(),
             agent_command: "claude-agent-acp".into(),
             agent_cwd: None,
         }
@@ -249,16 +249,16 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
 
         let (mut ws_tx_raw, mut ws_rx) = ws.split();
 
-        // 发送 register 消息，声明此 fixlet 服务的 agent_type
+        // 发送 register 消息，声明此 fixlet 服务的 task_type
         let register_msg = serde_json::json!({
             "type": "register",
-            "agent_type": config.agent_type,
+            "task_type": config.task_type,
         });
         if let Err(e) = ws_tx_raw.send(Message::Text(register_msg.to_string().into())).await {
             tracing::error!("Failed to send register message: {}", e);
             continue;
         }
-        tracing::info!("Registered for agent_type {}", config.agent_type);
+        tracing::info!("Registered for task_type {}", config.task_type);
 
         let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx_raw));
 
