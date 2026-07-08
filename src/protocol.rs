@@ -56,7 +56,7 @@ pub struct TurnInput {
     pub user_input: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnContext {
     #[serde(default)]
     pub summary: String,
@@ -104,6 +104,38 @@ pub struct TurnExecutionDone {
     /// fixlet 侧最大 local_seq
     pub max_local_seq: i64,
     pub final_output: String,
+}
+
+// ── Claim 协议(pull-based 执行,spec §8.3)──────────────────────────────
+
+/// Claim 请求(fixlet → fixus)——执行器认领一个 task_type 的 ready Task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "claim")]
+pub struct ClaimRequest {
+    pub task_type: String,
+    pub claimant: String,
+}
+
+/// Claim 授予(fixus → fixlet)——下发认领到的 Task(含 task_brief 作初始输入)
+///
+/// `session_id` 为 wire 字段名(值 = task_id);改名留后续 plan(避免 break nuntius)。
+/// `context` 用嵌套字段(非 flatten),规避 `#[serde(tag)]` + flatten 冲突。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "claim_granted")]
+pub struct ClaimGranted {
+    pub session_id: String,
+    pub task_type: String,
+    /// task_brief(body 编译产物),作首个 turn 的 user_input
+    pub task_brief: String,
+    #[serde(default)]
+    pub context: TurnContext,
+}
+
+/// Claim 拒绝(fixus → fixlet)——无匹配 ready Task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "claim_denied")]
+pub struct ClaimDenied {
+    pub reason: String,
 }
 
 // ── 通用消息 ────────────────────────────────────────────────────────────
@@ -374,5 +406,41 @@ mod tests {
         };
         let json = serde_json::to_string(&pong).unwrap();
         assert!(json.contains("pong"));
+    }
+
+    #[test]
+    fn test_claim_messages_serialization() {
+        // fixlet → fixus: claim
+        let claim = serde_json::json!({
+            "type": "claim",
+            "task_type": "db.repair",
+            "claimant": "fixlet-1",
+        });
+        let parsed: ClaimRequest = serde_json::from_value(claim).unwrap();
+        assert_eq!(parsed.task_type, "db.repair");
+        assert_eq!(parsed.claimant, "fixlet-1");
+
+        // fixus → fixlet: claim_granted(下发任务;context 嵌套字段,不用 flatten 避免 tag 冲突)
+        let granted = ClaimGranted {
+            session_id: "task_abc".into(), // wire 字段名保留 session_id(值=task_id)
+            task_type: "db.repair".into(),
+            task_brief: "目标:对 db1 执行全量修复".into(),
+            context: TurnContext {
+                summary: String::new(),
+                messages: vec![],
+            },
+        };
+        let json = serde_json::to_string(&granted).unwrap();
+        assert!(json.contains("claim_granted"), "json: {}", json);
+        assert!(json.contains("task_abc"));
+        assert!(json.contains("db.repair"));
+        assert!(json.contains("\"context\""));
+
+        // fixus → fixlet: claim_denied(无 ready 任务)
+        let denied = ClaimDenied {
+            reason: "no ready task".into(),
+        };
+        let json = serde_json::to_string(&denied).unwrap();
+        assert!(json.contains("claim_denied"));
     }
 }
