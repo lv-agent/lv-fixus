@@ -434,4 +434,70 @@ mod tests {
         registry.register_fixlet("db.repair", tx).await;
         assert!(registry.get_fixlet_for_task_type("db.repair").await.is_some());
     }
+
+    // ── 性能测试(#[ignore])──────────────────────────────────────────────
+    // 跑法:cargo test --lib -- --ignored perf_ --nocapture
+
+    fn report_ns(name: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<28} n={:>6}  p50={:>6}ns  p95={:>6}ns  p99={:>6}ns  avg={:>6}ns  total={:.2}µs",
+            name, n, p(50), p(95), p(99), sum / n as u64, sum as f64 / 1000.0
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_claim_next_fifo() {
+        // FIFO 路径(无 preferred_claimant 扫描):enqueue N,逐个 claim。
+        let registry = TaskRegistry::new();
+        let n = 5000;
+        for i in 0..n {
+            registry
+                .enqueue_ready(format!("task_{}", i), "db.repair".into(), None)
+                .await;
+        }
+        let mut ns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
+            ns.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(c.task_type, "db.repair");
+        }
+        report_ns("claim_next (FIFO)", ns);
+        // 队列已耗尽
+        assert!(registry.claim_next("db.repair", "fixlet-1").await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_claim_next_preferred_scan() {
+        // preferred_claimant 路径:队首不匹配 → 线性扫描找 preferred 项(最坏 O(n))。
+        let registry = TaskRegistry::new();
+        let n = 5000;
+        // 全部 preferred=other-claimant,claimant=fixlet-1 找不到 → 扫全表后取队首
+        for i in 0..n {
+            registry
+                .enqueue_ready(
+                    format!("task_{}", i),
+                    "db.repair".into(),
+                    Some("other".into()),
+                )
+                .await;
+        }
+        let mut ns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let _c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
+            ns.push(t0.elapsed().as_nanos() as u64);
+        }
+        report_ns("claim_next (preferred miss, O(n) scan)", ns);
+    }
 }

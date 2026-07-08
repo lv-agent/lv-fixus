@@ -1841,5 +1841,130 @@ mod logdbd_tests {
         // 不存在的 task → None
         assert_eq!(store.get_task_state("nope").await.unwrap(), None);
     }
+
+    // ── 性能测试(#[ignore],cargo test -- --ignored --nocapture 看)──────
+    //
+    // 测量 Task 热路径:create_task(append)/ get_task_state(投影)/ get_task(head 读)。
+    // 只断言功能正确,不断言时间阈值(WSL2 I/O 抖动会 flake);数字供人读。
+    // 跑法:cargo test --lib -- --ignored perf_ --nocapture
+
+    fn report(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<28} n={:>5}  p50={:>8}{}  p95={:>8}{}  p99={:>8}{}  avg={:>8}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_create_task_append() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        // warm-up( primes logdbd 连接 / segment)
+        for _ in 0..20 {
+            let (tid, _) = store
+                .create_task("db.repair", "t", "u", &prov, None)
+                .await
+                .unwrap();
+            wait_seq(&store, &tid, 1).await;
+        }
+        let n = 200;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let (tid, _) = store
+                .create_task("db.repair", "t", "u", &prov, None)
+                .await
+                .unwrap();
+            us.push(t0.elapsed().as_micros() as u64);
+            wait_seq(&store, &tid, 1).await; // ensure append durable before next
+        }
+        report("create_task (append)", "µs", us);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_get_task_state_projection() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = store
+            .create_task("db.repair", "t", "u", &prov, None)
+            .await
+            .unwrap();
+        wait_seq(&store, &tid, 1).await;
+        // 构造完整生命周期 → Executing(get_task_state 需扫 Task 事件 + 查 turn_started Max)
+        store
+            .write_event(&AgentEvent::new(
+                tid.clone(), None, None, EventType::TaskReady, serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        store
+            .write_event(&AgentEvent::new(
+                tid.clone(), None, None, EventType::TaskClaimed, serde_json::json!({"claimant":"f1"}),
+            ))
+            .await
+            .unwrap();
+        store
+            .write_event(&AgentEvent::new(
+                tid.clone(), Some(1), None, EventType::TurnStarted,
+                serde_json::json!({"user_input":"x","redo_group":"rg1","redo_count":0}),
+            ))
+            .await
+            .unwrap();
+        wait_seq(&store, &tid, 4).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(crate::models::TaskState::Executing)
+        );
+
+        // warm-up
+        for _ in 0..20 {
+            let _ = store.get_task_state(&tid).await.unwrap();
+        }
+        let n = 200;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let s = store.get_task_state(&tid).await.unwrap();
+            us.push(t0.elapsed().as_micros() as u64);
+            assert_eq!(s, Some(crate::models::TaskState::Executing));
+        }
+        report("get_task_state (projection)", "µs", us);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_get_task_head_read() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        let body = serde_json::json!({"task_brief":"fix db1","contract":{"x":1}});
+        let (tid, _) = store
+            .create_task("db.repair", "t", "u", &prov, Some(&body))
+            .await
+            .unwrap();
+        wait_seq(&store, &tid, 1).await;
+        // warm-up
+        for _ in 0..20 {
+            let _ = store.get_task(&tid).await.unwrap();
+        }
+        let n = 200;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let t = store.get_task(&tid).await.unwrap().unwrap();
+            us.push(t0.elapsed().as_micros() as u64);
+            assert_eq!(t.task_type, "db.repair");
+        }
+        report("get_task (head + state)", "µs", us);
+    }
 }
 
