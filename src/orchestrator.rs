@@ -111,9 +111,9 @@ impl Orchestrator {
         }
     }
 
-    /// 解析 session 的 agent_type(用于按 agent_type 路由到 fixlet)。
-    /// agent_type 是 session 创建时落库的独立业务字段,非事件派生。
-    async fn resolve_agent_type(&self, task_id: &str) -> Result<String> {
+    /// 解析 session 的 task_type(用于按 task_type 路由到 fixlet)。
+    /// task_type 是 session 创建时落库的独立业务字段,非事件派生。
+    async fn resolve_task_type(&self, task_id: &str) -> Result<String> {
         let session = self
             .store
             .get_task(task_id)
@@ -183,13 +183,13 @@ impl Orchestrator {
         // 3. 构建 context（只构建一次，传递给 dispatch）
         let ctx = context::build_llm_context(&*self.store, task_id).await?;
 
-        // 3b. 解析 agent_type —— 按 agent_type 路由到 fixlet(不再按 task_id)
-        let agent_type = self.resolve_agent_type(task_id).await?;
+        // 3b. 解析 task_type —— 按 task_type 路由到 fixlet(不再按 task_id)
+        let task_type = self.resolve_task_type(task_id).await?;
 
-        // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知;记录 agent_type 便于 fixlet 断连快速失败）
+        // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知;记录 task_type 便于 fixlet 断连快速失败）
         let (pending, result_rx) = PendingTurn::new(
             task_id.to_string(),
-            agent_type.clone(),
+            task_type.clone(),
             turn_id,
             redo_group.to_string(),
         );
@@ -197,10 +197,10 @@ impl Orchestrator {
             .register_pending_turn(task_id, pending)
             .await;
 
-        // 5. 检查服务于该 agent_type 的 fixlet 是否已连接
+        // 5. 检查服务于该 task_type 的 fixlet 是否已连接
         if self
             .registry
-            .get_fixlet_for_agent_type(&agent_type)
+            .get_fixlet_for_task_type(&task_type)
             .await
             .is_none()
         {
@@ -208,12 +208,12 @@ impl Orchestrator {
                 task_id,
                 turn_id,
                 "no_fixlet",
-                &format!("No fixlet connected for agent_type {}", agent_type),
+                &format!("No fixlet connected for task_type {}", task_type),
             )
             .await?;
             return Err(AppError::Protocol(format!(
-                "No fixlet connected for agent_type {} (session {})",
-                agent_type, task_id
+                "No fixlet connected for task_type {} (session {})",
+                task_type, task_id
             )));
         }
 
@@ -355,12 +355,12 @@ impl Orchestrator {
             let mut redo_success = 0;
             let mut redo_failed = 0;
 
-            // agent_type 是 session 级常量,循环外解析一次(按 agent_type 路由 redo)
-            let agent_type = match orch.resolve_agent_type(&task_id).await {
+            // task_type 是 session 级常量,循环外解析一次(按 task_type 路由 redo)
+            let task_type = match orch.resolve_task_type(&task_id).await {
                 Ok(at) => at,
                 Err(e) => {
                     tracing::error!(
-                        "session {}: recovery cannot resolve agent_type: {}",
+                        "session {}: recovery cannot resolve task_type: {}",
                         task_id,
                         e
                     );
@@ -379,7 +379,7 @@ impl Orchestrator {
 
                 let (pending, result_rx) = PendingTurn::new(
                     task_id.clone(),
-                    agent_type.clone(),
+                    task_type.clone(),
                     redo_ctx.turn_id,
                     redo_ctx.redo_group.clone(),
                 );
@@ -546,10 +546,10 @@ impl Orchestrator {
             "redo_count": redo_count,
         });
 
-        // 按 session 的 agent_type 路由到对应 fixlet
-        let agent_type = self.resolve_agent_type(task_id).await?;
+        // 按 session 的 task_type 路由到对应 fixlet
+        let task_type = self.resolve_task_type(task_id).await?;
         self.registry
-            .send_to_fixlet_for_agent_type(&agent_type, &msg.to_string())
+            .send_to_fixlet_for_task_type(&task_type, &msg.to_string())
             .await
             .map_err(|e| {
                 AppError::Protocol(format!("Failed to dispatch execute_turn: {}", e))
@@ -695,12 +695,12 @@ impl Orchestrator {
             "duration_ms": duration_ms,
         });
 
-        // tool_result 也按 agent_type 路由回对应 fixlet
-        let agent_type = match self.resolve_agent_type(task_id).await {
+        // tool_result 也按 task_type 路由回对应 fixlet
+        let task_type = match self.resolve_task_type(task_id).await {
             Ok(at) => at,
             Err(e) => {
                 tracing::error!(
-                    "session {}: cannot resolve agent_type for tool_result: {}",
+                    "session {}: cannot resolve task_type for tool_result: {}",
                     task_id,
                     e
                 );
@@ -709,13 +709,13 @@ impl Orchestrator {
         };
         if let Err(e) = self
             .registry
-            .send_to_fixlet_for_agent_type(&agent_type, &result_msg.to_string())
+            .send_to_fixlet_for_task_type(&task_type, &result_msg.to_string())
             .await
         {
             tracing::error!(
-                "session {}: failed to send tool_result to fixlet (agent_type {}): {}",
+                "session {}: failed to send tool_result to fixlet (task_type {}): {}",
                 task_id,
-                agent_type,
+                task_type,
                 e
             );
         }
