@@ -38,28 +38,135 @@ pub async fn create_task(
         .await
 }
 
-/// 结束 Session
+/// 校验并执行状态迁移:读当前态 → 校验合法 → 写迁移事件。
 ///
-/// 写入 session_ended 事件。写入后该 session 不再接受任何新的业务事件。
-pub async fn end_task(
+/// 终态不可迁出;非法迁移返回 `InvalidTaskStateTransition`。
+async fn transition_task(
+    store: &dyn EventStore,
+    task_id: &str,
+    target: crate::models::TaskState,
+    event_type: EventType,
+    payload: serde_json::Value,
+) -> Result<AgentEvent> {
+    let current = store
+        .get_task_state(task_id)
+        .await?
+        .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+
+    if !crate::models::TaskState::can_transition(current, target) {
+        return Err(AppError::InvalidTaskStateTransition {
+            task_id: task_id.to_string(),
+            from: current.as_str().into(),
+            to: target.as_str().into(),
+        });
+    }
+
+    let event = AgentEvent::new(task_id.to_string(), None, None, event_type, payload);
+    let seq = store.write_event(&event).await?;
+    Ok(AgentEvent { seq, ..event })
+}
+
+/// nuntius:readiness 通过,created → ready(spec §4.1 语义 gate)
+pub async fn mark_task_ready(store: &dyn EventStore, task_id: &str) -> Result<AgentEvent> {
+    transition_task(
+        store,
+        task_id,
+        crate::models::TaskState::Ready,
+        EventType::TaskReady,
+        serde_json::json!({}),
+    )
+    .await
+}
+
+/// executor claim:ready → claimed(spec §4.3)
+pub async fn claim_task(
+    store: &dyn EventStore,
+    task_id: &str,
+    claimant: &str,
+) -> Result<AgentEvent> {
+    transition_task(
+        store,
+        task_id,
+        crate::models::TaskState::Claimed,
+        EventType::TaskClaimed,
+        serde_json::json!({ "claimant": claimant }),
+    )
+    .await
+}
+
+/// executing → blocked(executor 请求人工)
+pub async fn block_task(
     store: &dyn EventStore,
     task_id: &str,
     reason: &str,
 ) -> Result<AgentEvent> {
-    if store.is_task_ended(task_id).await? {
-        return Err(AppError::TaskAlreadyEnded(task_id.to_string()));
-    }
+    transition_task(
+        store,
+        task_id,
+        crate::models::TaskState::Blocked,
+        EventType::TaskBlocked,
+        serde_json::json!({ "reason": reason }),
+    )
+    .await
+}
 
+/// executing → succeeded
+pub async fn succeed_task(
+    store: &dyn EventStore,
+    task_id: &str,
+    reason: &str,
+) -> Result<AgentEvent> {
+    transition_task(
+        store,
+        task_id,
+        crate::models::TaskState::Succeeded,
+        EventType::TaskSucceeded,
+        serde_json::json!({ "reason": reason }),
+    )
+    .await
+}
+
+/// executing → failed
+pub async fn fail_task(
+    store: &dyn EventStore,
+    task_id: &str,
+    reason: &str,
+) -> Result<AgentEvent> {
+    transition_task(
+        store,
+        task_id,
+        crate::models::TaskState::Failed,
+        EventType::TaskFailed,
+        serde_json::json!({ "reason": reason }),
+    )
+    .await
+}
+
+/// 任意活态 → canceled(用户放弃/取消,spec §4)
+pub async fn cancel_task(
+    store: &dyn EventStore,
+    task_id: &str,
+    reason: &str,
+) -> Result<AgentEvent> {
+    let current = store
+        .get_task_state(task_id)
+        .await?
+        .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+    if !crate::models::TaskState::can_transition(current, crate::models::TaskState::Canceled) {
+        return Err(AppError::InvalidTaskStateTransition {
+            task_id: task_id.to_string(),
+            from: current.as_str().into(),
+            to: "canceled".into(),
+        });
+    }
     let event = AgentEvent::new(
         task_id.to_string(),
         None,
         None,
-        EventType::SessionEnded,
-        serde_json::json!({"reason": reason}),
+        EventType::TaskCanceled,
+        serde_json::json!({ "reason": reason }),
     );
-
     let seq = store.write_event(&event).await?;
-
     Ok(AgentEvent { seq, ..event })
 }
 
@@ -674,3 +781,210 @@ pub async fn get_max_seq(store: &dyn EventStore, task_id: &str) -> Result<i64> {
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{EventType, Provenance, TaskState};
+
+    // logdbd harness(CLAUDE.md: 测试内联 per 模块;与 storage 测试同模式)
+    use logdbd::catalog::Catalog;
+    use logdbd::consumer::ConsumerTracker;
+    use logdbd::pb::log_db_service_server::LogDbServiceServer;
+    use logdbd::service::LogDbServiceImpl;
+    use logdbd::storage::Storage;
+    use logdbd::subscribe::SubscribeHub;
+    use logdb::Config as LogdbConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    fn test_provenance() -> Provenance {
+        Provenance {
+            source_channel: "api".into(),
+            source_session_id: None,
+            source_user_id: Some("u".into()),
+            source_tenant_id: Some("t".into()),
+            source_message_id: None,
+            created_at: chrono::Utc::now(),
+            created_by: "test".into(),
+        }
+    }
+
+    async fn setup() -> (crate::storage::LogdbdEventStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = LogdbConfig::default();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.durability_mode = logdb::DurabilityMode::Sync;
+        cfg.ring_size = 256;
+        cfg.shards = 1;
+        cfg.flush_timeout = Duration::from_secs(5);
+        let db = logdb::LogDb::open(cfg).unwrap();
+        let storage = Arc::new(Storage::new(db, 1));
+        let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+        let subscribe_hub = Arc::new(SubscribeHub::new());
+        let consumer_tracker = Arc::new(ConsumerTracker::new(None));
+        let svc = LogDbServiceImpl::new(
+            Arc::clone(&storage),
+            Arc::clone(&catalog),
+            Arc::clone(&consumer_tracker),
+            Arc::clone(&subscribe_hub),
+            "test-node".into(),
+            "primary".into(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(LogDbServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let store =
+            crate::storage::LogdbdEventStore::connect(&addr, "fixus-svc-test").await.unwrap();
+        (store, dir)
+    }
+
+    async fn wait_seq(store: &crate::storage::LogdbdEventStore, sid: &str, expected: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(v) = store.get_max_seq(sid).await {
+                if v >= expected {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("seq {} not reached for {}", expected, sid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 模拟 orchestrator 派发 execute_turn 后写的 turn_started(使 Task 进入 Executing)
+    async fn write_turn_started(store: &dyn EventStore, tid: &str) {
+        let ev = AgentEvent::new(
+            tid.into(),
+            Some(1),
+            None,
+            EventType::TurnStarted,
+            serde_json::json!({"user_input":"x","redo_group":"rg1","redo_count":0}),
+        );
+        store.write_event(&ev).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_task_assigns_id_and_created_state() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, ev) = create_task(&store, "db.repair", &prov, None)
+            .await
+            .unwrap();
+        assert_eq!(ev.event_type, EventType::TaskCreated);
+        assert!(tid.starts_with("task_"));
+        wait_seq(&store, &tid, 1).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Created)
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transitions_enforce_invariants() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        wait_seq(&store, &tid, 1).await;
+
+        // 非法:created → claimed(跳过 ready)
+        let err = claim_task(&store, &tid, "fixlet-1").await;
+        assert!(matches!(
+            err,
+            Err(crate::error::AppError::InvalidTaskStateTransition { .. })
+        ));
+
+        // 合法:created → ready
+        mark_task_ready(&store, &tid).await.unwrap();
+        wait_seq(&store, &tid, 2).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Ready)
+        );
+
+        // ready → claimed
+        claim_task(&store, &tid, "fixlet-1").await.unwrap();
+        wait_seq(&store, &tid, 3).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Claimed)
+        );
+
+        // claimed + turn_started → executing(orchestrator 派发)
+        write_turn_started(&store, &tid).await;
+        wait_seq(&store, &tid, 4).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Executing)
+        );
+
+        // executing → succeeded
+        succeed_task(&store, &tid, "done").await.unwrap();
+        wait_seq(&store, &tid, 5).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Succeeded)
+        );
+
+        // 终态不可再迁
+        let err = mark_task_ready(&store, &tid).await;
+        assert!(matches!(
+            err,
+            Err(crate::error::AppError::InvalidTaskStateTransition { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_from_blocked_returns_to_ready() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        wait_seq(&store, &tid, 1).await;
+        mark_task_ready(&store, &tid).await.unwrap();
+        wait_seq(&store, &tid, 2).await;
+        claim_task(&store, &tid, "fixlet-1").await.unwrap();
+        wait_seq(&store, &tid, 3).await;
+        write_turn_started(&store, &tid).await;
+        wait_seq(&store, &tid, 4).await;
+        block_task(&store, &tid, "need human input").await.unwrap();
+        wait_seq(&store, &tid, 5).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Blocked)
+        );
+
+        // blocked → ready(nuntius 语义 gate)
+        mark_task_ready(&store, &tid).await.unwrap();
+        wait_seq(&store, &tid, 6).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_task_from_any_active_state() {
+        let (store, _d) = setup().await;
+        let prov = test_provenance();
+        // created → canceled
+        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        wait_seq(&store, &tid, 1).await;
+        cancel_task(&store, &tid, "abandoned").await.unwrap();
+        wait_seq(&store, &tid, 2).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Canceled)
+        );
+    }
+}

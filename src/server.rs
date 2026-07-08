@@ -286,7 +286,7 @@ async fn end_session_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("client_requested");
 
-    let event = service::end_task(&*state.store, &task_id, reason).await?;
+    let event = service::cancel_task(&*state.store, &task_id, reason).await?;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "task_id": event.task_id,
