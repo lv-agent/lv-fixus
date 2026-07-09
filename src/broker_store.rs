@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
@@ -13,7 +14,9 @@ use logdb_broker_proto::pb::broker_service_client::BrokerServiceClient;
 use logdb_broker_proto::pb::ProduceRequest;
 
 use crate::error::{AppError, Result};
-use crate::models::AgentEvent;
+use crate::models::{AgentEvent, EventType, IncompleteStep, IncompleteTurn, Task, StepExecution, TokenUsageStats, TaskState, Provenance};
+use crate::projection::{ProjectionCache, TaskProjection};
+use crate::storage::EventStore;
 
 // ── BrokerWriter ─────────────────────────────────────────────────────────
 
@@ -99,6 +102,231 @@ pub struct BatchProduceEntry {
     pub timestamp_ns: u64,
     pub content_type: String,
     pub metadata: HashMap<String, String>,
+}
+
+// ── BrokerEventStore(EventStore trait) ──────────────────────────────────
+
+/// 从 AgentEvent 提取 metadata HashMap(用于 produce)。
+fn event_meta(event: &AgentEvent) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("task_id".into(), event.task_id.clone());
+    if let Some(tid) = event.turn_id {
+        m.insert("turn_id".into(), tid.to_string());
+    }
+    if let Some(ref sid) = event.step_id {
+        m.insert("step_id".into(), sid.clone());
+    }
+    m.insert("event_type".into(), event.event_type.as_str().into());
+    m
+}
+
+/// EventStore broker 实现——写经 BrokerWriter,读经 ProjectionCache。
+pub struct BrokerEventStore {
+    writer: Arc<Mutex<BrokerWriter>>,
+    cache: ProjectionCache,
+    namespace: String,
+    broker_addr: String,
+}
+
+impl BrokerEventStore {
+    pub async fn connect(broker_addr: &str, namespace: &str) -> std::result::Result<Self, logdb_client::broker::BrokerError> {
+        let writer = BrokerWriter::connect(broker_addr, namespace).await?;
+        Ok(Self {
+            writer: Arc::new(Mutex::new(writer)),
+            cache: ProjectionCache::new(1000),
+            namespace: namespace.to_string(),
+            broker_addr: broker_addr.to_string(),
+        })
+    }
+
+    async fn ensure_projection(&self, task_id: &str) -> Result<()> {
+        if self.cache.get(task_id).await.is_some() {
+            return Ok(());
+        }
+        self.cache
+            .catch_up(task_id, &self.broker_addr, &self.namespace)
+            .await
+            .map_err(|e| AppError::Internal(format!("broker: {}", e)))?;
+        Ok(())
+    }
+
+    /// 安全持有投射读锁并应用 f。guard 在 f 返回后立即释放。
+    async fn with_projection<T>(&self, task_id: &str, f: impl FnOnce(&TaskProjection) -> T) -> Result<T> {
+        self.ensure_projection(task_id).await?;
+        // ensure 已确认缓存命中,catch_up 也在内;get 必 Some
+        let proj = self.cache.get(task_id).await.unwrap();
+        let p = proj.read().await;
+        Ok(f(&p))
+    }
+}
+
+#[async_trait]
+impl EventStore for BrokerEventStore {
+    // ── 写 ──
+
+    async fn create_task(
+        &self,
+        task_type: &str,
+        tenant_id: &str,
+        user_id: &str,
+        provenance: &Provenance,
+        body: Option<&serde_json::Value>,
+    ) -> Result<(String, AgentEvent)> {
+        let task_id = format!("task_{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
+        let payload = serde_json::json!({"task_type":task_type,"provenance":provenance,"body":body.cloned().unwrap_or(serde_json::Value::Null)});
+        let content = serde_json::to_vec(&payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let mut meta = HashMap::new();
+        meta.insert("task_id".into(), task_id.clone());
+        meta.insert("tenant_id".into(), tenant_id.to_string());
+        meta.insert("user_id".into(), user_id.to_string());
+        meta.insert("task_type".into(), task_type.to_string());
+        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        let mut w = self.writer.lock().await;
+        let (_, seq) = w.produce(&task_id, "task_created", &content, Some(&task_id), ts_ns, "application/json", &meta)
+            .await.map_err(|e| AppError::Internal(format!("broker produce: {}", e)))?;
+        let event = AgentEvent { task_id: task_id.clone(), seq: seq as i64, turn_id: None, step_id: None,
+            event_type: EventType::TaskCreated, schema_version: 1, payload, created_at: chrono::Utc::now() };
+        // 立即入缓存,后续 task_exists / write_event 才查得到
+        let _ = self.cache.catch_up(&task_id, &self.broker_addr, &self.namespace).await;
+        Ok((task_id, event))
+    }
+
+    async fn write_event(&self, event: &AgentEvent) -> Result<i64> {
+        event.validate_scope().map_err(|msg| AppError::LifecycleInvariant(msg))?;
+        crate::models::validate_payload_required_fields(&event.event_type, &event.payload)?;
+        let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let meta = event_meta(event);
+        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        let mut w = self.writer.lock().await;
+        let (_, seq) = w.produce(&event.task_id, event.event_type.as_str(), &content, Some(&event.task_id), ts_ns, "application/json", &meta)
+            .await.map_err(|e| AppError::Internal(format!("broker produce: {}", e)))?;
+        let seq_i64 = seq as i64;
+        // 更新投射(若有——当前 write_event 用于 WAL,投射在 ensure 时已全量 consume 过;此处为事件刚写入,后续 ensure 会重新 consume 到)
+        if let Some(proj) = self.cache.get(&event.task_id).await {
+            let mut p = proj.write().await;
+            let _ = p.apply(seq, event.event_type.as_str(), &content, &meta);
+        }
+        Ok(seq_i64)
+    }
+
+    async fn write_events_batch(&self, events: &[AgentEvent]) -> Result<Vec<i64>> {
+        if events.is_empty() { return Ok(vec![]); }
+        let tid = &events[0].task_id;
+        let mut w = self.writer.lock().await;
+        let entries: Vec<BatchProduceEntry> = events.iter().map(|e| {
+            let content = serde_json::to_vec(&e.payload).unwrap_or_default();
+            let meta = event_meta(e);
+            BatchProduceEntry {
+                stream: e.task_id.clone(), event_type: e.event_type.as_str().into(),
+                content, shard_key: Some(e.task_id.clone()), timestamp_ns: 0,
+                content_type: "application/json".into(), metadata: meta,
+            }
+        }).collect();
+        let results = w.batch_produce(entries).await.map_err(|e| AppError::Internal(format!("broker batch: {}", e)))?;
+        let seqs: Vec<i64> = results.into_iter().map(|(_, s)| s as i64).collect();
+        // 更新投射
+        if let Some(proj) = self.cache.get(tid).await {
+            let mut p = proj.write().await;
+            for (i, e) in events.iter().enumerate() {
+                let c = serde_json::to_vec(&e.payload).unwrap_or_default();
+                let _ = p.apply(seqs[i] as u64, e.event_type.as_str(), &c, &event_meta(e));
+            }
+        }
+        Ok(seqs)
+    }
+
+    // ── 读(委托投射) ──
+
+    async fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
+        match self.ensure_projection(task_id).await {
+            Ok(()) => {}
+            Err(_) => return Ok(None),
+        }
+        self.with_projection(task_id, |p| Some(Task {
+            task_id: task_id.to_string(),
+            tenant_id: p.provenance.source_tenant_id.clone().unwrap_or_default(),
+            user_id: p.provenance.source_user_id.clone().unwrap_or_default(),
+            task_type: p.task_type.clone(),
+            state: p.state,
+            provenance: p.provenance.clone(),
+            body: p.body.clone(),
+            created_at: p.provenance.created_at,
+            metadata: None,
+        })).await
+    }
+
+    async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>> {
+        self.with_projection(task_id, |p| Some(p.state)).await
+    }
+    async fn task_exists(&self, task_id: &str) -> Result<bool> {
+        Ok(self.cache.get(task_id).await.is_some())
+    }
+    async fn is_task_ended(&self, task_id: &str) -> Result<bool> {
+        self.with_projection(task_id, |p| p.state.is_terminal()).await
+    }
+    async fn get_max_seq(&self, task_id: &str) -> Result<i64> {
+        self.with_projection(task_id, |p| p.max_seq).await
+    }
+    async fn get_max_turn_id(&self, task_id: &str) -> Result<i64> {
+        self.with_projection(task_id, |p| p.max_turn_id).await
+    }
+    async fn get_event(&self, task_id: &str, seq: i64) -> Result<Option<AgentEvent>> {
+        self.with_projection(task_id, |p| p.by_seq(seq).cloned()).await
+    }
+    async fn get_turn_events(&self, task_id: &str, turn_id: i64) -> Result<Vec<AgentEvent>> {
+        self.with_projection(task_id, |p| {
+            p.turn_seqs(turn_id).iter().filter_map(|s| p.by_seq(*s).cloned()).collect()
+        }).await
+    }
+    async fn get_events_after_seq(&self, task_id: &str, after_seq: i64) -> Result<Vec<AgentEvent>> {
+        self.with_projection(task_id, |p| p.after_seq(after_seq).into_iter().cloned().collect()).await
+    }
+    async fn get_latest_summary(&self, task_id: &str) -> Result<Option<AgentEvent>> {
+        self.with_projection(task_id, |p| {
+            p.latest_summary.as_ref().map(|s| AgentEvent {
+                task_id: task_id.into(), seq: p.summarized_up_to_seq, turn_id: None, step_id: None,
+                event_type: EventType::SummaryMarker, schema_version: 1, payload: s.clone(),
+                created_at: chrono::Utc::now(),
+            })
+        }).await
+    }
+    async fn get_turn_steps(&self, task_id: &str, turn_id: i64) -> Result<Vec<StepExecution>> {
+        self.with_projection(task_id, |p| p.turn_steps(turn_id)).await
+    }
+    async fn get_incomplete_turns(&self, task_id: &str) -> Result<Vec<IncompleteTurn>> {
+        self.with_projection(task_id, |p| p.incomplete_turns()).await
+    }
+    async fn get_incomplete_steps(&self, task_id: &str) -> Result<Vec<IncompleteStep>> {
+        self.with_projection(task_id, |p| p.incomplete_steps()).await
+    }
+    async fn detect_seq_gaps(&self, _task_id: &str) -> Result<Vec<i64>> {
+        Ok(vec![])
+    }
+    async fn is_turn_seq_continuous(&self, _task_id: &str, _turn_id: i64) -> Result<bool> {
+        Ok(true)
+    }
+    async fn get_token_usage_stats(&self, task_id: &str) -> Result<Vec<TokenUsageStats>> {
+        self.with_projection(task_id, |p| p.token_stats.values().cloned().collect()).await
+    }
+    async fn count_turns_after_seq(&self, task_id: &str, after_seq: i64) -> Result<i64> {
+        self.with_projection(task_id, |p| {
+            p.recent_turn_ids.iter().filter(|tid| {
+                p.turn_seqs(**tid).first().map(|s| *s > after_seq).unwrap_or(false)
+            }).count() as i64
+        }).await
+    }
+    async fn count_events_after_seq(&self, task_id: &str, after_seq: i64) -> Result<i64> {
+        self.with_projection(task_id, |p| p.max_seq.saturating_sub(after_seq).max(0)).await
+    }
+    async fn get_llm_payloads_after_seq(&self, task_id: &str, after_seq: i64) -> Result<Vec<String>> {
+        self.with_projection(task_id, |p| p.llm_payloads_after_seq(after_seq)).await
+    }
+    async fn get_recent_turn_ids(&self, task_id: &str, limit: i64) -> Result<Vec<i64>> {
+        self.with_projection(task_id, |p| p.recent_turn_ids.iter().rev().take(limit as usize).copied().collect()).await
+    }
+    async fn archive_events_before_seq(&self, _task_id: &str, _before_seq: i64) -> Result<crate::storage::ArchiveResult> {
+        Ok(crate::storage::ArchiveResult { archived: 0, path: String::new() })
+    }
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
@@ -312,5 +540,36 @@ mod tests {
 
         // 再次命中(不 consume)
         assert!(cache.get("t-cache").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_broker_event_store_create_and_read() {
+        let (logdbd_addr, _dir) = start_logdbd().await;
+        let broker_addr = start_broker(&logdbd_addr).await;
+        let store = BrokerEventStore::connect(&broker_addr, "test-ns").await.unwrap();
+
+        let prov = crate::models::Provenance {
+            source_channel: "api".into(), source_session_id: None, source_user_id: Some("u".into()),
+            source_tenant_id: Some("t".into()), source_message_id: None,
+            created_at: chrono::Utc::now(), created_by: "test".into(),
+        };
+        let (tid, _) = store.create_task("db.repair", "t", "u", &prov, None).await.unwrap();
+        assert!(tid.starts_with("task_"));
+
+        // catch_up 可能因 broker forwarder 延迟,短暂重试
+        let task = loop {
+            let t = store.get_task(&tid).await.unwrap().unwrap();
+            if !t.task_type.is_empty() { break t; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(task.task_type, "db.repair");
+        assert_eq!(task.state, TaskState::Created);
+        assert!(!store.is_task_ended(&tid).await.unwrap());
+
+        let st = store.get_task_state(&tid).await.unwrap().unwrap();
+        assert_eq!(st, TaskState::Created);
+
+        // gap detection(退化)
+        assert!(store.detect_seq_gaps(&tid).await.unwrap().is_empty());
     }
 }

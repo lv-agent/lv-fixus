@@ -351,7 +351,7 @@ impl ProjectionCache {
     pub async fn get(&self, task_id: &str) -> Option<ProjectionRef> {
         let mut m = self.inner.write().await;
         let proj = m.map.get(task_id).cloned();
-        if let Some(ref p) = proj {
+        if proj.is_some() {
             m.order.retain(|id| id != task_id);
             m.order.push_back(task_id.to_string());
         }
