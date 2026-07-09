@@ -14,7 +14,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # logdbd — append-only log database (gRPC + SQL query cache)
-logdb-client = { path = "../../logdb/lv-logdb/logdb-client" }
+logdb-client = { path = "../../logdb/lv-logdb/logdb-client", features = ["broker"] }
+logdb-broker-proto = { path = "../../logdb/lv-logdb/logdb-broker-proto" }
 logdbd-proto = { path = "../../logdb/lv-logdb/logdbd-proto" }
 tonic = "0.12"
 
@@ -66,6 +67,7 @@ serde_json = "1"
 http-body-util = "0.1"
 # 集成测试:内嵌真实 logdbd(含 Indexer 后台线程)验证 EventStore 契约
 logdbd = { path = "../../logdb/lv-logdb/logdbd" }
+logdb-broker = { path = "../../logdb/lv-logdb/logdb-broker" }
 logdb = { path = "../../logdb/lv-logdb/logdb" }
 tempfile = "3"
 
