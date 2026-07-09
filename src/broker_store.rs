@@ -280,4 +280,37 @@ mod tests {
         }
         panic!("expected Record at seq {} after deadline", expected_seq);
     }
+
+    // ── ProjectionCache 集成测试(consume → CaughtUp → 投射)─────────────
+
+    #[tokio::test]
+    async fn test_projection_cache_populate_and_hit() {
+        use crate::projection::{ProjectionCache, TaskProjection};
+        let (logdbd_addr, _dir) = start_logdbd().await;
+        let broker_addr = start_broker(&logdbd_addr).await;
+        let mut writer = BrokerWriter::connect(&broker_addr, "test-ns").await.unwrap();
+
+        // 写 3 条事件
+        let content1 = serde_json::to_vec(&serde_json::json!({
+            "task_type":"db.repair","provenance":{"source_channel":"api","created_by":"t","created_at":"2026-01-01T00:00:00Z"},"body":null
+        })).unwrap();
+        let meta = HashMap::new();
+        writer.produce("t-cache", "task_created", &content1, Some("t-cache"), 0, "application/json", &meta).await.unwrap();
+        writer.produce("t-cache", "task_ready", b"{}", Some("t-cache"), 0, "application/json", &meta).await.unwrap();
+        writer.produce("t-cache", "task_claimed", b"{}", Some("t-cache"), 0, "application/json", &meta).await.unwrap();
+
+        // 等 forwarder 追上
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let cache = ProjectionCache::new(10);
+        // 未命中 → catch_up
+        let proj = cache.catch_up("t-cache", &broker_addr, "test-ns").await.unwrap();
+        let p = proj.read().await;
+        assert_eq!(p.state, crate::models::TaskState::Claimed);
+        assert_eq!(p.task_type, "db.repair");
+        drop(p);
+
+        // 再次命中(不 consume)
+        assert!(cache.get("t-cache").await.is_some());
+    }
 }

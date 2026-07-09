@@ -5,6 +5,7 @@
 //! 类型——收基本类型(seq/event_type/content/metadata)。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::error::{AppError, Result};
 use crate::models::{
@@ -316,6 +317,100 @@ impl TaskProjection {
             .filter(|(_, e)| e.event_type == EventType::LlmCompleted)
             .map(|(_, e)| serde_json::to_string(&e.payload).unwrap_or_default())
             .collect()
+    }
+}
+
+// ── ProjectionCache(LRU)───────────────────────────────────────────────
+
+/// broker consume → 内存投射 LRU。容量限制,线程安全(RwLock)。
+pub struct ProjectionCache {
+    inner: tokio::sync::RwLock<LruMap>,
+}
+
+struct LruMap {
+    map: HashMap<String, Arc<tokio::sync::RwLock<TaskProjection>>>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+/// 投射引用(Arc+RwLock),调用方拿到后可读可更新。
+pub type ProjectionRef = Arc<tokio::sync::RwLock<TaskProjection>>;
+
+impl ProjectionCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: tokio::sync::RwLock::new(LruMap {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                cap: capacity,
+            }),
+        }
+    }
+
+    /// 本地缓存命中(不调 broker),返回投射引用。
+    pub async fn get(&self, task_id: &str) -> Option<ProjectionRef> {
+        let mut m = self.inner.write().await;
+        let proj = m.map.get(task_id).cloned();
+        if let Some(ref p) = proj {
+            m.order.retain(|id| id != task_id);
+            m.order.push_back(task_id.to_string());
+        }
+        proj
+    }
+
+    /// 从 broker consume 新事件,建/更新投射。
+    /// `broker_addr` 不带 scheme("127.0.0.1:PORT")
+    pub async fn catch_up(
+        &self,
+        task_id: &str,
+        broker_addr: &str,
+        namespace: &str,
+    ) -> std::result::Result<ProjectionRef, logdb_client::broker::BrokerError> {
+        use logdb_client::broker::GroupConsumer;
+        use logdb_broker_proto::pb::consume_response::Payload;
+        use tokio_stream::StreamExt;
+
+        let addr = format!("http://{}", broker_addr);
+        let mut consumer = GroupConsumer::join(addr, namespace, task_id, "fixus-reads", "singleton").await?;
+        let all_shards: HashSet<u32> = consumer.assigned_shards().iter().copied().collect();
+        let mut stream = consumer.consume_frames().await?;
+        let mut proj_guard = self.inner.write().await;
+        let proj = proj_guard
+            .map
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(TaskProjection::new(task_id))));
+        let proj_clone = proj.clone();
+        drop(proj_guard); // 释放写锁,消费 async 不持锁
+
+        let mut caught_up: HashSet<u32> = HashSet::new();
+        while let Some(item) = stream.next().await {
+            let frame = item?;
+            match frame.payload {
+                Some(Payload::Record(rec)) => {
+                    let mut p = proj_clone.write().await;
+                    let _ = p.apply(rec.seq, &rec.event_type, &rec.content, &rec.metadata);
+                }
+                Some(Payload::CaughtUp(c)) => {
+                    caught_up.insert(c.shard_id);
+                }
+                Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
+                None => {}
+            }
+            if caught_up == all_shards {
+                break;
+            }
+        }
+        consumer.leave().await?;
+
+        // 更新 LRU 顺序
+        let mut m = self.inner.write().await;
+        m.order.push_back(task_id.to_string());
+        while m.order.len() > m.cap {
+            if let Some(old) = m.order.pop_front() {
+                m.map.remove(&old);
+            }
+        }
+        Ok(proj_clone)
     }
 }
 
