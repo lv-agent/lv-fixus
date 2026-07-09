@@ -138,6 +138,7 @@ pub struct LogdbdEventStore {
     namespace: String,
 }
 
+#[cfg(test)]
 impl LogdbdEventStore {
     /// 连接到 logdbd 服务器。
     pub async fn connect(addr: &str, namespace: &str) -> Result<Self> {
@@ -390,6 +391,7 @@ fn event_from_record(rec: &logdb_client::Record, task_id: &str) -> Result<AgentE
 // ── EventStore for LogdbdEventStore ─────────────────────────────────────────
 
 #[async_trait]
+#[cfg(test)]
 impl EventStore for LogdbdEventStore {
     // ── Session ─────────────────────────────────────────────────────────
 

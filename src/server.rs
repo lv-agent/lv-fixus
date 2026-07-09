@@ -23,7 +23,8 @@ use crate::error::AppError;
 use crate::orchestrator::Orchestrator;
 use crate::protocol::*;
 use crate::task_registry::TaskRegistry;
-use crate::storage::{EventStore, LogdbdEventStore};
+use crate::storage::EventStore;
+use crate::broker_store::BrokerEventStore;
 use crate::{context, recovery, service};
 
 // ── 应用状态 ────────────────────────────────────────────────────────────
@@ -67,13 +68,15 @@ impl IntoResponse for AppError {
 
 /// 启动 fixus HTTP 服务器
 pub async fn start() -> Result<(), AppError> {
-    // logdbd 连接地址（默认 localhost:50051）
-    let addr = std::env::var("LOGDBD_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:50051".into());
+    // broker 地址（默认 localhost:5100,与 logdbd 不同端口）
+    let broker_addr = std::env::var("BROKER_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:5100".into());
     let namespace = std::env::var("LOGDBD_NAMESPACE")
         .unwrap_or_else(|_| "default".into());
 
-    let db = LogdbdEventStore::connect(&addr, &namespace).await?;
+    let db = BrokerEventStore::connect(&broker_addr, &namespace)
+        .await
+        .map_err(|e| AppError::Internal(format!("broker connect: {}", e)))?;
     let store: Arc<dyn EventStore> = Arc::new(db);
 
     let registry = TaskRegistry::new();
