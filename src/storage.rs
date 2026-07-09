@@ -250,16 +250,14 @@ impl LogdbdEventStore {
         Ok(())
     }
 
-    /// 从 Task 级事件流派生状态(spec §4.4 projection)。
-    ///
-    /// - 取最新 Task 迁移事件 → 基础态
-    /// - 基础态 == Claimed 且存在 task_claimed 之后的 turn_started → Executing
-    ///   (spec §8.2 只列 7 事件,§4 图有 8 态;executing 由 turn_started 派生)
-    async fn derive_task_state(
+    /// 一次查询读回全部 Task 级事件记录(7 种,有界 ≤~8 条)。
+    /// 调用方据此判定存在性(task_created 是否在结果中)+ 派生状态,
+    /// 避免为"存在性"和"head 事实"分别打 round-trip。
+    async fn read_task_records(
         &self,
         client: &mut Client,
         task_id: &str,
-    ) -> Result<TaskState> {
+    ) -> Result<Vec<logdb_client::Record>> {
         let task_events = [
             "task_created",
             "task_ready",
@@ -280,11 +278,23 @@ impl LogdbdEventStore {
                 },
             )
             .await?;
-        let records = match resp.result {
+        Ok(match resp.result {
             Some(query_response::Result::Records(r)) => r.records,
             _ => vec![],
-        };
+        })
+    }
 
+    /// 从已读回的 Task 级记录派生状态(spec §4.4 projection)。
+    ///
+    /// - 最新 Task 迁移事件 → 基础态
+    /// - 基础态 == Claimed 且存在 task_claimed 之后的 turn_started → Executing
+    ///   (仅此分支触发一次条件 turn_started Max 查询;其余状态零额外查询)
+    async fn derive_task_state(
+        &self,
+        client: &mut Client,
+        records: &[logdb_client::Record],
+        task_id: &str,
+    ) -> Result<TaskState> {
         // 最新迁移事件(seq 最大者)
         let latest = records.iter().max_by_key(|r| r.seq);
         let base = match latest.map(|r| r.event_type.as_str()) {
@@ -444,24 +454,11 @@ impl EventStore for LogdbdEventStore {
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
         let mut client = self.client.lock().await;
 
-        // 读 task_created(head 事实:task_type / provenance / body)
-        let resp = self
-            .run_query(
-                &mut client,
-                task_id,
-                QueryRequest {
-                    event_types: vec!["task_created".into()],
-                    result: QueryResult::Records as i32,
-                    limit: 1, // oldest(ascending 默认序)
-                    ..Default::default()
-                },
-            )
-            .await?;
-        let rec = match resp.result {
-            Some(query_response::Result::Records(r)) => r.records.into_iter().next(),
-            _ => None,
+        // 一次查询读回全部 Task 级事件(head 事实 + 派生状态共用,省 round-trip)
+        let records = self.read_task_records(&mut client, task_id).await?;
+        let Some(rec) = records.iter().find(|r| r.event_type == "task_created") else {
+            return Ok(None);
         };
-        let Some(rec) = rec else { return Ok(None) };
 
         let payload: serde_json::Value = if rec.content.is_empty() {
             serde_json::Value::Null
@@ -498,8 +495,8 @@ impl EventStore for LogdbdEventStore {
             .or_else(|| provenance.source_user_id.clone())
             .unwrap_or_default();
 
-        // 派生当前 state(spec §4.4 projection)
-        let state = self.derive_task_state(&mut client, task_id).await?;
+        // 派生当前 state(spec §4.4 projection;复用同一批 records)
+        let state = self.derive_task_state(&mut client, &records, task_id).await?;
 
         Ok(Some(Task {
             task_id: task_id.to_string(),
@@ -561,25 +558,14 @@ impl EventStore for LogdbdEventStore {
 
     async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>> {
         let mut client = self.client.lock().await;
-        // 先确认 task_created 存在(无则 None)
-        let exists = self
-            .run_query(
-                &mut client,
-                task_id,
-                QueryRequest {
-                    event_types: vec!["task_created".into()],
-                    result: QueryResult::Exists as i32,
-                    ..Default::default()
-                },
-            )
-            .await?;
-        if !matches!(
-            exists.result,
-            Some(query_response::Result::Exists(true))
-        ) {
+        // 一次查询:存在性(task_created 在结果中)+ 派生状态,共用同一批 records
+        let records = self.read_task_records(&mut client, task_id).await?;
+        if !records.iter().any(|r| r.event_type == "task_created") {
             return Ok(None);
         }
-        self.derive_task_state(&mut client, task_id).await.map(Some)
+        self.derive_task_state(&mut client, &records, task_id)
+            .await
+            .map(Some)
     }
 
     // ── Seq ─────────────────────────────────────────────────────────────
