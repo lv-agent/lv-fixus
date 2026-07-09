@@ -10,7 +10,8 @@
 //!
 //! 线程安全：使用 RwLock，写少读多。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 
@@ -82,6 +83,8 @@ pub struct ReadyTask {
     pub task_type: String,
     /// blocked 恢复时,优先 offer 给原执行器(spec §4.3)
     pub preferred_claimant: Option<String>,
+    /// 全局入队序号(FIFO 公平性 + liveness 兜底取最旧)
+    pub seq: u64,
 }
 
 /// claim 匹配结果
@@ -91,14 +94,34 @@ pub struct ClaimedTask {
     pub task_type: String,
 }
 
+impl From<ReadyTask> for ClaimedTask {
+    fn from(r: ReadyTask) -> Self {
+        Self {
+            task_id: r.task_id,
+            task_type: r.task_type,
+        }
+    }
+}
+
+/// 单个 task_type 的 ready 队列:双 deque 结构,claim_next O(1)。
+/// - `neutral`:无 preferred_claimant 的任务(FIFO)
+/// - `preferred`:claimant → 该 claimant 专属(优先认领)的任务
+#[derive(Debug, Default)]
+struct ReadyQueue {
+    neutral: VecDeque<ReadyTask>,
+    preferred: HashMap<String, VecDeque<ReadyTask>>,
+}
+
 /// 全局 fixlet 连接注册表(按 task_type 路由)+ 活跃 Turn
 pub struct TaskRegistry {
     /// task_type → fixlet WebSocket sender(一种 task_type 一个 fixlet;worker-pool 待扩展)
     by_task_type: RwLock<HashMap<String, WsSender>>,
     /// task_id → 当前活跃的 PendingTurn
     active_turns: RwLock<HashMap<String, PendingTurn>>,
-    /// task_type → 待认领的 ready Task 队列(FIFO;preferred_claimant 项优先匹配同 claimant)
-    ready_queue: RwLock<HashMap<String, Vec<ReadyTask>>>,
+    /// task_type → 待认领的 ready Task 双 deque 队列
+    ready_queue: RwLock<HashMap<String, ReadyQueue>>,
+    /// ready 队列入队序号(全局单调,FIFO 公平性)
+    seq_counter: AtomicU64,
 }
 
 impl TaskRegistry {
@@ -107,6 +130,7 @@ impl TaskRegistry {
             by_task_type: RwLock::new(HashMap::new()),
             active_turns: RwLock::new(HashMap::new()),
             ready_queue: RwLock::new(HashMap::new()),
+            seq_counter: AtomicU64::new(0),
         })
     }
 
@@ -184,18 +208,32 @@ impl TaskRegistry {
         task_type: String,
         preferred_claimant: Option<String>,
     ) {
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
+        let task = ReadyTask {
+            task_id,
+            task_type,
+            preferred_claimant: preferred_claimant.clone(),
+            seq,
+        };
         let mut q = self.ready_queue.write().await;
-        q.entry(task_type.clone())
-            .or_default()
-            .push(ReadyTask {
-                task_id,
-                task_type,
-                preferred_claimant,
-            });
+        let queue = q.entry(task.task_type.clone()).or_default();
+        match preferred_claimant {
+            Some(c) => queue
+                .preferred
+                .entry(c)
+                .or_default()
+                .push_back(task),
+            None => queue.neutral.push_back(task),
+        }
     }
 
-    /// claimant 认领一个 task_type 的 ready Task。
-    /// 优先返回 `preferred_claimant == claimant` 的项;否则 FIFO。
+    /// claimant 认领一个 task_type 的 ready Task(O(1) 常规路径)。
+    ///
+    /// 顺序:
+    /// 1. `preferred[claimant]` 非空 → 取其队首(claimant 专属优先,O(1))
+    /// 2. `neutral` 非空 → 取队首(无 preferred 的 FIFO,O(1))
+    /// 3. liveness 兜底:取**别的** claimant 的 preferred 中最旧的一项(O(num_claimants),个位数)
+    ///    —— spec §4.3「允许其他 agent 认领」(原执行器超时/拒绝时)
     // TODO(Plan D): fixus 重启后 ready_queue 为空,需从 get_task_state==Ready 的事件流重建。
     pub async fn claim_next(
         &self,
@@ -204,19 +242,25 @@ impl TaskRegistry {
     ) -> Option<ClaimedTask> {
         let mut q = self.ready_queue.write().await;
         let queue = q.get_mut(task_type)?;
-        if queue.is_empty() {
-            return None;
+
+        // 1. claimant 专属
+        if let Some(dq) = queue.preferred.get_mut(claimant) {
+            if let Some(task) = dq.pop_front() {
+                return Some(ClaimedTask::from(task));
+            }
         }
-        // 优先 preferred_claimant 匹配,否则取队首(FIFO)
-        let pos = queue
+        // 2. neutral FIFO
+        if let Some(task) = queue.neutral.pop_front() {
+            return Some(ClaimedTask::from(task));
+        }
+        // 3. liveness:别的 claimant 的 preferred 里取最旧(seq 最小)
+        let (claimant_key, min_seq) = queue
+            .preferred
             .iter()
-            .position(|r| r.preferred_claimant.as_deref() == Some(claimant))
-            .unwrap_or(0);
-        let ready = queue.remove(pos);
-        Some(ClaimedTask {
-            task_id: ready.task_id,
-            task_type: ready.task_type,
-        })
+            .filter_map(|(k, dq)| dq.front().map(|t| (k.clone(), t.seq)))
+            .min_by_key(|(_, s)| *s)?;
+        let task = queue.preferred.get_mut(&claimant_key)?.pop_front()?;
+        Some(ClaimedTask::from(task))
     }
 
     // ── PendingTurn 管理 ──
@@ -479,10 +523,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn perf_claim_next_preferred_scan() {
-        // preferred_claimant 路径:队首不匹配 → 线性扫描找 preferred 项(最坏 O(n))。
+        // preferred-miss 路径(claimant 无专属任务):neutral 空 → liveness 兜底取别的
+        // claimant 的 preferred 中最旧一项,O(num_claimants) 而非 O(queue)。
         let registry = TaskRegistry::new();
         let n = 5000;
-        // 全部 preferred=other-claimant,claimant=fixlet-1 找不到 → 扫全表后取队首
+        // 全部 preferred=other-claimant;claimant=fixlet-1 走 liveness 兜底
         for i in 0..n {
             registry
                 .enqueue_ready(
@@ -498,6 +543,6 @@ mod tests {
             let _c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
             ns.push(t0.elapsed().as_nanos() as u64);
         }
-        report_ns("claim_next (preferred miss, O(n) scan)", ns);
+        report_ns("claim_next (preferred-miss, liveness fallback)", ns);
     }
 }
