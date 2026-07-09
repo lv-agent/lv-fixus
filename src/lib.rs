@@ -16,6 +16,7 @@ pub mod sandbox_client;
 pub mod task_registry;
 pub mod orchestrator;
 pub mod stream;
+pub mod projection;
 
 // 重新导出核心类型
 pub use error::{AppError, Result};
