@@ -671,6 +671,7 @@ impl EventStore for LogdbdEventStore {
             requests.push(AppendRequest {
                 namespace: self.namespace.clone(),
                 stream: event.task_id.clone(),
+                shard_key: Some(event.task_id.clone()),
                 event_type: event.event_type.as_str().to_string(),
                 content_type: "application/json".to_string(),
                 metadata: meta,

@@ -661,6 +661,8 @@ dependencies = [
  "http-body-util",
  "landlock",
  "logdb",
+ "logdb-broker",
+ "logdb-broker-proto",
  "logdb-client",
  "logdbd",
  "logdbd-proto",
@@ -1310,7 +1312,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "logdb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1327,17 +1329,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "logdb-client"
-version = "0.3.1"
+name = "logdb-broker"
+version = "0.1.0"
 dependencies = [
+ "logdb-broker-proto",
+ "logdbd-proto",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "logdb-broker-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "logdb-client"
+version = "0.4.1"
+dependencies = [
+ "logdb-broker-proto",
  "logdbd-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
 [[package]]
 name = "logdbd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "crc32c",
  "fs2",
@@ -1361,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "logdbd-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "prost",
  "tonic",
