@@ -383,21 +383,25 @@ impl ProjectionCache {
         drop(proj_guard); // 释放写锁,消费 async 不持锁
 
         let mut caught_up: HashSet<u32> = HashSet::new();
-        while let Some(item) = stream.next().await {
-            let frame = item?;
-            match frame.payload {
-                Some(Payload::Record(rec)) => {
-                    let mut p = proj_clone.write().await;
-                    let _ = p.apply(rec.seq, &rec.event_type, &rec.content, &rec.metadata);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break; }
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(frame))) => {
+                    match frame.payload {
+                        Some(Payload::Record(rec)) => {
+                            let mut p = proj_clone.write().await;
+                            let _ = p.apply(rec.seq, &rec.event_type, &rec.content, &rec.metadata);
+                        }
+                        Some(Payload::CaughtUp(c)) => { caught_up.insert(c.shard_id); }
+                        Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
+                        None => {}
+                    }
+                    if caught_up == all_shards { break; }
                 }
-                Some(Payload::CaughtUp(c)) => {
-                    caught_up.insert(c.shard_id);
-                }
-                Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
-                None => {}
-            }
-            if caught_up == all_shards {
-                break;
+                Ok(Some(Err(e))) => return Err(e),
+                _ => break,
             }
         }
         consumer.leave().await?;
