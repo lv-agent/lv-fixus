@@ -3,7 +3,10 @@
 //! fixlet 的核心：连接 fixus（WebSocket），管理 Agent 子进程（ACP stdio），
 //! 双向路由消息。无状态——崩溃后重启即可。
 
+use std::sync::Arc;
+
 use futures_util::{SinkExt, StreamExt};
+use logdb_client::broker::BrokerProducer;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -258,20 +261,14 @@ async fn broker_task_subscriber(config: FixletConfig) {
     let stream = format!("tasks-{}", config.task_type.replace('.', "-"));
     let consumer_id = format!("fixlet-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
     let group = format!("fixlets-{}", config.task_type);
-    let fixus_http = config.fixus_url
-        .replace("ws://", "http://")
-        .replace("wss://", "https://")
-        .trim_end_matches("/ws/fixlet")
-        .to_string();
 
     tracing::info!(
-        "broker task subscriber starting: broker={} stream={} group={} fixus_http={}",
-        broker_addr, stream, group, fixus_http
+        "broker task subscriber starting: broker={} stream={} group={}",
+        broker_addr, stream, group
     );
 
-    let http_client = reqwest::Client::new();
     loop {
-        match subscribe_and_claim(&broker_addr, &namespace, &stream, &group, &consumer_id, &fixus_http, &http_client, &config.task_type).await {
+        match subscribe_and_claim(&broker_addr, &namespace, &stream, &group, &consumer_id).await {
             Ok(()) => tracing::info!("task subscriber ended normally"),
             Err(e) => {
                 tracing::error!("task subscriber error: {}; retrying in 1s", e);
@@ -287,9 +284,6 @@ async fn subscribe_and_claim(
     stream: &str,
     group: &str,
     consumer_id: &str,
-    fixus_http: &str,
-    http_client: &reqwest::Client,
-    task_type: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use logdb_client::broker::GroupConsumer;
     use logdb_broker_proto::pb::consume_response::Payload;
@@ -327,33 +321,9 @@ async fn subscribe_and_claim(
                 let task_id = payload["task_id"].as_str().unwrap_or("");
                 if task_id.is_empty() { continue; }
 
-                tracing::info!("task subscriber: received ready task {}", task_id);
-
-                // HTTP claim
-                let claim_body = serde_json::json!({"claimant": consumer_id});
-                match http_client
-                    .post(format!("{}/api/v1/sessions/{}/claim", fixus_http, task_id))
-                    .json(&claim_body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            tracing::info!("task {} claimed successfully", task_id);
-                            let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
-                        } else {
-                            let body = resp.text().await.unwrap_or_default();
-                            tracing::warn!("task {} claim rejected ({}): {}", task_id, status, body);
-                            // 仍 commit——task 可能已被其他 fixlet 认领,跳过
-                            let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("task {} claim HTTP failed: {}", task_id, e);
-                        // 不 commit——重试
-                    }
-                }
+                tracing::info!("task subscriber: received ready task {} — consuming directly", task_id);
+                // broker shard 分配已排他,消费即认领。直接 commit,不调 HTTP。
+                let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
             }
             Some(Payload::CaughtUp(_)) | Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
             None => {}
@@ -369,6 +339,34 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
     tokio::spawn(async move {
         broker_task_subscriber(broker_config).await;
     });
+
+    // broker lifecycle producer: turn_execution_done 等事件通过 broker 回传 fixus
+    let broker_addr = std::env::var("BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:5100".into());
+    let namespace = std::env::var("LOGDBD_NAMESPACE").unwrap_or_else(|_| "default".into());
+    let lifecycle_producer = Arc::new(tokio::sync::Mutex::new(
+        BrokerProducer::connect(format!("http://{}", broker_addr)).await
+            .map_err(|e| format!("broker producer: {}", e))?,
+    ));
+
+    // Redis connection for llm_chunk streaming (bypass fixus WS)
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis_conn: Arc<tokio::sync::Mutex<Option<redis::aio::ConnectionManager>>> =
+        match redis::Client::open(redis_url.clone()) {
+            Ok(client) => match client.get_connection_manager().await {
+                Ok(conn) => {
+                    tracing::info!("fixlet Redis connected for token streaming: {}", redis_url);
+                    Arc::new(tokio::sync::Mutex::new(Some(conn)))
+                }
+                Err(e) => {
+                    tracing::warn!("fixlet Redis unavailable ({}), token streaming disabled", e);
+                    Arc::new(tokio::sync::Mutex::new(None))
+                }
+            },
+            Err(e) => {
+                tracing::warn!("fixlet Redis client error ({}), token streaming disabled", e);
+                Arc::new(tokio::sync::Mutex::new(None))
+            }
+        };
 
     loop {
         tracing::info!("Connecting to fixus at {}", config.fixus_url);
@@ -398,6 +396,9 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
         tracing::info!("Registered for task_type {}", config.task_type);
 
         let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx_raw));
+        let lifecycle_producer = lifecycle_producer.clone();
+        let lifecycle_namespace = namespace.clone();
+        let redis_conn = redis_conn.clone();
 
         // 当前 activate Turn 上下文（每次 execute_turn 时替换）
         let mut active_turn: Option<TurnContext> = None;
@@ -463,6 +464,9 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
                                 &ws_tx,
                                 agent_stdin.as_ref(),
                                 &mut msg_accumulator,
+                                &redis_conn,
+                                &lifecycle_producer,
+                                &lifecycle_namespace,
                             ).await {
                                 tracing::error!("Error handling agent message: {}", e);
                             }
@@ -703,6 +707,9 @@ async fn handle_agent_message(
     ws_tx: &std::sync::Arc<tokio::sync::Mutex<impl SinkExt<Message> + Unpin>>,
     _agent_stdin: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
     msg_acc: &mut MessageAccumulator,
+    redis_conn: &Arc<tokio::sync::Mutex<Option<redis::aio::ConnectionManager>>>,
+    lifecycle_producer: &Arc<tokio::sync::Mutex<BrokerProducer>>,
+    lifecycle_namespace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = match acp::parse_acp_message(text) {
         Some(p) => p,
@@ -714,14 +721,19 @@ async fn handle_agent_message(
         ParsedAcpEvent::MessageChunk(chunk) => {
             msg_acc.append(&chunk);
 
-            // 实时转发每个 token 给 fixus（用于 SSE 流式输出）
-            let chunk_msg = FixletToFixus::LlmChunk {
-                session_id: ctx.task_id.clone(),
-                turn_id: ctx.turn_id,
-                text: chunk.clone(),
-            };
-            let mut tx = ws_tx.lock().await;
-            let _ = tx.send(Message::Text(chunk_msg.to_json().into())).await;
+            // 实时转发每个 token 到 Redis（fixus-stream SSE 消费），绕过 fixus WS
+            if let Some(ref mut conn) = *redis_conn.lock().await {
+                let payload = serde_json::json!({
+                    "task_id": ctx.task_id,
+                    "turn_id": ctx.turn_id,
+                    "text": chunk,
+                });
+                let _ = redis::cmd("PUBLISH")
+                    .arg(format!("fixus:token:{}", ctx.task_id))
+                    .arg(serde_json::to_string(&payload).unwrap_or_default())
+                    .query_async::<()>(conn)
+                    .await;
+            }
 
             tracing::debug!("agent message chunk: {} chars", chunk.len());
         }
@@ -787,15 +799,26 @@ async fn handle_agent_message(
                 ctx.local_seq.current()
             );
 
-            let done_msg = FixletToFixus::TurnExecutionDone {
-                session_id: ctx.task_id.clone(),
-                turn_id: ctx.turn_id,
-                max_local_seq: ctx.local_seq.current(),
-                final_output: final_text,
-            };
+            // Produce turn_execution_done to broker (替代 WS send —— fixlet 独立性)
+            let done_payload = serde_json::json!({
+                "task_id": ctx.task_id,
+                "turn_id": ctx.turn_id,
+                "max_local_seq": ctx.local_seq.current(),
+                "final_output": final_text,
+                "event_type": "turn_execution_done",
+            });
+            let content = serde_json::to_vec(&done_payload).unwrap_or_default();
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("task_id".into(), ctx.task_id.clone());
+            meta.insert("event_type".into(), "turn_execution_done".into());
 
-            let mut tx = ws_tx.lock().await;
-            let _ = tx.send(Message::Text(done_msg.to_json().into())).await;
+            let mut lp = lifecycle_producer.lock().await;
+            if let Err(e) = lp.produce_full(
+                &lifecycle_namespace, "task-lifecycle", "turn_execution_done", &content,
+                Some(&ctx.task_id), 0, "application/json", &meta,
+            ).await {
+                tracing::error!("broker produce turn_execution_done failed: {}", e);
+            }
         }
 
         ParsedAcpEvent::Error(err) => {

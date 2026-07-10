@@ -134,13 +134,6 @@ pub enum AsyncTurnStart {
     RecoveryTriggered { incomplete_count: usize },
 }
 
-/// Broker path HTTP claim 结果
-#[derive(Debug)]
-pub enum ClaimHttpOutcome {
-    Granted { task_type: String, task_brief: String },
-    Denied { reason: String },
-}
-
 /// claim 处理结果(spec §8.3 pull-based 认领)
 #[derive(Debug)]
 pub enum ClaimOutcome {
@@ -266,31 +259,6 @@ impl Orchestrator {
             .await?
             .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
         Ok(session.task_type)
-    }
-
-    /// Broker 路径 HTTP claim: fixlet 已从 broker 订阅到 task_id,调 HTTP 认领。
-    pub async fn handle_claim_http(
-        &self,
-        task_id: &str,
-        claimant: &str,
-    ) -> Result<ClaimHttpOutcome> {
-        if let Err(e) = service::claim_task(&*self.store, task_id, claimant).await {
-            tracing::warn!("claim_http failed for {}: {}", task_id, e);
-            return Ok(ClaimHttpOutcome::Denied {
-                reason: format!("claim transition failed: {}", e),
-            });
-        }
-        let task = self.store.get_task(task_id).await?
-            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
-        let task_brief = task.body.as_ref()
-            .and_then(|b| b.get("task_brief"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(ClaimHttpOutcome::Granted {
-            task_type: task.task_type,
-            task_brief,
-        })
     }
 
     /// 处理 fixlet claim 请求(spec §8.3 pull-based 认领)。
@@ -1290,6 +1258,38 @@ impl Orchestrator {
 
         Ok(outcome)
     }
+
+    /// 启动 `task-lifecycle` stream 消费者,接收 fixlet 的 turn_execution_done。
+    pub fn spawn_lifecycle_consumer(
+        self: &Arc<Self>,
+        broker_addr: &str,
+        namespace: &str,
+    ) {
+        let orch = self.clone();
+        let broker_addr = broker_addr.to_string();
+        let namespace = namespace.to_string();
+        let instance_id = uuid::Uuid::now_v7().to_string().replace('-', "");
+        let group = format!("fixus-lifecycle-{}", &instance_id[..12]);
+
+        tokio::spawn(async move {
+            let consumer_id = format!("fixus-lifecycle-{}", instance_id);
+            tracing::info!(
+                "lifecycle consumer starting: broker={} stream=task-lifecycle group={} consumer={}",
+                broker_addr, group, consumer_id
+            );
+            loop {
+                match run_lifecycle_consumer(&orch, &broker_addr, &namespace, &group, &consumer_id).await {
+                    Ok(()) => tracing::info!("lifecycle consumer ended normally"),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("lifecycle consumer error: {}; retrying in 1s", msg);
+                        drop(msg);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+    }
 }
 
 // ── Broker Result Consumer ─────────────────────────────────────────────
@@ -1389,6 +1389,66 @@ async fn run_result_consumer(
             | Some(Payload::Rebalance(_))
             | Some(Payload::Assignment(_)) => {}
             None => {}
+        }
+    }
+    consumer.leave().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    Ok(())
+}
+
+// ── Broker Lifecycle Consumer (free fn) ────────────────────────────────
+
+async fn run_lifecycle_consumer(
+    orch: &Arc<Orchestrator>,
+    broker_addr: &str,
+    namespace: &str,
+    group: &str,
+    consumer_id: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use logdb_broker_proto::pb::consume_response::Payload;
+    use logdb_client::broker::GroupConsumer;
+    use tokio_stream::StreamExt;
+
+    let mut consumer = GroupConsumer::join(
+        format!("http://{}", broker_addr),
+        namespace,
+        "task-lifecycle",
+        group,
+        consumer_id,
+    )
+    .await
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    tracing::info!("lifecycle consumer joined {} ({}), shards: {:?}", group, consumer_id, consumer.assigned_shards());
+
+    let mut frames = consumer.consume_frames().await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    let mut consecutive_errors: u32 = 0;
+    while let Some(item) = frames.next().await {
+        let frame = match item {
+            Ok(f) => { consecutive_errors = 0; f }
+            Err(e) => {
+                consecutive_errors += 1;
+                tracing::error!("lifecycle consume error (consecutive={}): {}", consecutive_errors, e);
+                if consecutive_errors >= 3 {
+                    return Err(format!("{} consecutive lifecycle errors, rejoining", consecutive_errors).into());
+                }
+                continue;
+            }
+        };
+        match frame.payload {
+            Some(Payload::Record(rec)) => {
+                if rec.event_type != "turn_execution_done" { continue; }
+                let payload: serde_json::Value = serde_json::from_slice(&rec.content).unwrap_or_default();
+                let task_id = payload["task_id"].as_str().unwrap_or("");
+                let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+                let max_local_seq = payload["max_local_seq"].as_i64().unwrap_or(0);
+                let final_output = payload["final_output"].as_str().unwrap_or("");
+                if task_id.is_empty() || turn_id == 0 { continue; }
+                tracing::info!("lifecycle: turn_execution_done task={} turn={}", task_id, turn_id);
+                let _ = orch.handle_turn_execution_done(task_id, turn_id, max_local_seq, final_output).await;
+                let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+            }
+            _ => {}
         }
     }
     consumer.leave().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -1589,82 +1649,6 @@ mod tests {
             store_arc.get_task_state(&tid).await.unwrap(),
             Some(TaskState::Created)
         );
-    }
-
-    // ── #84: Broker claim HTTP 测试 ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn handle_claim_http_granted_writes_claimed() {
-        let (store, _d) = setup().await;
-        let store_arc: Arc<dyn EventStore> = Arc::new(store);
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(store_arc.clone(), registry, tp);
-
-        let body = serde_json::json!({"task_brief": "fix db1 deadlocks"});
-        let prov = test_provenance();
-        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, Some(&body))
-            .await.unwrap();
-        wait_seq(&*store_arc, &tid, 1).await;
-
-        // mark ready 后 state 变为 ready,才能 claim
-        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
-        wait_seq(&*store_arc, &tid, 2).await;
-
-        match orch.handle_claim_http(&tid, "fixlet-1").await.unwrap() {
-            ClaimHttpOutcome::Granted { task_type, task_brief } => {
-                assert_eq!(task_type, "db.repair");
-                assert_eq!(task_brief, "fix db1 deadlocks");
-            }
-            other => panic!("expected Granted, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_claim_http_denied_when_not_ready() {
-        let (store, _d) = setup().await;
-        let store_arc: Arc<dyn EventStore> = Arc::new(store);
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(store_arc.clone(), registry, tp);
-
-        let prov = test_provenance();
-        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
-            .await.unwrap();
-        // 未 mark ready → state=created,claim 应拒绝
-        match orch.handle_claim_http(&tid, "fixlet-1").await.unwrap() {
-            ClaimHttpOutcome::Denied { reason } => {
-                assert!(reason.contains("transition"), "reason: {}", reason);
-            }
-            other => panic!("expected Denied, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_claim_http_denied_when_already_claimed() {
-        let (store, _d) = setup().await;
-        let store_arc: Arc<dyn EventStore> = Arc::new(store);
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(store_arc.clone(), registry, tp);
-
-        let prov = test_provenance();
-        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
-            .await.unwrap();
-        wait_seq(&*store_arc, &tid, 1).await;
-        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
-        wait_seq(&*store_arc, &tid, 2).await;
-
-        // 第一次 claim 成功
-        assert!(matches!(
-            orch.handle_claim_http(&tid, "fixlet-1").await.unwrap(),
-            ClaimHttpOutcome::Granted { .. }
-        ));
-        // 第二次 claim 应拒绝(已 claimed,非 ready)
-        assert!(matches!(
-            orch.handle_claim_http(&tid, "fixlet-2").await.unwrap(),
-            ClaimHttpOutcome::Denied { .. }
-        ));
     }
 
     // ── #74: work_dir 相关测试 ──────────────────────────────────────────

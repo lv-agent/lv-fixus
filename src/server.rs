@@ -92,6 +92,8 @@ pub async fn start() -> Result<(), AppError> {
     // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
     let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
     orchestrator.spawn_result_consumer(&broker_addr, &namespace, &region);
+    // 启动 broker lifecycle consumer(fixlet turn_execution_done → broker → fixus)
+    orchestrator.spawn_lifecycle_consumer(&broker_addr, &namespace);
 
     let state = AppState {
         store,
@@ -184,11 +186,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/sessions/{task_id}/turns/{turn_id}/context",
             get(get_turn_context_handler),
-        )
-        // Claim (broker-based: fixlet 从 broker 订阅 ready task 后 HTTP claim)
-        .route(
-            "/api/v1/sessions/{task_id}/claim",
-            post(claim_task_handler),
         )
         // Recovery
         .route(
@@ -350,41 +347,6 @@ async fn mark_ready_handler(
         "seq": event.seq,
         "state": "ready",
     }))))
-}
-
-/// POST /sessions/{task_id}/claim — fixlet broker 路径认领 task
-///
-/// fixlet 从 broker stream `tasks-{task_type}` 订阅 ready task 后,
-/// 调此端点 HTTP 认领(同步)。fixus 写 task_claimed event 完成状态迁移,
-/// 返回 task_brief 供 fixlet 用作首个 turn 的 user_input。
-async fn claim_task_handler(
-    State(state): State<AppState>,
-    Path(task_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let claimant = body.get("claimant")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    let orch = orchestrator(&state);
-    match orch.handle_claim_http(&task_id, claimant).await {
-        Ok(outcome) => match outcome {
-            crate::orchestrator::ClaimHttpOutcome::Granted { task_type, task_brief } => {
-                tracing::info!("claim_http: task={} granted to {}", task_id, claimant);
-                Ok(Json(ApiResponse::ok(serde_json::json!({
-                    "task_id": task_id,
-                    "task_type": task_type,
-                    "task_brief": task_brief,
-                    "status": "claimed",
-                }))))
-            }
-            crate::orchestrator::ClaimHttpOutcome::Denied { reason } => {
-                tracing::warn!("claim_http: task={} denied: {}", task_id, reason);
-                Ok(Json(ApiResponse::err(reason)))
-            }
-        },
-        Err(e) => Err(e),
-    }
 }
 
 /// GET /sessions/{task_id}/state — 查询 Task 当前状态(事件投影)
