@@ -185,6 +185,11 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/sessions/{task_id}/turns/{turn_id}/context",
             get(get_turn_context_handler),
         )
+        // Claim (broker-based: fixlet 从 broker 订阅 ready task 后 HTTP claim)
+        .route(
+            "/api/v1/sessions/{task_id}/claim",
+            post(claim_task_handler),
+        )
         // Recovery
         .route(
             "/api/v1/sessions/{task_id}/recovery",
@@ -236,12 +241,13 @@ async fn create_session_handler(
         created_at: chrono::Utc::now(),
         created_by: "api".into(),
     };
+    let task_type = req.task_type.as_deref().unwrap_or(&req.agent_type);
     // fixus 分配 task_id(spec §8.4);req.session_id(client 指定)被忽略。
     let (task_id, event) = service::create_task(
         &*state.store,
-        &req.agent_type,
+        task_type,
         &prov,
-        req.metadata.as_ref(),
+        req.body.as_ref(),
     )
     .await?;
 
@@ -320,10 +326,20 @@ async fn mark_ready_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let event = service::mark_task_ready(&*state.store, &task_id).await?;
 
-    // 入 claim 队列(阻塞恢复时带 preferred_claimant,此处首次 ready 无 hint)
     let task = service::get_task_info(&*state.store, &task_id)
         .await?
         .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
+    let task_brief = task.body.as_ref()
+        .and_then(|b| b.get("task_brief"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅(替代内存队列)
+    if let Err(e) = state.store.publish_ready_task(&task_id, &task.task_type, task_brief, None).await {
+        tracing::warn!("publish_ready_task failed for {}: {} — falling back to memory queue", task_id, e);
+    }
+
+    // 同时入内存队列(兼容直连 fixlet 的 WS claim 路径;broker 路径优先)
     state
         .registry
         .enqueue_ready(task_id.clone(), task.task_type, None)
@@ -334,6 +350,41 @@ async fn mark_ready_handler(
         "seq": event.seq,
         "state": "ready",
     }))))
+}
+
+/// POST /sessions/{task_id}/claim — fixlet broker 路径认领 task
+///
+/// fixlet 从 broker stream `tasks-{task_type}` 订阅 ready task 后,
+/// 调此端点 HTTP 认领(同步)。fixus 写 task_claimed event 完成状态迁移,
+/// 返回 task_brief 供 fixlet 用作首个 turn 的 user_input。
+async fn claim_task_handler(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let claimant = body.get("claimant")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let orch = orchestrator(&state);
+    match orch.handle_claim_http(&task_id, claimant).await {
+        Ok(outcome) => match outcome {
+            crate::orchestrator::ClaimHttpOutcome::Granted { task_type, task_brief } => {
+                tracing::info!("claim_http: task={} granted to {}", task_id, claimant);
+                Ok(Json(ApiResponse::ok(serde_json::json!({
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "task_brief": task_brief,
+                    "status": "claimed",
+                }))))
+            }
+            crate::orchestrator::ClaimHttpOutcome::Denied { reason } => {
+                tracing::warn!("claim_http: task={} denied: {}", task_id, reason);
+                Ok(Json(ApiResponse::err(reason)))
+            }
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// GET /sessions/{task_id}/state — 查询 Task 当前状态(事件投影)

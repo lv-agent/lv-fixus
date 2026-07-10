@@ -134,6 +134,13 @@ pub enum AsyncTurnStart {
     RecoveryTriggered { incomplete_count: usize },
 }
 
+/// Broker path HTTP claim 结果
+#[derive(Debug)]
+pub enum ClaimHttpOutcome {
+    Granted { task_type: String, task_brief: String },
+    Denied { reason: String },
+}
+
 /// claim 处理结果(spec §8.3 pull-based 认领)
 #[derive(Debug)]
 pub enum ClaimOutcome {
@@ -259,6 +266,31 @@ impl Orchestrator {
             .await?
             .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
         Ok(session.task_type)
+    }
+
+    /// Broker 路径 HTTP claim: fixlet 已从 broker 订阅到 task_id,调 HTTP 认领。
+    pub async fn handle_claim_http(
+        &self,
+        task_id: &str,
+        claimant: &str,
+    ) -> Result<ClaimHttpOutcome> {
+        if let Err(e) = service::claim_task(&*self.store, task_id, claimant).await {
+            tracing::warn!("claim_http failed for {}: {}", task_id, e);
+            return Ok(ClaimHttpOutcome::Denied {
+                reason: format!("claim transition failed: {}", e),
+            });
+        }
+        let task = self.store.get_task(task_id).await?
+            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+        let task_brief = task.body.as_ref()
+            .and_then(|b| b.get("task_brief"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(ClaimHttpOutcome::Granted {
+            task_type: task.task_type,
+            task_brief,
+        })
     }
 
     /// 处理 fixlet claim 请求(spec §8.3 pull-based 认领)。

@@ -248,7 +248,128 @@ fn fixus_mcp_url(fixus_url: &str) -> String {
     format!("{}://{}/mcp", scheme, host_port)
 }
 
+/// 后台 broker 任务订阅:从 `tasks-{task_type}` stream 获取 ready task,通过 HTTP 认领。
+async fn broker_task_subscriber(config: FixletConfig) {
+    use logdb_client::broker::GroupConsumer;
+    use logdb_broker_proto::pb::consume_response::Payload;
+
+    let broker_addr = std::env::var("BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:5100".into());
+    let namespace = std::env::var("LOGDBD_NAMESPACE").unwrap_or_else(|_| "default".into());
+    let stream = format!("tasks-{}", config.task_type.replace('.', "-"));
+    let consumer_id = format!("fixlet-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
+    let group = format!("fixlets-{}", config.task_type);
+    let fixus_http = config.fixus_url
+        .replace("ws://", "http://")
+        .replace("wss://", "https://")
+        .trim_end_matches("/ws/fixlet")
+        .to_string();
+
+    tracing::info!(
+        "broker task subscriber starting: broker={} stream={} group={} fixus_http={}",
+        broker_addr, stream, group, fixus_http
+    );
+
+    let http_client = reqwest::Client::new();
+    loop {
+        match subscribe_and_claim(&broker_addr, &namespace, &stream, &group, &consumer_id, &fixus_http, &http_client, &config.task_type).await {
+            Ok(()) => tracing::info!("task subscriber ended normally"),
+            Err(e) => {
+                tracing::error!("task subscriber error: {}; retrying in 1s", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn subscribe_and_claim(
+    broker_addr: &str,
+    namespace: &str,
+    stream: &str,
+    group: &str,
+    consumer_id: &str,
+    fixus_http: &str,
+    http_client: &reqwest::Client,
+    task_type: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use logdb_client::broker::GroupConsumer;
+    use logdb_broker_proto::pb::consume_response::Payload;
+    use tokio_stream::StreamExt as TokioStreamExt;
+
+    let mut consumer = GroupConsumer::join(
+        format!("http://{}", broker_addr),
+        namespace,
+        stream,
+        group,
+        consumer_id,
+    ).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    tracing::info!("task subscriber joined {} ({}), shards: {:?}", group, consumer_id, consumer.assigned_shards());
+
+    let mut frames = consumer.consume_frames().await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    let mut consecutive_errors: u32 = 0;
+    while let Some(item) = TokioStreamExt::next(&mut frames).await {
+        let frame = match item {
+            Ok(f) => { consecutive_errors = 0; f }
+            Err(e) => {
+                consecutive_errors += 1;
+                tracing::error!("task consume error (consecutive={}): {}", consecutive_errors, e);
+                if consecutive_errors >= 3 {
+                    return Err(format!("{} consecutive errors, rejoining", consecutive_errors).into());
+                }
+                continue;
+            }
+        };
+        match frame.payload {
+            Some(Payload::Record(rec)) => {
+                if rec.event_type != "task_ready" { continue; }
+                let payload: serde_json::Value = serde_json::from_slice(&rec.content).unwrap_or_default();
+                let task_id = payload["task_id"].as_str().unwrap_or("");
+                if task_id.is_empty() { continue; }
+
+                tracing::info!("task subscriber: received ready task {}", task_id);
+
+                // HTTP claim
+                let claim_body = serde_json::json!({"claimant": consumer_id});
+                match http_client
+                    .post(format!("{}/api/v1/sessions/{}/claim", fixus_http, task_id))
+                    .json(&claim_body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            tracing::info!("task {} claimed successfully", task_id);
+                            let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+                        } else {
+                            let body = resp.text().await.unwrap_or_default();
+                            tracing::warn!("task {} claim rejected ({}): {}", task_id, status, body);
+                            // 仍 commit——task 可能已被其他 fixlet 认领,跳过
+                            let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("task {} claim HTTP failed: {}", task_id, e);
+                        // 不 commit——重试
+                    }
+                }
+            }
+            Some(Payload::CaughtUp(_)) | Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
+            None => {}
+        }
+    }
+    consumer.leave().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    Ok(())
+}
+
 pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // 启动 broker 任务订阅(后台,不阻塞 WS 主循环)
+    let broker_config = config.clone();
+    tokio::spawn(async move {
+        broker_task_subscriber(broker_config).await;
+    });
+
     loop {
         tracing::info!("Connecting to fixus at {}", config.fixus_url);
 

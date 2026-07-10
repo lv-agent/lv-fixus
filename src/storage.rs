@@ -110,6 +110,12 @@ pub trait EventStore: Send + Sync {
 
     // ── Dispatch ────────────────────────────────────────────────────────
 
+    /// 把 ready task 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅。
+    /// 默认 no-op;BrokerEventStore 覆盖。
+    async fn publish_ready_task(&self, _task_id: &str, _task_type: &str, _task_brief: &str, _preferred_claimant: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+
     /// 把工具事件发到 sandbox dispatch stream(Plan D)。
     /// 默认 no-op;BrokerEventStore 覆盖。
     async fn dispatch_tool(&self, _task_id: &str, _event: &AgentEvent) -> Result<()> {

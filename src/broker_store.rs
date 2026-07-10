@@ -328,6 +328,45 @@ impl EventStore for BrokerEventStore {
         Ok(crate::storage::ArchiveResult { archived: 0, path: String::new() })
     }
 
+    /// 把 ready task 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅认领。
+    /// 替代原来的内存 TaskRegistry 队列——broker 持久化,fixus 重启不丢。
+    async fn publish_ready_task(&self, task_id: &str, task_type: &str, task_brief: &str, preferred_claimant: Option<&str>) -> Result<()> {
+        // broker stream 名只允许 [a-zA-Z0-9_-], task_type 中的 '.' 替换为 '-'
+        let sanitized = task_type.replace('.', "-");
+        let stream = format!("tasks-{}", sanitized);
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "task_type": task_type,
+            "task_brief": task_brief,
+            "preferred_claimant": preferred_claimant,
+        });
+        let content = serde_json::to_vec(&payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let mut meta = HashMap::new();
+        meta.insert("task_id".into(), task_id.to_string());
+        meta.insert("event_type".into(), "task_ready".into());
+
+        let mut last_err = None;
+        for attempt in 0..3 {
+            let mut w = self.writer.lock().await;
+            match w.produce(&stream, "task_ready", &content, Some(task_id), 0, "application/json", &meta).await {
+                Ok((gid, seq)) => {
+                    tracing::info!("publish_ready_task: task={} type={} stream={} gid={} seq={}",
+                        task_id, task_type, stream, gid, seq);
+                    return Ok(());
+                }
+                Err(e) => {
+                    drop(w);
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        let delay_ms = 100u64 << attempt;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+        Err(AppError::Internal(format!("publish_ready_task after 3 retries: {}", last_err.unwrap())))
+    }
+
     /// 把工具事件发到 sandbox dispatch stream `tools-region-<SANDBOX_REGION>`。
     /// 失败时自动重试(backoff: 100ms → 200ms → 400ms),总共最多 3 次尝试。
     async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {

@@ -211,6 +211,14 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub session_id: Option<String>,
     pub agent_type: String,
+    /// task_type 用于 broker 路由(fixlet 按 task_type 订阅 `tasks-{task_type}` stream)。
+    /// 未设置时 fallback 到 agent_type。
+    #[serde(default)]
+    pub task_type: Option<String>,
+    /// body(fixus opaque):contract / schema_ref / task_brief / acceptance_result。
+    /// nuntius 侧设置,future:task schema 定义后做 schema validation。
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 }
