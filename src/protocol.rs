@@ -208,7 +208,8 @@ pub struct WsFrame {
 /// 创建 Session 请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
-    pub session_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub agent_type: String,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
