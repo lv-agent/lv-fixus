@@ -15,6 +15,7 @@ use chrono::{TimeZone, Utc};
 use logdb_client::{
     Client, QueryRequest, QueryResponse, QueryResult, query_response,
 };
+#[cfg(test)]
 use logdbd_proto::pb::{AbsentMatch, AppendRequest, MetadataFilter};
 use tokio::sync::Mutex;
 
