@@ -232,6 +232,22 @@ fn spawn_agent(config: &FixletConfig) -> Option<(tokio::sync::mpsc::UnboundedSen
 /// fixlet 主循环
 ///
 /// 连接 fixus WebSocket，处理 execute_turn，启动 Agent，双向路由消息。
+/// 把 fixus 的 WebSocket 地址（ws://host:port/ws/fixlet）转成 MCP HTTP 端点
+/// （http://host:port/mcp），用于注册进 ACP session/new 的 mcpServers。
+fn fixus_mcp_url(fixus_url: &str) -> String {
+    let with_http = fixus_url
+        .strip_prefix("wss://")
+        .map(|s| format!("https://{}", s))
+        .or_else(|| fixus_url.strip_prefix("ws://").map(|s| format!("http://{}", s)))
+        .unwrap_or_else(|| fixus_url.to_string());
+    let (scheme, rest) = match with_http.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => return format!("{}/mcp", with_http),
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    format!("{}://{}/mcp", scheme, host_port)
+}
+
 pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tracing::info!("Connecting to fixus at {}", config.fixus_url);
@@ -408,9 +424,19 @@ async fn handle_fixus_message(
                 &et.context.messages,
                 &user_input,
             );
-            let acp_tools = acp::build_acp_tools(&et.tools);
+            // ACP session/prompt 不接受 tools 字段（工具通过 session/new 的 mcpServers 注册）。
+            // 此处传空 vec,future:ACP spec 若支持 prompt-level tools 再恢复。
 
             // 4. 启动新的 Agent 子进程（如果尚未启动或需要重启）
+            //
+            // 已知限制:Agent 进程跨 task 复用。fixlet 首次 execute_turn 时创建 agent 并
+            // session/new,后续 task 复用同一 agent 进程,通过 session/prompt 构造的
+            // session_id。但 claude-agent-acp 不认构造的 session_id(它只认 session/new
+            // 返回的真实 sessionId),导致跨 task 时 X-Fixus-Session-Id header 携带的是
+            // 首个 task 的 id,tools/call 归属到错误 task。
+            //
+            // 当前 workaround:每个 task 重启 fixlet。正确修复:每个 task 做 session/new +
+            // 捕获真实 sessionId,用 map 维护 session_id → task_id 映射。
             if agent_child.is_none() {
                 if let Some((stdin_tx, stdout_rx, child)) = spawn_agent(config) {
                     *agent_stdin = Some(stdin_tx.clone());
@@ -425,6 +451,22 @@ async fn handle_fixus_message(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                     // session/new — 需要 mcpServers 参数，响应中包含真实 sessionId
+                    //
+                    // ACP 的 session/prompt 没有 `tools` 字段（fixus 之前在 session/prompt
+                    // 里塞的 fixus_* 工具定义会被 claude-agent-acp 忽略），模型可见的工具
+                    // 只能来自 session/new 的 mcpServers。这里把 fixus 自身的 /mcp 端点注册
+                    // 进去：claude-agent-acp 连上后通过 tools/list 拿到 fixus_bash 等工具，
+                    // 模型调用时由 claude-agent-acp 发 tools/call 到 fixus /mcp，
+                    // fixus 的 orchestrator.execute_tool 执行（WAL + sandbox）。
+                    //
+                    // task_id 通过 X-Fixus-Session-Id header 注入：fixus /mcp 的 tools/call
+                    // 靠这个 header 把工具调用归属到正确的 task。fixlet 在此时知道 task_id
+                    //（= et.session_id），且同一 task 的所有 turn 共用同一 task_id。
+                    let fixus_mcp = fixus_mcp_url(&config.fixus_url);
+                    tracing::info!(
+                        "Registering fixus MCP server for task {}: {}",
+                        et.session_id, fixus_mcp
+                    );
                     let session_new_id = acp.next_req_id();
                     let session_new_msg = serde_json::json!({
                         "jsonrpc": "2.0",
@@ -432,7 +474,14 @@ async fn handle_fixus_message(
                         "method": "session/new",
                         "params": {
                             "cwd": config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into()),
-                            "mcpServers": []
+                            "mcpServers": [{
+                                "type": "http",
+                                "name": "fixus",
+                                "url": fixus_mcp,
+                                "headers": [
+                                    {"name": "X-Fixus-Session-Id", "value": et.session_id}
+                                ]
+                            }]
                         }
                     });
                     acp.send_raw(&session_new_msg.to_string());
@@ -468,7 +517,7 @@ async fn handle_fixus_message(
                     let real_sid = real_session_id
                         .unwrap_or_else(|| format!("fixus:{}:turn_{}", et.session_id, et.turn_id));
 
-                    acp.session_prompt(&real_sid, prompt_blocks, acp_tools);
+                    acp.session_prompt(&real_sid, prompt_blocks, vec![]);
                 } else {
                     let error_msg = FixletToFixus::TurnExecutionError {
                         session_id: et.session_id,
@@ -486,7 +535,7 @@ async fn handle_fixus_message(
                 acp.session_prompt(
                     &format!("{}:turn_{}", et.session_id, et.turn_id),
                     prompt_blocks,
-                    acp_tools,
+                    vec![],
                 );
             }
         }

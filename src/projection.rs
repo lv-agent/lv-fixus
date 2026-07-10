@@ -383,7 +383,7 @@ impl ProjectionCache {
         drop(proj_guard); // 释放写锁,消费 async 不持锁
 
         let mut caught_up: HashSet<u32> = HashSet::new();
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() { break; }

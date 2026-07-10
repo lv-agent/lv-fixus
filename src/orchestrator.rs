@@ -8,6 +8,7 @@
 //! 这是把 fixus、fixlet、sandbox 串成完整闭环的中心组件。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,12 +72,13 @@ fn canonical_json(value: &serde_json::Value) -> String {
     }
 }
 
-/// 首字母大写
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+/// 工具默认超时(秒):Bash 30s,文件工具 15s,未知工具 30s。
+fn default_tool_timeout(tool_name: &str) -> u64 {
+    let name = tool_name.strip_prefix("fixus_").unwrap_or(tool_name).to_lowercase();
+    match name.as_str() {
+        "bash" => 30,
+        "read" | "write" | "edit" | "glob" | "grep" => 15,
+        _ => 30,
     }
 }
 
@@ -91,6 +93,20 @@ pub struct PendingToolResult {
     pub duration_ms: u64,
 }
 
+/// 依赖健康状态
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthStatus {
+    pub fixus: &'static str,
+    pub broker: DependencyHealth,
+    pub sandbox: DependencyHealth,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DependencyHealth {
+    pub status: &'static str, // "ok" | "degraded" | "unknown"
+    pub last_ok_secs_ago: Option<u64>,
+}
+
 /// Turn 编排器
 pub struct Orchestrator {
     store: Arc<dyn EventStore>,
@@ -101,6 +117,12 @@ pub struct Orchestrator {
     token_publisher: crate::stream::TokenPublisher,
     /// 等待 sandbox 结果的 pending channel(step_id → sender)
     pending_results: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<PendingToolResult>>>>,
+    /// 项目工作目录(SANDBOX_WORKSPACE env 或 current_dir),注入 dispatch payload 供 sandbox-server 路径校验
+    work_dir: PathBuf,
+    /// 最近一次成功 dispatch 时间(用于健康检查)
+    last_dispatch_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// 最近一次收到 sandbox 结果的时间(用于健康检查)
+    last_result_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// 异步 Turn 启动结果(`start_turn_async`)
@@ -133,18 +155,99 @@ impl Orchestrator {
         registry: Arc<TaskRegistry>,
         token_publisher: crate::stream::TokenPublisher,
     ) -> Self {
+        let work_dir = std::env::var("SANDBOX_WORKSPACE")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        tracing::info!("orchestrator work_dir={}", work_dir.display());
         Self {
             store,
             registry,
             turn_timeout: Duration::from_secs(300),
             token_publisher,
             pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            work_dir,
+            last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
+            last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     /// 取走 pending 通道(用于 result 端点)。返回 None 表示 step_id 未在等待。
     pub async fn take_pending_result(&self, step_id: &str) -> Option<oneshot::Sender<PendingToolResult>> {
         self.pending_results.lock().await.remove(step_id)
+    }
+
+    /// 返回依赖健康状态。
+    /// - broker: 基于最近一次成功 dispatch 的时间(>2min 未 dispatch → degraded)
+    /// - sandbox: 基于最近一次收到结果的时间(>2min 未收到 → degraded)
+    pub async fn health(&self) -> HealthStatus {
+        let now = std::time::Instant::now();
+        let dispatch_ago = self.last_dispatch_ok.lock().await.map(|t| now.duration_since(t).as_secs());
+        let result_ago = self.last_result_ok.lock().await.map(|t| now.duration_since(t).as_secs());
+
+        let broker_status = match dispatch_ago {
+            None => "unknown",
+            Some(s) if s < 120 => "ok",
+            Some(_) => "degraded",
+        };
+        let sandbox_status = match result_ago {
+            None => "unknown",
+            Some(s) if s < 120 => "ok",
+            Some(_) => "degraded",
+        };
+
+        HealthStatus {
+            fixus: "ok",
+            broker: DependencyHealth { status: broker_status, last_ok_secs_ago: dispatch_ago },
+            sandbox: DependencyHealth { status: sandbox_status, last_ok_secs_ago: result_ago },
+        }
+    }
+
+    /// 启动 broker result consumer 后台任务。
+    ///
+    /// 消费 `tool-results-region-<region>` stream,将 sandbox-server 回传的工具结果
+    /// 路由到 `pending_results` 中对应 step_id 的 oneshot channel。
+    ///
+    /// sandbox-server 通过 broker produce 结果,fixus 通过 broker consume 结果——
+    /// 对称架构,双方只与 broker 对话,无需 HTTP 直连。
+    pub fn spawn_result_consumer(
+        self: &Arc<Self>,
+        broker_addr: &str,
+        namespace: &str,
+        region: &str,
+    ) {
+        let orch = self.clone();
+        let stream = format!("tool-results-region-{}", region);
+        let broker_addr = broker_addr.to_string();
+        let namespace = namespace.to_string();
+        // 每次启动用唯一 group 名,避免旧实例的 stale consumer member 占 shard(TODO: 未来 fixus 需做 HA 时改为多成员共享 group)
+        let instance_id = uuid::Uuid::now_v7().to_string().replace('-', "");
+        let group = format!("fixus-results-{}", &instance_id[..12]);
+
+        tokio::spawn(async move {
+            let consumer_id = format!("fixus-result-{}", instance_id);
+            tracing::info!(
+                "result consumer starting: broker={} stream={} group={} consumer={}",
+                broker_addr, stream, group, consumer_id
+            );
+
+            loop {
+                match run_result_consumer(&orch, &broker_addr, &namespace, &stream, &group, &consumer_id)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!("result consumer ended normally");
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::error!("result consumer error: {}; retrying in 1s", msg);
+                        drop(msg);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     }
 
     /// 解析 session 的 task_type(用于按 task_type 路由到 fixlet)。
@@ -390,6 +493,9 @@ impl Orchestrator {
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
             pending_results: self.pending_results.clone(),
+            work_dir: PathBuf::from("/tmp"),
+            last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
+            last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let sid = task_id.to_string();
         let ui = user_input.to_string();
@@ -444,6 +550,9 @@ impl Orchestrator {
                 turn_timeout,
                 token_publisher,
                 pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                work_dir: PathBuf::from("/tmp"),
+                last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
+                last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
             };
 
             let mut redo_success = 0;
@@ -628,14 +737,21 @@ impl Orchestrator {
 
         let msg = serde_json::json!({
             "type": "execute_turn",
-            "task_id": task_id,
+            "session_id": task_id,
             "turn_id": turn_id,
             "input": {"user_input": &user_input_with_cache},
             "context": {
                 "summary": ctx.summary,
                 "messages": ctx.messages,
             },
-            "tools": [],  // TODO: 从 session 配置或工具注册表获取
+            "tools": [
+                {"name":"fixus_Bash","description":"Execute a shell command (via fixus sandbox)","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"description":{"type":"string","description":"Brief description"}},"required":["command"]}},
+                {"name":"fixus_Read","description":"Read a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"]}},
+                {"name":"fixus_Write","description":"Write to a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}},
+                {"name":"fixus_Edit","description":"Edit a file by replacing a string","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["file_path","old_string","new_string"]}},
+                {"name":"fixus_Glob","description":"Find files matching a pattern","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
+                {"name":"fixus_Grep","description":"Search for a pattern in files","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}
+            ],
             "redo_group": redo_group,
             "redo_count": redo_count,
         });
@@ -667,6 +783,86 @@ impl Orchestrator {
     /// 2. 调度 Sandbox 执行
     /// 3. WAL: 写 tool_completed 或 tool_failed
     /// 4. 回传 tool_result 给 fixlet
+    /// 公共:WAL 写 tool_invoked → dispatch 到 broker → 等 sandbox-server 回传结果(60s)
+    ///
+    /// 被 `handle_tool_invoked`(fixlet execute_turn 路径)与 `execute_tool`(/mcp 路径)共用。
+    /// 工具实际执行发生在 sandbox-server(独立进程,Bash 走 Landlock),fixus 不再有进程内沙箱。
+    ///
+    /// `timeout_secs`: fixus 等待 sandbox 结果的超时(秒)。sandbox-server 的执行超时设为
+    /// `timeout_secs - 5`(最小 5s),确保 sandbox 先放弃,避免 fixus 已超时移除了 channel
+    /// 但 sandbox 还在执行浪费资源。
+    async fn dispatch_and_wait(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+        idempotency_key: &str,
+        input: &serde_json::Value,
+        local_seq: i64,
+        timeout_secs: u64,
+    ) -> Result<PendingToolResult> {
+        tracing::info!(
+            "session {}: tool_invoked {} step_id={} idempotency_key={}",
+            task_id,
+            tool_name,
+            step_id,
+            idempotency_key
+        );
+
+        // 1. WAL: 写 tool_invoked(捕获 seq + payload 用于 dispatch)
+        //    work_dir + timeout_ms 注入 payload —— sandbox-server 用它们做路径校验和执行超时
+        let sandbox_timeout_ms = timeout_secs.saturating_sub(5).max(5) * 1000; // sandbox 先于 fixus 放弃
+        let work_dir_str = self.work_dir.to_str();
+        let event = service::record_tool_invoked(
+            &*self.store, task_id, turn_id, step_id, tool_name, tool_call_id, idempotency_key, input, None, local_seq, work_dir_str, Some(sandbox_timeout_ms),
+        ).await?;
+
+        // 2. 先注册 pending channel —— 必须在 dispatch 之前!
+        //    否则 sandbox-server 可能在 fixus 注册 oneshot 之前就消费+POST 回结果,
+        //    导致 take_pending_result 找不到 channel(竞态)→ oneshot 永不兑现 → 60s 超时。
+        let (tx, mut rx) = oneshot::channel::<PendingToolResult>();
+        {
+            let mut pending = self.pending_results.lock().await;
+            let pending_count = pending.len();
+            if pending_count >= 8 {
+                tracing::warn!(
+                    "session {}: {} pending tool dispatches — sandbox may be overloaded",
+                    task_id, pending_count
+                );
+            }
+            pending.insert(step_id.to_string(), tx);
+        }
+
+        // 3. Dispatch 到 sandbox dispatch stream(broker consumer group 分发给 sandbox-server)
+        let dispatch_res = self.store.dispatch_tool(task_id, &AgentEvent {
+            task_id: task_id.into(), seq: event.seq, turn_id, step_id: Some(step_id.into()),
+            event_type: crate::models::EventType::ToolInvoked, schema_version: 1, payload: event.payload.clone(),
+            created_at: chrono::Utc::now(),
+        }).await;
+        if let Err(e) = dispatch_res {
+            self.pending_results.lock().await.remove(step_id);
+            return Err(e);
+        }
+        // 记录成功 dispatch 时间(用于健康检查)
+        *self.last_dispatch_ok.lock().await = Some(std::time::Instant::now());
+
+        // 4. 等 sandbox-server 回传结果(or timeout)
+        let timeout_dur = Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(timeout_dur, &mut rx).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(_)) => {
+                self.pending_results.lock().await.remove(step_id);
+                Err(AppError::Internal("pending channel closed".into()))
+            }
+            Err(_) => {
+                self.pending_results.lock().await.remove(step_id);
+                Err(AppError::Internal(format!("sandbox timeout after {}s", timeout_dur.as_secs())))
+            }
+        }
+    }
+
     pub async fn handle_tool_invoked(
         &self,
         task_id: &str,
@@ -678,40 +874,11 @@ impl Orchestrator {
         idempotency_key: &str,
         input: &serde_json::Value,
     ) -> Result<()> {
-        tracing::info!(
-            "session {}: tool_invoked {} step_id={} idempotency_key={}",
-            task_id,
-            tool_name,
-            step_id,
-            idempotency_key
-        );
+        let result = self
+            .dispatch_and_wait(task_id, Some(turn_id), step_id, tool_name, tool_call_id, idempotency_key, input, local_seq, default_tool_timeout(tool_name))
+            .await?;
 
-        // 1. WAL: 写 tool_invoked
-        let event = service::record_tool_invoked(
-            &*self.store, task_id, Some(turn_id), step_id, tool_name, tool_call_id, idempotency_key, input, None, local_seq,
-        ).await?;
-
-        // 2. Dispatch 到 sandbox dispatch stream(broker consumer group 分发给 sandbox worker)
-        self.store.dispatch_tool(task_id, &AgentEvent {
-            task_id: task_id.into(), seq: event.seq, turn_id: Some(turn_id), step_id: Some(step_id.into()),
-            event_type: crate::models::EventType::ToolInvoked, schema_version: 1, payload: event.payload.clone(),
-            created_at: chrono::Utc::now(),
-        }).await?;
-
-        // 3. 创建 pending channel,等待 sandbox 回传结果(or timeout)
-        let (tx, mut rx) = oneshot::channel::<PendingToolResult>();
-        self.pending_results.lock().await.insert(step_id.to_string(), tx);
-        let timeout_dur = Duration::from_secs(60);
-        let result = match tokio::time::timeout(timeout_dur, &mut rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => return Err(AppError::Internal("pending channel closed".into())),
-            Err(_) => {
-                self.pending_results.lock().await.remove(step_id);
-                return Err(AppError::Internal(format!("sandbox timeout after {}s", timeout_dur.as_secs())));
-            }
-        };
-
-        // 4. WAL + relay
+        // WAL terminal + relay 给 fixlet
         if result.success {
             service::record_tool_completed(&*self.store, task_id, Some(turn_id), step_id, tool_call_id, &result.output, false, local_seq).await?;
         } else {
@@ -1020,88 +1187,34 @@ impl Orchestrator {
 
         let step_id = Uuid::now_v7().to_string();
         let active_turn = self.store.get_max_turn_id(task_id).await?;
-
-        // 将 fixus_* 映射为原生工具名
-        let native_tool: String = tool_name
-            .strip_prefix("fixus_")
-            .map(|s| capitalize_first(s))
-            .unwrap_or_else(|| tool_name.to_string());
-
-        // 生成 idempotency_key
+        let turn_id = if active_turn > 0 { Some(active_turn) } else { None };
         let idempotency_key = build_tool_idempotency_key(task_id, tool_name, args);
 
         tracing::info!(
-            "session {}: executing tool {} (native={}) idempotency_key={}",
+            "session {}: executing tool {} idempotency_key={}",
             task_id,
             tool_name,
-            native_tool,
             idempotency_key
         );
 
-        // 1. WAL: tool_invoked
-        let turn_id = if active_turn > 0 {
-            Some(active_turn)
-        } else {
-            None
-        };
-        service::record_tool_invoked(
-            &*self.store,
-            task_id,
-            turn_id,
-            &step_id,
-            tool_name,
-            tool_call_id,
-            &idempotency_key,
-            args,
-            None,
-            0,
-        )
-        .await?;
-
-        // 2. Sandbox 执行
-        let exec_result = crate::sandbox::execute_tool(crate::sandbox::ExecuteRequest {
-            tool_name: native_tool.to_string(),
-            tool_call_id: tool_call_id.to_string(),
-            idempotency_key: idempotency_key.clone(),
-            input: args.clone(),
-            timeout_ms: 30_000,
-        })
-        .await;
-
-        // 3. WAL: tool_terminal
-        if exec_result.success {
-            service::record_tool_completed(
-                &*self.store,
-                task_id,
-                turn_id,
-                &step_id,
-                tool_call_id,
-                &exec_result.output,
-                false,
-                0,
-            )
+        // 走 broker→sandbox-server(fixus 不再有进程内沙箱;fixus_ 前缀由 sandbox-server strip)
+        let result = self
+            .dispatch_and_wait(task_id, turn_id, &step_id, tool_name, tool_call_id, &idempotency_key, args, 0, default_tool_timeout(tool_name))
             .await?;
+
+        // WAL: tool_terminal
+        if result.success {
+            service::record_tool_completed(&*self.store, task_id, turn_id, &step_id, tool_call_id, &result.output, false, 0).await?;
         } else {
-            let error_msg = exec_result.error.clone().unwrap_or_default();
-            service::record_tool_failed(
-                &*self.store,
-                task_id,
-                turn_id,
-                &step_id,
-                tool_call_id,
-                "sandbox_execution_error",
-                &error_msg,
-                true,
-                1,
-                0,
-            )
-            .await?;
+            let error_msg = result.error.clone().unwrap_or_default();
+            service::record_tool_failed(&*self.store, task_id, turn_id, &step_id, tool_call_id,
+                "sandbox_execution_error", &error_msg, true, 1, 0).await?;
         }
 
         Ok(ToolExecuteResult {
-            success: exec_result.success,
-            output: exec_result.output,
-            duration_ms: exec_result.duration_ms,
+            success: result.success,
+            output: result.output,
+            duration_ms: result.duration_ms,
         })
     }
 
@@ -1145,6 +1258,109 @@ impl Orchestrator {
 
         Ok(outcome)
     }
+}
+
+// ── Broker Result Consumer ─────────────────────────────────────────────
+
+/// 后台消费 `tool-results-region-<region>` stream,将 sandbox-server 回传的工具结果
+/// 路由到 orchestrator 的 `pending_results` oneshot channel。
+async fn run_result_consumer(
+    orch: &Arc<Orchestrator>,
+    broker_addr: &str,
+    namespace: &str,
+    stream: &str,
+    group: &str,
+    consumer_id: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use logdb_broker_proto::pb::consume_response::Payload;
+    use logdb_client::broker::GroupConsumer;
+    use tokio_stream::StreamExt;
+
+    let mut consumer = GroupConsumer::join(
+        format!("http://{}", broker_addr),
+        namespace,
+        stream,
+        group,
+        consumer_id,
+    )
+    .await
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    tracing::info!(
+        "result consumer joined {} ({}), assigned shards: {:?}",
+        group,
+        consumer_id,
+        consumer.assigned_shards()
+    );
+
+    let mut frames = consumer
+        .consume_frames()
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    // 连续错误计数器:达到阈值时认为 stream 已断,跳出循环让外层 rejoin
+    let mut consecutive_errors: u32 = 0;
+    while let Some(item) = frames.next().await {
+        let frame = match item {
+            Ok(f) => {
+                consecutive_errors = 0;
+                f
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                tracing::error!("result consume error (consecutive={}): {}", consecutive_errors, e);
+                if consecutive_errors >= 3 {
+                    return Err(format!("result consumer: {} consecutive consume errors, rejoining", consecutive_errors).into());
+                }
+                continue;
+            }
+        };
+        match frame.payload {
+            Some(Payload::Record(rec)) => {
+                if rec.event_type != "tool_result" {
+                    continue;
+                }
+                let result: serde_json::Value =
+                    serde_json::from_slice(&rec.content).unwrap_or_default();
+                let step_id = result["step_id"].as_str().unwrap_or("");
+                if step_id.is_empty() {
+                    tracing::warn!("result record missing step_id");
+                    continue;
+                }
+
+                let pending = PendingToolResult {
+                    success: result["success"].as_bool().unwrap_or(false),
+                    output: result["output"].clone(),
+                    error: result["error"].as_str().map(|s| s.to_string()),
+                    duration_ms: result["duration_ms"].as_u64().unwrap_or(0),
+                };
+
+                tracing::info!(
+                    "result consumer: step_id={} success={} duration_ms={}",
+                    step_id,
+                    pending.success,
+                    pending.duration_ms
+                );
+
+                if let Some(tx) = orch.take_pending_result(step_id).await {
+                    let _ = tx.send(pending);
+                    // 记录成功收到结果的时间(用于健康检查)
+                    *orch.last_result_ok.lock().await = Some(std::time::Instant::now());
+                } else {
+                    tracing::warn!(
+                        "no pending channel for step_id {} (already timed out or completed)",
+                        step_id
+                    );
+                }
+
+                let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+            }
+            Some(Payload::CaughtUp(_))
+            | Some(Payload::Rebalance(_))
+            | Some(Payload::Assignment(_)) => {}
+            None => {}
+        }
+    }
+    consumer.leave().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    Ok(())
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
@@ -1341,5 +1557,108 @@ mod tests {
             store_arc.get_task_state(&tid).await.unwrap(),
             Some(TaskState::Created)
         );
+    }
+
+    // ── #74: work_dir 相关测试 ──────────────────────────────────────────
+
+    #[test]
+    fn default_tool_timeout_bash_30s() {
+        assert_eq!(default_tool_timeout("fixus_Bash"), 30);
+        assert_eq!(default_tool_timeout("Bash"), 30);
+        assert_eq!(default_tool_timeout("bash"), 30);
+    }
+
+    #[test]
+    fn default_tool_timeout_file_tools_15s() {
+        for name in &["fixus_Read", "fixus_Write", "fixus_Edit", "fixus_Glob", "fixus_Grep"] {
+            assert_eq!(default_tool_timeout(name), 15, "failed for {}", name);
+        }
+    }
+
+    #[test]
+    fn default_tool_timeout_unknown_30s() {
+        assert_eq!(default_tool_timeout("fixus_unknown"), 30);
+    }
+
+    #[tokio::test]
+    async fn orchestrator_new_has_work_dir_default() {
+        let (store, _d) = setup().await;
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(Arc::new(store), registry, tp);
+        // work_dir should be a valid PathBuf (current_dir or /tmp fallback)
+        assert!(!orch.work_dir.as_os_str().is_empty());
+    }
+
+    // ── #77: Health 相关测试 ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_status_all_unknown_when_fresh() {
+        let (store, _d) = setup().await;
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(Arc::new(store), registry, tp);
+        let h = orch.health().await;
+        assert_eq!(h.fixus, "ok");
+        assert_eq!(h.broker.status, "unknown");
+        assert_eq!(h.sandbox.status, "unknown");
+        assert!(h.broker.last_ok_secs_ago.is_none());
+        assert!(h.sandbox.last_ok_secs_ago.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_status_transitions_after_tracking() {
+        let (store, _d) = setup().await;
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(Arc::new(store), registry, tp);
+
+        // Initially unknown
+        let h = orch.health().await;
+        assert_eq!(h.broker.status, "unknown");
+
+        // Simulate successful dispatch
+        *orch.last_dispatch_ok.lock().await = Some(std::time::Instant::now());
+        let h = orch.health().await;
+        assert_eq!(h.broker.status, "ok");
+        assert!(h.broker.last_ok_secs_ago.unwrap() < 2);
+
+        // Simulate result received
+        *orch.last_result_ok.lock().await = Some(std::time::Instant::now());
+        let h = orch.health().await;
+        assert_eq!(h.sandbox.status, "ok");
+    }
+
+    // ── Idempotency key 稳定性测试 ──────────────────────────────────────
+
+    #[test]
+    fn canonical_json_deterministic() {
+        let a = serde_json::json!({"b": 1, "a": 2});
+        let b = serde_json::json!({"a": 2, "b": 1});
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn idempotency_key_stable_for_same_input() {
+        let args = serde_json::json!({"command": "echo hello"});
+        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
+        let k2 = build_tool_idempotency_key("task1", "Bash", &args);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn idempotency_key_differs_per_task() {
+        let args = serde_json::json!({"command": "echo hello"});
+        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
+        let k2 = build_tool_idempotency_key("task2", "Bash", &args);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn idempotency_key_differs_per_tool() {
+        let args = serde_json::json!({"command": "echo hello"});
+        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
+        let k2 = build_tool_idempotency_key("task1", "Read", &args);
+        assert_ne!(k1, k2);
     }
 }

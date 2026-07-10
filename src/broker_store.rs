@@ -186,8 +186,7 @@ impl EventStore for BrokerEventStore {
             .await.map_err(|e| AppError::Internal(format!("broker produce: {}", e)))?;
         let event = AgentEvent { task_id: task_id.clone(), seq: seq as i64, turn_id: None, step_id: None,
             event_type: EventType::TaskCreated, schema_version: 1, payload, created_at: chrono::Utc::now() };
-        // 立即入缓存,后续 task_exists / write_event 才查得到
-        let _ = self.cache.catch_up(&task_id, &self.broker_addr, &self.namespace).await;
+        // 延迟入缓存:forwarder 异步 tail,首次 get_task/get_task_state 懒 catch_up
         Ok((task_id, event))
     }
 
@@ -259,7 +258,8 @@ impl EventStore for BrokerEventStore {
         self.with_projection(task_id, |p| Some(p.state)).await
     }
     async fn task_exists(&self, task_id: &str) -> Result<bool> {
-        Ok(self.cache.get(task_id).await.is_some())
+        if self.cache.get(task_id).await.is_some() { return Ok(true); }
+        Ok(self.ensure_projection(task_id).await.is_ok()) // 懒 catch_up
     }
     async fn is_task_ended(&self, task_id: &str) -> Result<bool> {
         self.with_projection(task_id, |p| p.state.is_terminal()).await
@@ -329,15 +329,33 @@ impl EventStore for BrokerEventStore {
     }
 
     /// 把工具事件发到 sandbox dispatch stream `tools-region-<SANDBOX_REGION>`。
+    /// 失败时自动重试(backoff: 100ms → 200ms → 400ms),总共最多 3 次尝试。
     async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {
         let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
         let stream = format!("tools-region-{}", region);
         let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let meta = event_meta(event);
-        let mut w = self.writer.lock().await;
-        w.produce(&stream, event.event_type.as_str(), &content, Some(task_id), 0, "application/json", &meta)
-            .await.map_err(|e| AppError::Internal(format!("dispatch: {}", e)))?;
-        Ok(())
+
+        let mut last_err = None;
+        for attempt in 0..3 {
+            let mut w = self.writer.lock().await;
+            match w.produce(&stream, event.event_type.as_str(), &content, Some(task_id), 0, "application/json", &meta).await {
+                Ok((gid, seq)) => {
+                    tracing::debug!("dispatch_tool: gid={} seq={} (attempt {})", gid, seq, attempt + 1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    drop(w); // 释放锁,重试时重新获取
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        let delay_ms = 100u64 << attempt; // 100, 200, 400
+                        tracing::warn!("dispatch_tool retry {}/3 after {}ms: {}", attempt + 1, delay_ms, last_err.as_ref().unwrap());
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+        Err(AppError::Internal(format!("dispatch after 3 retries: {}", last_err.unwrap())))
     }
 }
 

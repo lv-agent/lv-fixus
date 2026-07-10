@@ -497,6 +497,8 @@ pub async fn record_tool_invoked(
     input: &serde_json::Value,
     parent_step_id: Option<&str>,
     local_seq: i64,
+    work_dir: Option<&str>,
+    timeout_ms: Option<u64>,
 ) -> Result<AgentEvent> {
     let mut payload_map = serde_json::json!({
         "step_type": "tool_call",
@@ -509,6 +511,12 @@ pub async fn record_tool_invoked(
 
     if let Some(psid) = parent_step_id {
         payload_map["parent_step_id"] = serde_json::json!(psid);
+    }
+    if let Some(wd) = work_dir {
+        payload_map["work_dir"] = serde_json::json!(wd);
+    }
+    if let Some(tmo) = timeout_ms {
+        payload_map["timeout_ms"] = serde_json::json!(tmo);
     }
 
     let event = AgentEvent::new(

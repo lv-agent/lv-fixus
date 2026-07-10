@@ -115,6 +115,8 @@ pub struct SessionNewParams {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: Option<Value>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// session/prompt 方法参数
@@ -411,9 +413,11 @@ impl AcpClient {
 
     /// 创建新 session
     pub fn session_new(&mut self, cwd: Option<&str>) {
+        let model = std::env::var("ANTHROPIC_MODEL").ok();
         let params = serde_json::to_value(SessionNewParams {
             cwd: cwd.map(|s| s.to_string()),
             env: None,
+            model,
         })
         .unwrap();
 

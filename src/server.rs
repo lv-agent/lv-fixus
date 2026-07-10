@@ -35,6 +35,9 @@ pub struct AppState {
     pub store: Arc<dyn EventStore>,
     pub registry: Arc<TaskRegistry>,
     pub token_publisher: Arc<crate::stream::TokenPublisher>,
+    /// 共享的 Orchestrator 实例 —— 必须全进程唯一,否则 pending_results(oneshot map)
+    /// 会因 execute_tool 与 tool_result_handler 拿到不同实例而无法兑现,导致工具结果丢失。
+    pub orchestrator: Arc<Orchestrator>,
 }
 
 // ── 错误转换 ────────────────────────────────────────────────────────────
@@ -81,10 +84,20 @@ pub async fn start() -> Result<(), AppError> {
 
     let registry = TaskRegistry::new();
     let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
+    let orchestrator = Arc::new(Orchestrator::new(
+        store.clone(),
+        registry.clone(),
+        (*token_publisher).clone(),
+    ));
+    // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
+    let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
+    orchestrator.spawn_result_consumer(&broker_addr, &namespace, &region);
+
     let state = AppState {
         store,
         registry,
         token_publisher,
+        orchestrator,
     };
     let app = build_router(state);
 
@@ -119,13 +132,9 @@ fn stream_url_for(task_id: &str, turn_id: i64) -> Option<String> {
     })
 }
 
-/// 从 AppState 创建 Orchestrator
-fn orchestrator(state: &AppState) -> Orchestrator {
-    Orchestrator::new(
-        state.store.clone(),
-        state.registry.clone(),
-        (*state.token_publisher).clone(),
-    )
+/// 从 AppState 获取共享的 Orchestrator(全进程唯一实例,pending_results 跨 handler 共享)
+fn orchestrator(state: &AppState) -> Arc<Orchestrator> {
+    state.orchestrator.clone()
 }
 
 /// 构建 Axum Router
@@ -200,7 +209,6 @@ pub fn build_router(state: AppState) -> Router {
         // MCP
         .route("/mcp", post(handle_mcp))
         // Health
-        .route("/api/v1/tools/result", post(tool_result_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -774,7 +782,7 @@ async fn handle_fixlet_ws(
 
                                 // Agent 请求执行 Tool
                                 "tool_invoked" => {
-                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let step_id = parsed["step_id"].as_str().unwrap_or("");
                                     let local_seq = parsed["local_seq"].as_i64().unwrap_or(0);
@@ -793,7 +801,7 @@ async fn handle_fixlet_ws(
 
                                 // Agent 完成 Turn
                                 "turn_execution_done" => {
-                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let max_local_seq = parsed["max_local_seq"].as_i64().unwrap_or(0);
                                     let final_output = parsed["final_output"].as_str().unwrap_or("");
@@ -807,7 +815,7 @@ async fn handle_fixlet_ws(
 
                                 // Agent 进程异常退出
                                 "turn_execution_error" => {
-                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let error_type = parsed["error_type"].as_str().unwrap_or("unknown");
                                     let error_message = parsed["error_message"].as_str().unwrap_or("");
@@ -821,7 +829,7 @@ async fn handle_fixlet_ws(
 
                                 // LLM 流式 token（实时转发）
                                 "llm_chunk" => {
-                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let text = parsed["text"].as_str().unwrap_or("");
                                     let _ = orch.handle_llm_chunk(task_id, turn_id, text).await;
@@ -829,7 +837,7 @@ async fn handle_fixlet_ws(
 
                                 // LLM 调用完成（含 token 用量）
                                 "llm_completed" => {
-                                    let task_id = parsed["task_id"].as_str().unwrap_or("");
+                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
                                     let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
                                     let model = parsed["model"].as_str().unwrap_or("");
                                     let input_tokens = parsed["input_tokens"].as_i64().unwrap_or(0);
@@ -927,9 +935,23 @@ async fn handle_mcp(
     headers: axum::http::HeaderMap,
     Json(body): Json<McpRequest>,
 ) -> Json<McpResponse> {
+    let sid_hdr = headers
+        .get("X-Fixus-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("(none)");
+    tracing::info!(
+        "MCP /mcp request: method={} id={:?} X-Fixus-Session-Id={}",
+        body.method, body.id, sid_hdr
+    );
     match body.method.as_str() {
-        "initialize" => Json(mcp_initialize(body.id)),
-        "tools/list"  => Json(mcp_tools_list(body.id)),
+        "initialize" => {
+            tracing::info!("MCP initialize -> returning serverInfo");
+            Json(mcp_initialize(body.id))
+        }
+        "tools/list"  => {
+            tracing::debug!("MCP tools/list -> returning 6 fixus tools");
+            Json(mcp_tools_list(body.id))
+        }
         "tools/call"  => {
             // 从 X-Fixus-Session-Id header 获取 task_id
             let task_id = headers
@@ -942,19 +964,26 @@ async fn handle_mcp(
                 .and_then(|p| p.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
+            // ACP MCP tools/call 的 toolCallId 可能不在 params 顶层(在 _meta 中或缺失)。
+            // 此时生成 UUID v7 作为 tool_call_id,确保事件链路可追溯。
             let tool_call_id = params
                 .and_then(|p| p.get("_meta"))
                 .and_then(|m| m.get("toolCallId"))
                 .and_then(|v| v.as_str())
                 .or_else(|| params.and_then(|p| p.get("toolCallId")).and_then(|v| v.as_str()))
-                .unwrap_or("unknown");
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
             let args = params
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
             let orch = orchestrator(&state);
-            match orch.execute_tool(task_id, tool_name, tool_call_id, &args).await {
+            tracing::info!(
+                "MCP tools/call: task_id={} tool={} tool_call_id={}",
+                task_id, tool_name, tool_call_id
+            );
+            match orch.execute_tool(task_id, tool_name, &tool_call_id, &args).await {
                 Ok(result) => Json(mcp_tool_result(
                     body.id,
                     &result.output,
@@ -1008,7 +1037,7 @@ fn mcp_tools_list(id: Option<i64>) -> McpResponse {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "file_path": {"type": "string", "description": "Absolute path to the file"},
+                            "file_path": {"type": "string", "description": "Path to the file (relative or absolute, scoped to workspace)"},
                             "offset": {"type": "integer", "description": "Line number to start reading from"},
                             "limit": {"type": "integer", "description": "Number of lines to read"}
                         },
@@ -1021,7 +1050,7 @@ fn mcp_tools_list(id: Option<i64>) -> McpResponse {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "file_path": {"type": "string", "description": "Absolute path to the file"},
+                            "file_path": {"type": "string", "description": "Path to the file (relative or absolute, scoped to workspace)"},
                             "content": {"type": "string", "description": "Content to write"}
                         },
                         "required": ["file_path", "content"]
@@ -1033,7 +1062,7 @@ fn mcp_tools_list(id: Option<i64>) -> McpResponse {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "file_path": {"type": "string", "description": "Absolute path to the file"},
+                            "file_path": {"type": "string", "description": "Path to the file (relative or absolute, scoped to workspace)"},
                             "old_string": {"type": "string", "description": "Text to replace"},
                             "new_string": {"type": "string", "description": "Text to replace it with"}
                         },
@@ -1098,37 +1127,12 @@ fn mcp_error(id: Option<i64>, code: i64, message: &str) -> McpResponse {
 
 // ── Health Handler ──────────────────────────────────────────────────────
 
-/// POST /api/v1/tools/result — sandbox 回传工具执行结果(跨 DC,需鉴权 Plan D 后续)。
-async fn tool_result_handler(
+async fn health_handler(
     State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    let step_id = body.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
-    let success = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-    let output = body.get("output").cloned().unwrap_or(serde_json::Value::Null);
-    let error = body.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let duration_ms = body.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    if step_id.is_empty() {
-        return Err(AppError::Validation("step_id required".into()));
-    }
-
+) -> Json<ApiResponse<crate::orchestrator::HealthStatus>> {
     let orch = orchestrator(&state);
-    match orch.take_pending_result(step_id).await {
-        Some(tx) => {
-            let res = crate::orchestrator::PendingToolResult { success, output, error, duration_ms };
-            let _ = tx.send(res);
-            Ok(Json(ApiResponse::ok(serde_json::json!({ "ack": true }))))
-        }
-        None => {
-            tracing::warn!("no pending result channel for step_id {}", step_id);
-            Ok(Json(ApiResponse::err("no pending tool for that step_id")))
-        }
-    }
-}
-
-async fn health_handler() -> Json<ApiResponse<&'static str>> {
-    Json(ApiResponse::ok("ok"))
+    let health = orch.health().await;
+    Json(ApiResponse::ok(health))
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
@@ -1197,10 +1201,16 @@ mod tests {
         let store: Arc<dyn EventStore> = Arc::new(LogdbdEventStore::connect(&addr, "fixus-srv-test").await.unwrap());
         let registry = TaskRegistry::new();
         let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
+        let orchestrator = Arc::new(Orchestrator::new(
+            store.clone(),
+            registry.clone(),
+            (*token_publisher).clone(),
+        ));
         let state = AppState {
             store,
             registry: registry.clone(),
             token_publisher,
+            orchestrator,
         };
         (state, registry, dir)
     }
