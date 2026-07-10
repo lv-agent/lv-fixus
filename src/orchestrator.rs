@@ -1591,6 +1591,82 @@ mod tests {
         );
     }
 
+    // ── #84: Broker claim HTTP 测试 ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_claim_http_granted_writes_claimed() {
+        let (store, _d) = setup().await;
+        let store_arc: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(store_arc.clone(), registry, tp);
+
+        let body = serde_json::json!({"task_brief": "fix db1 deadlocks"});
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, Some(&body))
+            .await.unwrap();
+        wait_seq(&*store_arc, &tid, 1).await;
+
+        // mark ready 后 state 变为 ready,才能 claim
+        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
+        wait_seq(&*store_arc, &tid, 2).await;
+
+        match orch.handle_claim_http(&tid, "fixlet-1").await.unwrap() {
+            ClaimHttpOutcome::Granted { task_type, task_brief } => {
+                assert_eq!(task_type, "db.repair");
+                assert_eq!(task_brief, "fix db1 deadlocks");
+            }
+            other => panic!("expected Granted, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_claim_http_denied_when_not_ready() {
+        let (store, _d) = setup().await;
+        let store_arc: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(store_arc.clone(), registry, tp);
+
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
+            .await.unwrap();
+        // 未 mark ready → state=created,claim 应拒绝
+        match orch.handle_claim_http(&tid, "fixlet-1").await.unwrap() {
+            ClaimHttpOutcome::Denied { reason } => {
+                assert!(reason.contains("transition"), "reason: {}", reason);
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_claim_http_denied_when_already_claimed() {
+        let (store, _d) = setup().await;
+        let store_arc: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = make_orch(store_arc.clone(), registry, tp);
+
+        let prov = test_provenance();
+        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
+            .await.unwrap();
+        wait_seq(&*store_arc, &tid, 1).await;
+        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
+        wait_seq(&*store_arc, &tid, 2).await;
+
+        // 第一次 claim 成功
+        assert!(matches!(
+            orch.handle_claim_http(&tid, "fixlet-1").await.unwrap(),
+            ClaimHttpOutcome::Granted { .. }
+        ));
+        // 第二次 claim 应拒绝(已 claimed,非 ready)
+        assert!(matches!(
+            orch.handle_claim_http(&tid, "fixlet-2").await.unwrap(),
+            ClaimHttpOutcome::Denied { .. }
+        ));
+    }
+
     // ── #74: work_dir 相关测试 ──────────────────────────────────────────
 
     #[test]

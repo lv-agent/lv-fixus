@@ -452,4 +452,32 @@ mod tests {
         let json = serde_json::to_string(&denied).unwrap();
         assert!(json.contains("claim_denied"));
     }
+
+    #[test]
+    fn test_create_session_with_task_type_and_body() {
+        let json = serde_json::json!({
+            "agent_type": "fixlet-v1",
+            "task_type": "database.repair",
+            "body": {
+                "task_brief": "修复 db-3 主从延迟",
+                "contract": {"sla": "delay < 1s"}
+            }
+        });
+        let req: CreateSessionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.agent_type, "fixlet-v1");
+        assert_eq!(req.task_type.unwrap(), "database.repair");
+        let body = req.body.unwrap();
+        assert_eq!(body["task_brief"].as_str().unwrap(), "修复 db-3 主从延迟");
+        assert!(body["contract"].is_object());
+    }
+
+    #[test]
+    fn test_create_session_task_type_falls_back_to_agent_type() {
+        // 未设置 task_type 时,服务端 fallback agent_type
+        let json = serde_json::json!({
+            "agent_type": "fixlet-v1"
+        });
+        let req: CreateSessionRequest = serde_json::from_value(json).unwrap();
+        assert!(req.task_type.is_none());
+    }
 }
