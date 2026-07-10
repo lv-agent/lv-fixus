@@ -108,6 +108,14 @@ pub trait EventStore: Send + Sync {
     ) -> Result<Vec<String>>;
     async fn get_recent_turn_ids(&self, task_id: &str, limit: i64) -> Result<Vec<i64>>;
 
+    // ── Dispatch ────────────────────────────────────────────────────────
+
+    /// 把工具事件发到 sandbox dispatch stream(Plan D)。
+    /// 默认 no-op;BrokerEventStore 覆盖。
+    async fn dispatch_tool(&self, _task_id: &str, _event: &AgentEvent) -> Result<()> {
+        Ok(())
+    }
+
     // ── Archive ─────────────────────────────────────────────────────────
 
     async fn archive_events_before_seq(

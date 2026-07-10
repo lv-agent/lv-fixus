@@ -200,6 +200,7 @@ pub fn build_router(state: AppState) -> Router {
         // MCP
         .route("/mcp", post(handle_mcp))
         // Health
+        .route("/api/v1/tools/result", post(tool_result_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -1096,6 +1097,35 @@ fn mcp_error(id: Option<i64>, code: i64, message: &str) -> McpResponse {
 }
 
 // ── Health Handler ──────────────────────────────────────────────────────
+
+/// POST /api/v1/tools/result — sandbox 回传工具执行结果(跨 DC,需鉴权 Plan D 后续)。
+async fn tool_result_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    let step_id = body.get("step_id").and_then(|v| v.as_str()).unwrap_or("");
+    let success = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let output = body.get("output").cloned().unwrap_or(serde_json::Value::Null);
+    let error = body.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let duration_ms = body.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if step_id.is_empty() {
+        return Err(AppError::Validation("step_id required".into()));
+    }
+
+    let orch = orchestrator(&state);
+    match orch.take_pending_result(step_id).await {
+        Some(tx) => {
+            let res = crate::orchestrator::PendingToolResult { success, output, error, duration_ms };
+            let _ = tx.send(res);
+            Ok(Json(ApiResponse::ok(serde_json::json!({ "ack": true }))))
+        }
+        None => {
+            tracing::warn!("no pending result channel for step_id {}", step_id);
+            Ok(Json(ApiResponse::err("no pending tool for that step_id")))
+        }
+    }
+}
 
 async fn health_handler() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse::ok("ok"))

@@ -327,6 +327,18 @@ impl EventStore for BrokerEventStore {
     async fn archive_events_before_seq(&self, _task_id: &str, _before_seq: i64) -> Result<crate::storage::ArchiveResult> {
         Ok(crate::storage::ArchiveResult { archived: 0, path: String::new() })
     }
+
+    /// 把工具事件发到 sandbox dispatch stream `tools:region:<SANDBOX_REGION>`。
+    async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {
+        let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
+        let stream = format!("tools:region:{}", region);
+        let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let meta = event_meta(event);
+        let mut w = self.writer.lock().await;
+        w.produce(&stream, event.event_type.as_str(), &content, Some(task_id), 0, "application/json", &meta)
+            .await.map_err(|e| AppError::Internal(format!("dispatch: {}", e)))?;
+        Ok(())
+    }
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────

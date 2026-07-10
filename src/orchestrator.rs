@@ -7,13 +7,17 @@
 //!
 //! 这是把 fixus、fixlet、sandbox 串成完整闭环的中心组件。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use crate::error::{AppError, Result};
+use crate::models::{AgentEvent, EventType};
 use crate::task_registry::{PendingTurn, TaskRegistry, TurnOutcome};
 use crate::storage::EventStore;
-use crate::{context, recovery, sandbox, service};
+use crate::{context, recovery, service};
 
 // ── 辅助类型 ────────────────────────────────────────────────────────────
 
@@ -78,6 +82,15 @@ fn capitalize_first(s: &str) -> String {
 
 // ── Orchestrator ────────────────────────────────────────────────────────
 
+/// 工具执行结果(沙箱→fixus)
+#[derive(Debug)]
+pub struct PendingToolResult {
+    pub success: bool,
+    pub output: serde_json::Value,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// Turn 编排器
 pub struct Orchestrator {
     store: Arc<dyn EventStore>,
@@ -86,6 +99,8 @@ pub struct Orchestrator {
     turn_timeout: Duration,
     /// Token 逐字流式发布(Redis ephemeral 快路径,仅 llm_chunk)
     token_publisher: crate::stream::TokenPublisher,
+    /// 等待 sandbox 结果的 pending channel(step_id → sender)
+    pending_results: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<PendingToolResult>>>>,
 }
 
 /// 异步 Turn 启动结果(`start_turn_async`)
@@ -123,7 +138,13 @@ impl Orchestrator {
             registry,
             turn_timeout: Duration::from_secs(300),
             token_publisher,
+            pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 取走 pending 通道(用于 result 端点)。返回 None 表示 step_id 未在等待。
+    pub async fn take_pending_result(&self, step_id: &str) -> Option<oneshot::Sender<PendingToolResult>> {
+        self.pending_results.lock().await.remove(step_id)
     }
 
     /// 解析 session 的 task_type(用于按 task_type 路由到 fixlet)。
@@ -368,6 +389,7 @@ impl Orchestrator {
             registry: self.registry.clone(),
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
+            pending_results: self.pending_results.clone(),
         };
         let sid = task_id.to_string();
         let ui = user_input.to_string();
@@ -421,6 +443,7 @@ impl Orchestrator {
                 registry: registry.clone(),
                 turn_timeout,
                 token_publisher,
+                pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             };
 
             let mut redo_success = 0;
@@ -664,73 +687,38 @@ impl Orchestrator {
         );
 
         // 1. WAL: 写 tool_invoked
-        let _event = service::record_tool_invoked(
-            &*self.store,
-            task_id,
-            Some(turn_id),
-            step_id,
-            tool_name,
-            tool_call_id,
-            idempotency_key,
-            input,
-            None, // parent_step_id
-            local_seq,
-        )
-        .await?;
+        let event = service::record_tool_invoked(
+            &*self.store, task_id, Some(turn_id), step_id, tool_name, tool_call_id, idempotency_key, input, None, local_seq,
+        ).await?;
 
-        // 2. 统一调度 Sandbox 执行（所有工具走同一 ExecuteRequest 路径）
-        let native_tool = tool_name.strip_prefix("fixus_").unwrap_or(tool_name);
-        let native_tool_cased = capitalize_first(native_tool);
+        // 2. Dispatch 到 sandbox dispatch stream(broker consumer group 分发给 sandbox worker)
+        self.store.dispatch_tool(task_id, &AgentEvent {
+            task_id: task_id.into(), seq: event.seq, turn_id: Some(turn_id), step_id: Some(step_id.into()),
+            event_type: crate::models::EventType::ToolInvoked, schema_version: 1, payload: event.payload.clone(),
+            created_at: chrono::Utc::now(),
+        }).await?;
 
-        let exec_result = crate::sandbox::execute_tool(crate::sandbox::ExecuteRequest {
-            tool_name: native_tool_cased,
-            tool_call_id: tool_call_id.to_string(),
-            idempotency_key: idempotency_key.to_string(),
-            input: input.clone(),
-            timeout_ms: 30_000,
-        })
-        .await;
+        // 3. 创建 pending channel,等待 sandbox 回传结果(or timeout)
+        let (tx, mut rx) = oneshot::channel::<PendingToolResult>();
+        self.pending_results.lock().await.insert(step_id.to_string(), tx);
+        let timeout_dur = Duration::from_secs(60);
+        let result = match tokio::time::timeout(timeout_dur, &mut rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(AppError::Internal("pending channel closed".into())),
+            Err(_) => {
+                self.pending_results.lock().await.remove(step_id);
+                return Err(AppError::Internal(format!("sandbox timeout after {}s", timeout_dur.as_secs())));
+            }
+        };
 
-        // 3. WAL: 写 tool_completed 或 tool_failed
-        if exec_result.success {
-            service::record_tool_completed(
-                &*self.store,
-                task_id,
-                Some(turn_id),
-                step_id,
-                tool_call_id,
-                &exec_result.output,
-                false,
-                local_seq,
-            )
-            .await?;
+        // 4. WAL + relay
+        if result.success {
+            service::record_tool_completed(&*self.store, task_id, Some(turn_id), step_id, tool_call_id, &result.output, false, local_seq).await?;
         } else {
-            service::record_tool_failed(
-                &*self.store,
-                task_id,
-                Some(turn_id),
-                step_id,
-                tool_call_id,
-                "sandbox_execution_error",
-                &exec_result.error.unwrap_or_default(),
-                true,
-                1,
-                local_seq,
-            )
-            .await?;
+            service::record_tool_failed(&*self.store, task_id, Some(turn_id), step_id, tool_call_id,
+                "sandbox_error", result.error.as_deref().unwrap_or("?"), true, 1, local_seq).await?;
         }
-
-        // 4. 回传 tool_result 给 fixlet
-        self.send_tool_result_to_fixlet(
-            task_id,
-            step_id,
-            tool_call_id,
-            &exec_result.output,
-            exec_result.success,
-            exec_result.duration_ms,
-        )
-        .await;
-
+        self.send_tool_result_to_fixlet(task_id, step_id, tool_call_id, &result.output, result.success, result.duration_ms).await;
         Ok(())
     }
 
