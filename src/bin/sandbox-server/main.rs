@@ -2,7 +2,7 @@
 //!
 //! 旧版是 passive HTTP server,新版是 consumer loop:
 //!   1. join broker consumer group "sandboxes-<region>"
-//!   2. consume_frames() → 接收 tools:region:<region> 流的 tool_invoked 事件
+//!   2. consume_frames() → 接收 tools-region-<region> 流的 tool_invoked 事件
 //!   3. executor 执行(幂等缓存按 idempotency_key 去重)
 //!   4. HTTP POST 结果回 fixus
 //!   5. commit_shard offset
@@ -84,7 +84,7 @@ async fn main() {
     let cli = Cli::parse();
     let session_mgr = Arc::new(session::SessionManager::new(cli.session_dir.clone()));
     let cache = IdempotentCache::new();
-    let stream = format!("tools:region:{}", cli.region);
+    let stream = format!("tools-region-{}", cli.region);
     let consumer_id = format!("sandbox-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
 
     tracing::info!("sandbox pull-worker starting: broker={} stream={} group={} consumer={} fixus={}",

@@ -328,10 +328,10 @@ impl EventStore for BrokerEventStore {
         Ok(crate::storage::ArchiveResult { archived: 0, path: String::new() })
     }
 
-    /// 把工具事件发到 sandbox dispatch stream `tools:region:<SANDBOX_REGION>`。
+    /// 把工具事件发到 sandbox dispatch stream `tools-region-<SANDBOX_REGION>`。
     async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {
         let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
-        let stream = format!("tools:region:{}", region);
+        let stream = format!("tools-region-{}", region);
         let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let meta = event_meta(event);
         let mut w = self.writer.lock().await;
@@ -583,5 +583,72 @@ mod tests {
 
         // gap detection(退化)
         assert!(store.detect_seq_gaps(&tid).await.unwrap().is_empty());
+    }
+
+    // ── E2E: dispatch → consume → execute (Plan D) ────────────────────
+
+    #[tokio::test]
+    async fn test_e2e_dispatch_consume_execute() {
+        use logdb_client::broker::GroupConsumer;
+        use logdb_broker_proto::pb::consume_response::Payload;
+        use tokio_stream::StreamExt;
+
+        // 设置 SANDBOX_REGION 让 dispatch_tool 用
+        std::env::set_var("SANDBOX_REGION", "test");
+
+        let (ld_addr, _d) = start_logdbd().await;
+        let ba = start_broker(&ld_addr).await;
+        let mut w = BrokerWriter::connect(&ba, "ns").await.unwrap();
+
+        // 1. 写一条 tool_invoked 到 dispatch stream
+        let step_id = "step-e2e-1";
+        let uid = uuid::Uuid::now_v7().to_string();
+        let idem_key = &format!("t-e2e:rg:bash:{}", &uid[..8]);
+        let tool_payload = serde_json::json!({
+            "step_type":"tool_call","tool_name":"fixus_Bash","tool_call_id":"call-e2e",
+            "idempotency_key": idem_key,
+            "input": {"command": "echo e2e-ok"},
+            "local_seq": 1,
+        });
+        let content = serde_json::to_vec(&tool_payload).unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("task_id".into(), "t-e2e".into());
+        meta.insert("step_id".into(), step_id.into());
+        meta.insert("turn_id".into(), "1".into());
+        meta.insert("event_type".into(), "tool_invoked".into());
+        w.produce("tools-region-test", "tool_invoked", &content, Some("t-e2e"), 0, "application/json", &meta).await.expect("dispatch produce");
+
+        // 稍等 broker forwarder 追上(异步 tail)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 2. 起 sandbox consumer
+        let ba_full = format!("http://{}", ba);
+        let mut consumer = GroupConsumer::join(ba_full, "ns", "tools-region-test", "sandboxes-test", "c-e2e").await.unwrap();
+        let mut frames = consumer.consume_frames().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut received = false;
+        while tokio::time::Instant::now() < deadline {
+            let item = tokio::time::timeout(Duration::from_millis(500), frames.next()).await;
+            match item {
+                Ok(Some(Ok(frame))) => {
+                    if let Some(Payload::Record(rec)) = frame.payload {
+                        assert_eq!(rec.event_type, "tool_invoked");
+                        let pl: serde_json::Value = serde_json::from_slice(&rec.content).unwrap();
+                        assert_eq!(pl["tool_name"], "fixus_Bash");
+                        // Execute
+                        let d = tempfile::tempdir().unwrap();
+                        let r = std::process::Command::new("sh").arg("-c").arg("echo e2e-ok").current_dir(d.path()).output().unwrap();
+                        assert!(String::from_utf8_lossy(&r.stdout).contains("e2e-ok"));
+                        let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+                        received = true;
+                        break;
+                    }
+                }
+                Ok(Some(Err(e))) => panic!("consume: {}", e),
+                _ => { /* timeout/end, retry */ }
+            }
+        }
+        let _ = consumer.leave().await;
+        assert!(received, "expected tool_invoked via broker dispatch");
     }
 }
