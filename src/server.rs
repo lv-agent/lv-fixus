@@ -792,24 +792,6 @@ async fn handle_fixlet_ws(
                                 }
 
                                 // Agent 请求执行 Tool
-                                "tool_invoked" => {
-                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
-                                    let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
-                                    let step_id = parsed["step_id"].as_str().unwrap_or("");
-                                    let local_seq = parsed["local_seq"].as_i64().unwrap_or(0);
-                                    let tool_name = parsed["tool_name"].as_str().unwrap_or("");
-                                    let tool_call_id = parsed["tool_call_id"].as_str().unwrap_or("");
-                                    let idempotency_key = parsed["idempotency_key"].as_str().unwrap_or("");
-                                    let input = parsed.get("input").cloned().unwrap_or(serde_json::Value::Null);
-
-                                    if let Err(e) = orch.handle_tool_invoked(
-                                        task_id, turn_id, step_id, local_seq,
-                                        tool_name, tool_call_id, idempotency_key, &input,
-                                    ).await {
-                                        tracing::error!("handle_tool_invoked failed: {}", e);
-                                    }
-                                }
-
                                 // Agent 完成 Turn
                                 "turn_execution_done" => {
                                     let task_id = parsed["session_id"].as_str().unwrap_or("");

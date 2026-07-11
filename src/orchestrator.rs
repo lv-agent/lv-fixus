@@ -5,85 +5,17 @@
 //! - handle_tool_invoked: fixlet tool_call → WAL → sandbox → tool_result
 //! - handle_turn_execution_done: fixlet done → WAL → 通知HTTP handler
 //!
-//! 这是把 fixus、fixlet、sandbox 串成完整闭环的中心组件。
+//! Turn 编排引擎。fixus 的中心组件:Turn 启动、Claim、恢复、健康检查。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
-
 use crate::error::{AppError, Result};
-use crate::models::{AgentEvent, EventType};
+use crate::models::AgentEvent;
 use crate::task_registry::{PendingTurn, TaskRegistry, TurnOutcome};
 use crate::storage::EventStore;
 use crate::{context, recovery, service};
-
-// ── 辅助类型 ────────────────────────────────────────────────────────────
-
-/// 为 MCP tool 构建 idempotency_key
-///
-/// 格式: `{task_id}:mcp:{tool_name}:{canonical_hash}`
-/// MCP tool 的 idempotency_key 与 Turn 无关（不包含 redo_group），
-/// 因为 MCP tool 在 Turn 级别恢复时不参与重做。
-fn build_tool_idempotency_key(
-    task_id: &str,
-    tool_name: &str,
-    args: &serde_json::Value,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let canonical = canonical_json(args);
-    let hash = hex::encode(Sha256::digest(canonical.as_bytes()).as_slice());
-    format!("{}:mcp:{}:{}", task_id, tool_name, &hash[..16])
-}
-
-/// 规范化为确定性的 JSON 字符串
-fn canonical_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let items: Vec<String> = keys
-                .iter()
-                .map(|k| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(k).unwrap(),
-                        canonical_json(&map[*k])
-                    )
-                })
-                .collect();
-            format!("{{{}}}", items.join(","))
-        }
-        serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonical_json).collect();
-            format!("[{}]", items.join(","))
-        }
-        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
-    }
-}
-
-/// 工具默认超时(秒):Bash 30s,文件工具 15s,未知工具 30s。
-fn default_tool_timeout(tool_name: &str) -> u64 {
-    let name = tool_name.strip_prefix("fixus_").unwrap_or(tool_name).to_lowercase();
-    match name.as_str() {
-        "bash" => 30,
-        "read" | "write" | "edit" | "glob" | "grep" => 15,
-        _ => 30,
-    }
-}
-
-// ── Orchestrator ────────────────────────────────────────────────────────
-
-/// 工具执行结果(沙箱→fixus)
-#[derive(Debug)]
-pub struct PendingToolResult {
-    pub success: bool,
-    pub output: serde_json::Value,
-    pub error: Option<String>,
-    pub duration_ms: u64,
-}
 
 /// 依赖健康状态
 #[derive(Debug, Clone, serde::Serialize)]
@@ -107,8 +39,6 @@ pub struct Orchestrator {
     turn_timeout: Duration,
     /// Token 逐字流式发布(Redis ephemeral 快路径,仅 llm_chunk)
     token_publisher: crate::stream::TokenPublisher,
-    /// 等待 sandbox 结果的 pending channel(step_id → sender)
-    pending_results: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<PendingToolResult>>>>,
     /// 项目工作目录(SANDBOX_WORKSPACE env 或 current_dir),注入 dispatch payload 供 sandbox-server 路径校验
     work_dir: PathBuf,
     /// 最近一次成功 dispatch 时间(用于健康检查)
@@ -158,17 +88,12 @@ impl Orchestrator {
             registry,
             turn_timeout: Duration::from_secs(300),
             token_publisher,
-            pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             work_dir,
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
-    /// 取走 pending 通道(用于 result 端点)。返回 None 表示 step_id 未在等待。
-    pub async fn take_pending_result(&self, step_id: &str) -> Option<oneshot::Sender<PendingToolResult>> {
-        self.pending_results.lock().await.remove(step_id)
-    }
 
     /// 返回依赖健康状态。
     /// - broker: 基于最近一次成功 dispatch 的时间(>2min 未 dispatch → degraded)
@@ -198,11 +123,8 @@ impl Orchestrator {
 
     /// 启动 broker result consumer 后台任务。
     ///
-    /// 消费 `tool-results-region-<region>` stream,将 sandbox-server 回传的工具结果
-    /// 路由到 `pending_results` 中对应 step_id 的 oneshot channel。
-    ///
-    /// sandbox-server 通过 broker produce 结果,fixus 通过 broker consume 结果——
-    /// 对称架构,双方只与 broker 对话,无需 HTTP 直连。
+    /// 消费 `tool-results-region-<region>` stream,用于投影更新和健康检查。
+    /// tools-bank 独立处理 MCP 响应,fixus 只做事件消费(不再管理 oneshot)。
     pub fn spawn_result_consumer(
         self: &Arc<Self>,
         broker_addr: &str,
@@ -484,7 +406,6 @@ impl Orchestrator {
             registry: self.registry.clone(),
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
-            pending_results: self.pending_results.clone(),
             work_dir: PathBuf::from("/tmp"),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
@@ -541,7 +462,6 @@ impl Orchestrator {
                 registry: registry.clone(),
                 turn_timeout,
                 token_publisher,
-                pending_results: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 work_dir: PathBuf::from("/tmp"),
                 last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
                 last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
@@ -769,117 +689,7 @@ impl Orchestrator {
 
     // ── Tool 调用处理 ────────────────────────────────────────────────
 
-    /// 处理 fixlet 上报的 tool_invoked
-    ///
-    /// 1. WAL: 写 tool_invoked
-    /// 2. 调度 Sandbox 执行
-    /// 3. WAL: 写 tool_completed 或 tool_failed
-    /// 4. 回传 tool_result 给 fixlet
-    /// 公共:WAL 写 tool_invoked → dispatch 到 broker → 等 sandbox-server 回传结果(60s)
-    ///
-    /// 被 `handle_tool_invoked`(fixlet execute_turn 路径)与 `execute_tool`(/mcp 路径)共用。
-    /// 工具实际执行发生在 sandbox-server(独立进程,Bash 走 Landlock),fixus 不再有进程内沙箱。
-    ///
-    /// `timeout_secs`: fixus 等待 sandbox 结果的超时(秒)。sandbox-server 的执行超时设为
-    /// `timeout_secs - 5`(最小 5s),确保 sandbox 先放弃,避免 fixus 已超时移除了 channel
-    /// 但 sandbox 还在执行浪费资源。
-    async fn dispatch_and_wait(
-        &self,
-        task_id: &str,
-        turn_id: Option<i64>,
-        step_id: &str,
-        tool_name: &str,
-        tool_call_id: &str,
-        idempotency_key: &str,
-        input: &serde_json::Value,
-        local_seq: i64,
-        timeout_secs: u64,
-    ) -> Result<PendingToolResult> {
-        tracing::info!(
-            "session {}: tool_invoked {} step_id={} idempotency_key={}",
-            task_id,
-            tool_name,
-            step_id,
-            idempotency_key
-        );
 
-        // 1. WAL: 写 tool_invoked(捕获 seq + payload 用于 dispatch)
-        //    work_dir + timeout_ms 注入 payload —— sandbox-server 用它们做路径校验和执行超时
-        let sandbox_timeout_ms = timeout_secs.saturating_sub(5).max(5) * 1000; // sandbox 先于 fixus 放弃
-        let work_dir_str = self.work_dir.to_str();
-        let event = service::record_tool_invoked(
-            &*self.store, task_id, turn_id, step_id, tool_name, tool_call_id, idempotency_key, input, None, local_seq, work_dir_str, Some(sandbox_timeout_ms),
-        ).await?;
-
-        // 2. 先注册 pending channel —— 必须在 dispatch 之前!
-        //    否则 sandbox-server 可能在 fixus 注册 oneshot 之前就消费+POST 回结果,
-        //    导致 take_pending_result 找不到 channel(竞态)→ oneshot 永不兑现 → 60s 超时。
-        let (tx, mut rx) = oneshot::channel::<PendingToolResult>();
-        {
-            let mut pending = self.pending_results.lock().await;
-            let pending_count = pending.len();
-            if pending_count >= 8 {
-                tracing::warn!(
-                    "session {}: {} pending tool dispatches — sandbox may be overloaded",
-                    task_id, pending_count
-                );
-            }
-            pending.insert(step_id.to_string(), tx);
-        }
-
-        // 3. Dispatch 到 sandbox dispatch stream(broker consumer group 分发给 sandbox-server)
-        let dispatch_res = self.store.dispatch_tool(task_id, &AgentEvent {
-            task_id: task_id.into(), seq: event.seq, turn_id, step_id: Some(step_id.into()),
-            event_type: crate::models::EventType::ToolInvoked, schema_version: 1, payload: event.payload.clone(),
-            created_at: chrono::Utc::now(),
-        }).await;
-        if let Err(e) = dispatch_res {
-            self.pending_results.lock().await.remove(step_id);
-            return Err(e);
-        }
-        // 记录成功 dispatch 时间(用于健康检查)
-        *self.last_dispatch_ok.lock().await = Some(std::time::Instant::now());
-
-        // 4. 等 sandbox-server 回传结果(or timeout)
-        let timeout_dur = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout_dur, &mut rx).await {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(_)) => {
-                self.pending_results.lock().await.remove(step_id);
-                Err(AppError::Internal("pending channel closed".into()))
-            }
-            Err(_) => {
-                self.pending_results.lock().await.remove(step_id);
-                Err(AppError::Internal(format!("sandbox timeout after {}s", timeout_dur.as_secs())))
-            }
-        }
-    }
-
-    pub async fn handle_tool_invoked(
-        &self,
-        task_id: &str,
-        turn_id: i64,
-        step_id: &str,
-        local_seq: i64,
-        tool_name: &str,
-        tool_call_id: &str,
-        idempotency_key: &str,
-        input: &serde_json::Value,
-    ) -> Result<()> {
-        let result = self
-            .dispatch_and_wait(task_id, Some(turn_id), step_id, tool_name, tool_call_id, idempotency_key, input, local_seq, default_tool_timeout(tool_name))
-            .await?;
-
-        // WAL terminal + relay 给 fixlet
-        if result.success {
-            service::record_tool_completed(&*self.store, task_id, Some(turn_id), step_id, tool_call_id, &result.output, false, local_seq).await?;
-        } else {
-            service::record_tool_failed(&*self.store, task_id, Some(turn_id), step_id, tool_call_id,
-                "sandbox_error", result.error.as_deref().unwrap_or("?"), true, 1, local_seq).await?;
-        }
-        self.send_tool_result_to_fixlet(task_id, step_id, tool_call_id, &result.output, result.success, result.duration_ms).await;
-        Ok(())
-    }
 
     /// 从 WAL 读取上次尝试的 LLM 缓存（同 turn_id 下所有 llm_completed）
     async fn get_cached_llm_responses(&self, task_id: &str, turn_id: i64) -> Vec<String> {
@@ -895,50 +705,6 @@ impl Orchestrator {
     }
 
     /// 回传 tool_result 到 fixlet
-    async fn send_tool_result_to_fixlet(
-        &self,
-        task_id: &str,
-        step_id: &str,
-        tool_call_id: &str,
-        output: &serde_json::Value,
-        success: bool,
-        duration_ms: u64,
-    ) {
-        let result_msg = serde_json::json!({
-            "type": "tool_result",
-            "step_id": step_id,
-            "tool_call_id": tool_call_id,
-            "output": output,
-            "success": success,
-            "duration_ms": duration_ms,
-        });
-
-        // tool_result 也按 task_type 路由回对应 fixlet
-        let task_type = match self.resolve_task_type(task_id).await {
-            Ok(at) => at,
-            Err(e) => {
-                tracing::error!(
-                    "session {}: cannot resolve task_type for tool_result: {}",
-                    task_id,
-                    e
-                );
-                return;
-            }
-        };
-        if let Err(e) = self
-            .registry
-            .send_to_fixlet_for_task_type(&task_type, &result_msg.to_string())
-            .await
-        {
-            tracing::error!(
-                "session {}: failed to send tool_result to fixlet (task_type {}): {}",
-                task_id,
-                task_type,
-                e
-            );
-        }
-    }
-
     // ── Turn 完成处理 ────────────────────────────────────────────────
 
     /// 处理 fixlet 上报的 llm_chunk（流式 token）
@@ -1245,7 +1011,7 @@ impl Orchestrator {
 // ── Broker Result Consumer ─────────────────────────────────────────────
 
 /// 后台消费 `tool-results-region-<region>` stream,将 sandbox-server 回传的工具结果
-/// 路由到 orchestrator 的 `pending_results` oneshot channel。
+/// 消费 `tool-results-region-<region>` stream,记录工具结果用于投影和健康检查。
 async fn run_result_consumer(
     orch: &Arc<Orchestrator>,
     broker_addr: &str,
@@ -1308,30 +1074,14 @@ async fn run_result_consumer(
                     continue;
                 }
 
-                let pending = PendingToolResult {
-                    success: result["success"].as_bool().unwrap_or(false),
-                    output: result["output"].clone(),
-                    error: result["error"].as_str().map(|s| s.to_string()),
-                    duration_ms: result["duration_ms"].as_u64().unwrap_or(0),
-                };
-
+                let success = result["success"].as_bool().unwrap_or(false);
+                let duration_ms = result["duration_ms"].as_u64().unwrap_or(0);
                 tracing::info!(
                     "result consumer: step_id={} success={} duration_ms={}",
-                    step_id,
-                    pending.success,
-                    pending.duration_ms
+                    step_id, success, duration_ms
                 );
-
-                if let Some(tx) = orch.take_pending_result(step_id).await {
-                    let _ = tx.send(pending);
-                    // 记录成功收到结果的时间(用于健康检查)
-                    *orch.last_result_ok.lock().await = Some(std::time::Instant::now());
-                } else {
-                    tracing::warn!(
-                        "no pending channel for step_id {} (already timed out or completed)",
-                        step_id
-                    );
-                }
+                // 记录结果到达时间(健康检查用)
+                *orch.last_result_ok.lock().await = Some(std::time::Instant::now());
 
                 let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
             }
@@ -1601,37 +1351,6 @@ mod tests {
         );
     }
 
-    // ── #74: work_dir 相关测试 ──────────────────────────────────────────
-
-    #[test]
-    fn default_tool_timeout_bash_30s() {
-        assert_eq!(default_tool_timeout("fixus_Bash"), 30);
-        assert_eq!(default_tool_timeout("Bash"), 30);
-        assert_eq!(default_tool_timeout("bash"), 30);
-    }
-
-    #[test]
-    fn default_tool_timeout_file_tools_15s() {
-        for name in &["fixus_Read", "fixus_Write", "fixus_Edit", "fixus_Glob", "fixus_Grep"] {
-            assert_eq!(default_tool_timeout(name), 15, "failed for {}", name);
-        }
-    }
-
-    #[test]
-    fn default_tool_timeout_unknown_30s() {
-        assert_eq!(default_tool_timeout("fixus_unknown"), 30);
-    }
-
-    #[tokio::test]
-    async fn orchestrator_new_has_work_dir_default() {
-        let (store, _d) = setup().await;
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = Orchestrator::new(Arc::new(store), registry, tp);
-        // work_dir should be a valid PathBuf (current_dir or /tmp fallback)
-        assert!(!orch.work_dir.as_os_str().is_empty());
-    }
-
     // ── #77: Health 相关测试 ────────────────────────────────────────────
 
     #[tokio::test]
@@ -1671,36 +1390,4 @@ mod tests {
         assert_eq!(h.sandbox.status, "ok");
     }
 
-    // ── Idempotency key 稳定性测试 ──────────────────────────────────────
-
-    #[test]
-    fn canonical_json_deterministic() {
-        let a = serde_json::json!({"b": 1, "a": 2});
-        let b = serde_json::json!({"a": 2, "b": 1});
-        assert_eq!(canonical_json(&a), canonical_json(&b));
-    }
-
-    #[test]
-    fn idempotency_key_stable_for_same_input() {
-        let args = serde_json::json!({"command": "echo hello"});
-        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
-        let k2 = build_tool_idempotency_key("task1", "Bash", &args);
-        assert_eq!(k1, k2);
-    }
-
-    #[test]
-    fn idempotency_key_differs_per_task() {
-        let args = serde_json::json!({"command": "echo hello"});
-        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
-        let k2 = build_tool_idempotency_key("task2", "Bash", &args);
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn idempotency_key_differs_per_tool() {
-        let args = serde_json::json!({"command": "echo hello"});
-        let k1 = build_tool_idempotency_key("task1", "Bash", &args);
-        let k2 = build_tool_idempotency_key("task1", "Read", &args);
-        assert_ne!(k1, k2);
-    }
 }
