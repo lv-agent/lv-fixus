@@ -22,14 +22,6 @@ use crate::{context, recovery, service};
 
 // ── 辅助类型 ────────────────────────────────────────────────────────────
 
-/// MCP tool 执行结果
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ToolExecuteResult {
-    pub success: bool,
-    pub output: serde_json::Value,
-    pub duration_ms: u64,
-}
-
 /// 为 MCP tool 构建 idempotency_key
 ///
 /// 格式: `{task_id}:mcp:{tool_name}:{canonical_hash}`
@@ -1176,48 +1168,6 @@ impl Orchestrator {
     /// 2. Sandbox 执行
     /// 3. WAL: tool_completed 或 tool_failed
     /// 4. 返回执行结果
-    pub async fn execute_tool(
-        &self,
-        task_id: &str,
-        tool_name: &str, // "fixus_bash"
-        tool_call_id: &str,
-        args: &serde_json::Value,
-    ) -> Result<ToolExecuteResult> {
-        use uuid::Uuid;
-
-        let step_id = Uuid::now_v7().to_string();
-        let active_turn = self.store.get_max_turn_id(task_id).await?;
-        let turn_id = if active_turn > 0 { Some(active_turn) } else { None };
-        let idempotency_key = build_tool_idempotency_key(task_id, tool_name, args);
-
-        tracing::info!(
-            "session {}: executing tool {} idempotency_key={}",
-            task_id,
-            tool_name,
-            idempotency_key
-        );
-
-        // 走 broker→sandbox-server(fixus 不再有进程内沙箱;fixus_ 前缀由 sandbox-server strip)
-        let result = self
-            .dispatch_and_wait(task_id, turn_id, &step_id, tool_name, tool_call_id, &idempotency_key, args, 0, default_tool_timeout(tool_name))
-            .await?;
-
-        // WAL: tool_terminal
-        if result.success {
-            service::record_tool_completed(&*self.store, task_id, turn_id, &step_id, tool_call_id, &result.output, false, 0).await?;
-        } else {
-            let error_msg = result.error.clone().unwrap_or_default();
-            service::record_tool_failed(&*self.store, task_id, turn_id, &step_id, tool_call_id,
-                "sandbox_execution_error", &error_msg, true, 1, 0).await?;
-        }
-
-        Ok(ToolExecuteResult {
-            success: result.success,
-            output: result.output,
-            duration_ms: result.duration_ms,
-        })
-    }
-
     /// 写 turn_failed 并通知 HTTP handler
     async fn fail_turn_and_respond(
         &self,

@@ -584,13 +584,13 @@ async fn handle_fixus_message(
                     // 模型调用时由 claude-agent-acp 发 tools/call 到 fixus /mcp，
                     // fixus 的 orchestrator.execute_tool 执行（WAL + sandbox）。
                     //
-                    // task_id 通过 X-Fixus-Session-Id header 注入：fixus /mcp 的 tools/call
-                    // 靠这个 header 把工具调用归属到正确的 task。fixlet 在此时知道 task_id
-                    //（= et.session_id），且同一 task 的所有 turn 共用同一 task_id。
-                    let fixus_mcp = fixus_mcp_url(&config.fixus_url);
+                    // task_id 通过 X-Fixus-Session-Id header 注入：tools-bank /mcp 的 tools/call
+                    // 靠这个 header 把工具调用归属到正确的 task。
+                    let tools_bank_url = std::env::var("TOOLS_BANK_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:3001/mcp".into());
                     tracing::info!(
-                        "Registering fixus MCP server for task {}: {}",
-                        et.session_id, fixus_mcp
+                        "Registering tools-bank MCP server for task {}: {}",
+                        et.session_id, tools_bank_url
                     );
                     let session_new_id = acp.next_req_id();
                     let session_new_msg = serde_json::json!({
@@ -602,7 +602,7 @@ async fn handle_fixus_message(
                             "mcpServers": [{
                                 "type": "http",
                                 "name": "fixus",
-                                "url": fixus_mcp,
+                                "url": tools_bank_url,
                                 "headers": [
                                     {"name": "X-Fixus-Session-Id", "value": et.session_id}
                                 ]
