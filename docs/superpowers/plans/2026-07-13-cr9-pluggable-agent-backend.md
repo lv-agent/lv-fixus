@@ -207,11 +207,12 @@ pub struct FixletConfig {
 
 ### 6.2 测试(全绿)
 
-`cargo test --bin fixlet` —— **20 passed**(基线 9 → +11 backend):
+`cargo test --bin fixlet` —— **21 passed**, 2 ignored(基线 9 → +12 backend):
 
 | 测试 | 验证 |
 |------|------|
-| `build_session_new_params_matches_legacy_claude` | **parity**:重构后 session/new params 与重构前硬编码逐键等价 |
+| `build_session_new_params_matches_legacy_claude` | **parity**:session/new params 与重构前逐键等价 |
+| `build_session_new_request_matches_legacy_envelope` | **parity**:完整 JSON-RPC 消息(envelope+params)与重构前等价 |
 | `build_session_new_params_merges_extra` | session_new_extra 合并进外壳(扩展点) |
 | `claude_backend_*`(3) | extract_model 路径 / spawn_spec / name |
 | `session_new_extra_default_null` | 默认不带额外参数 |
@@ -222,6 +223,21 @@ pub struct FixletConfig {
 | `select_backend_generic_branch` | factory `generic` 分支命中 |
 
 原有 9 个 acp 测试全绿(零回归)。
+
+### 6.3 性能(`cargo test --bin fixlet -- --ignored perf_ --nocapture`)
+
+backend 层 per-turn 一次性、无锁;测之证明新抽象层相对秒级 agent 执行可忽略:
+
+```
+[perf] backend per-turn (spawn+new+model)  n=20000  p50=8.3µs  p99=26µs   ← 一 turn 全 backend 开销
+[perf] generic extract_model (3-seg path)  n=50000  p50=491ns  p99=1.8µs  ← dotted model 提取
+```
+
+agent 执行是秒级 ⇒ backend 层 ~8µs/turn 占比 < 0.001%。结论:薄 trait 抽象零性能代价。
+
+### 6.4 构建
+
+`cargo build --release` 成功。
 
 ### 6.3 构建
 

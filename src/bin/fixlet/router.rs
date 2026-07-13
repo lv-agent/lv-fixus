@@ -441,10 +441,9 @@ async fn handle_execute_turn_from_broker(
         &cwd,
         &tools_bank_url,
     );
-    acp.send_raw(&serde_json::json!({
-        "jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
-        "params": params,
-    }).to_string());
+    acp.send_raw(
+        &backend::build_session_new_request(session_new_id, params).to_string(),
+    );
 
     let real_session_id = loop {
         match agent_stdout.as_mut().unwrap().recv().await {

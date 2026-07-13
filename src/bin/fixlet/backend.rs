@@ -164,6 +164,17 @@ pub fn build_session_new_params(
     params
 }
 
+/// 构造完整的 session/new JSON-RPC 请求(envelope + params)。抽出来便于
+/// parity 测试(完整消息字节级回归)。
+pub fn build_session_new_request(req_id: i64, params: Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "session/new",
+        "params": params,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +250,71 @@ mod tests {
         assert_eq!(b.name(), "generic");
     }
 
+    // ── 性能测试(#[ignore],cargo test --bin fixlet -- --ignored perf_ --nocapture)──
+    // backend 层是 per-turn 一次性(spawn_spec + build_session_new_params + extract_model),
+    // 非热路径、无锁。测一 turn 的 backend 总开销,证明新抽象层相对秒级 agent 执行可忽略。
+
+    fn report(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_backend_per_turn_overhead() {
+        let b = ClaudeCodeBackend::new("claude-agent-acp".into());
+        let result = serde_json::json!({"sessionId": "s1", "models": {"currentModelId": "claude-sonnet-5"}});
+        // warm-up
+        for _ in 0..1000 {
+            let _ = b.spawn_spec();
+            let p = build_session_new_params(&b, "t", "/tmp", "http://tb/mcp");
+            let _ = build_session_new_request(1, p);
+            let _ = b.extract_model(&result);
+        }
+        let n = 20_000;
+        let mut ns = Vec::with_capacity(n);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            let _ = b.spawn_spec();
+            let p = build_session_new_params(&b, &format!("t{i}"), "/tmp", "http://tb/mcp");
+            let _ = build_session_new_request(i as i64, p);
+            let m = b.extract_model(&result);
+            ns.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(m.as_deref(), Some("claude-sonnet-5")); // 功能正确
+        }
+        report("backend per-turn (spawn+new+model)", "ns", ns);
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_generic_json_path_extract() {
+        // GenericAcpBackend 的 dotted 路径解析(model 提取)—— 自定义路径下性能。
+        let b = GenericAcpBackend::new("x".into(), "data.response.model".into());
+        let result = serde_json::json!({"data": {"response": {"model": "gpt-5", "meta": {"x": 1}}}});
+        for _ in 0..1000 {
+            let _ = b.extract_model(&result);
+        }
+        let n = 50_000;
+        let mut ns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let m = b.extract_model(&result);
+            ns.push(t0.elapsed().as_nanos() as u64);
+            assert_eq!(m.as_deref(), Some("gpt-5"));
+        }
+        report("generic extract_model (3-seg path)", "ns", ns);
+    }
+
     /// parity(CR-9a 核心):build_session_new_params 对 ClaudeCode backend 必须与
     /// 重构前 router.rs 硬编码的 session/new params 逐键等价(零回归)。
     #[test]
@@ -257,6 +333,27 @@ mod tests {
             }]
         });
         assert_eq!(got, legacy, "session/new params 必须与重构前等价");
+    }
+
+    /// parity(完整消息):build_session_new_request 包出的完整 JSON-RPC 消息
+    /// 与重构前 router 硬编码的 envelope(jsonrpc/id/method/params)逐键等价。
+    #[test]
+    fn build_session_new_request_matches_legacy_envelope() {
+        let b = ClaudeCodeBackend::new("claude-agent-acp".into());
+        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp");
+        let got = build_session_new_request(7, params);
+
+        let legacy = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "mcpServers": [{
+                    "type": "http", "name": "fixus", "url": "http://tb/mcp",
+                    "headers": [{"name": "X-Fixus-Session-Id", "value": "task_x"}]
+                }]
+            }
+        });
+        assert_eq!(got, legacy, "完整 session/new 消息必须与重构前等价");
     }
 
     /// session_new_extra 非 null 时合并进 params(为 CR-9b/后续 backend 验证扩展点)。
