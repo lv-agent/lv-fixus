@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 use super::acp::{self, AcpClient, ParsedAcpEvent};
+use super::backend::{self, AgentBackend};
 use super::idempotency::TurnContext;
 
 /// 流式消息累积器
@@ -39,24 +40,14 @@ impl MessageAccumulator {
 // ── 配置 ────────────────────────────────────────────────────────────────
 
 /// fixlet 配置
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FixletConfig {
     /// 此 fixlet 服务的 task_type(决定订阅哪条 `task-begin-{task_type}` stream)
     pub task_type: String,
-    /// Agent 启动命令（例如 "claude-agent-acp"）
-    pub agent_command: String,
+    /// 可插拔 agent backend(CR-9):spawn 规格 + model 提取。
+    pub backend: Arc<dyn AgentBackend>,
     /// Agent 工作目录
     pub agent_cwd: Option<String>,
-}
-
-impl Default for FixletConfig {
-    fn default() -> Self {
-        Self {
-            task_type: "default".into(),
-            agent_command: "claude-agent-acp".into(),
-            agent_cwd: None,
-        }
-    }
 }
 
 
@@ -64,15 +55,21 @@ impl Default for FixletConfig {
 
 /// 启动 Agent 子进程，返回 stdin writer channel 和 stdout reader
 fn spawn_agent(config: &FixletConfig) -> Option<(tokio::sync::mpsc::UnboundedSender<String>, tokio::sync::mpsc::UnboundedReceiver<String>, Child)> {
+    let spec = config.backend.spawn_spec();
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd");
-        c.args(["/C", &config.agent_command]);
+        c.args(["/C", &spec.command]);
         c
     } else {
         let mut c = Command::new("bash");
-        c.args(["-c", &config.agent_command]);
+        c.args(["-c", &spec.command]);
         c
     };
+
+    // backend 额外 env(ClaudeCode 为空;GenericAcpBackend 等可注入)
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
 
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -437,15 +434,16 @@ async fn handle_execute_turn_from_broker(
     acp.set_stdin_tx(agent_stdin.as_ref().unwrap().clone());
 
     let session_new_id = acp.next_req_id();
+    let cwd = config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into());
+    let params = backend::build_session_new_params(
+        config.backend.as_ref(),
+        task_id,
+        &cwd,
+        &tools_bank_url,
+    );
     acp.send_raw(&serde_json::json!({
         "jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
-        "params": {
-            "cwd": config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into()),
-            "mcpServers": [{
-                "type": "http", "name": "fixus", "url": tools_bank_url,
-                "headers": [{"name": "X-Fixus-Session-Id", "value": task_id}]
-            }]
-        }
+        "params": params,
     }).to_string());
 
     let real_session_id = loop {
@@ -454,10 +452,11 @@ async fn handle_execute_turn_from_broker(
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                     if v.get("id").and_then(|i| i.as_i64()) == Some(session_new_id) {
                         if let Some(sid) = v.get("result").and_then(|r| r.get("sessionId")).and_then(|s| s.as_str()) {
-                            let model = v.get("result").and_then(|r| r.get("models"))
-                                .and_then(|m| m.get("currentModelId")).and_then(|s| s.as_str()).unwrap_or("");
+                            // model 提取走 backend(CR-9):ClaudeCode = result.models.currentModelId
+                            let result = v.get("result").cloned().unwrap_or_default();
+                            let model = config.backend.extract_model(&result).unwrap_or_default();
                             tracing::info!("ACP session/new: sessionId={} model={}", sid, model);
-                            ctx.model = model.to_string();
+                            ctx.model = model;
                             *active_turn = Some(ctx.clone());
                             break Some(sid.to_string());
                         }
