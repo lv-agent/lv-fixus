@@ -328,50 +328,38 @@ impl EventStore for BrokerEventStore {
         Ok(crate::storage::ArchiveResult { archived: 0, path: String::new() })
     }
 
-    /// 把 ready task 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅认领。
-    /// 替代原来的内存 TaskRegistry 队列——broker 持久化,fixus 重启不丢。
-    async fn publish_ready_task(&self, task_id: &str, task_type: &str, task_brief: &str, preferred_claimant: Option<&str>) -> Result<()> {
-        // broker stream 名只允许 [a-zA-Z0-9_-], task_type 中的 '.' 替换为 '-'
+    /// 把 turn.begin(execute_turn) 发布到 `task-begin-{task_type}` stream。
+    /// fixlet 竞争消费该 stream 认领 turn(pull-based),消费后启动 agent。
+    /// task_type 决定路由——fixlet 按 task_type 订阅自己负责的那条 stream。
+    async fn publish_turn_begin(&self, task_id: &str, task_type: &str, payload: &serde_json::Value) -> Result<()> {
+        // broker stream 名 task_type 中的 '.' 替换为 '-'
         let sanitized = task_type.replace('.', "-");
-        let stream = format!("tasks-{}", sanitized);
-        let payload = serde_json::json!({
-            "task_id": task_id,
-            "task_type": task_type,
-            "task_brief": task_brief,
-            "preferred_claimant": preferred_claimant,
-        });
-        let content = serde_json::to_vec(&payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let stream = format!("task-begin-{}", sanitized);
+        let content = serde_json::to_vec(payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let mut meta = HashMap::new();
         meta.insert("task_id".into(), task_id.to_string());
-        meta.insert("event_type".into(), "task_ready".into());
+        meta.insert("event_type".into(), "execute_turn".into());
 
-        let mut last_err = None;
-        for attempt in 0..3 {
-            let mut w = self.writer.lock().await;
-            match w.produce(&stream, "task_ready", &content, Some(task_id), 0, "application/json", &meta).await {
-                Ok((gid, seq)) => {
-                    tracing::info!("publish_ready_task: task={} type={} stream={} gid={} seq={}",
-                        task_id, task_type, stream, gid, seq);
-                    return Ok(());
-                }
-                Err(e) => {
-                    drop(w);
-                    last_err = Some(e);
-                    if attempt < 2 {
-                        let delay_ms = 100u64 << attempt;
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
+        let mut w = self.writer.lock().await;
+        match w.produce(&stream, "execute_turn", &content, Some(task_id), 0, "application/json", &meta).await {
+            Ok((gid, seq)) => {
+                tracing::info!("publish_turn_begin: task={} type={} stream={} gid={} seq={}", task_id, task_type, stream, gid, seq);
+                Ok(())
             }
+            Err(e) => Err(AppError::Internal(format!("publish_turn_begin: {}", e))),
         }
-        Err(AppError::Internal(format!("publish_ready_task after 3 retries: {}", last_err.unwrap())))
     }
 
-    /// 把工具事件发到 sandbox dispatch stream `tools-region-<SANDBOX_REGION>`。
+    /// 失效 task 投影缓存——下次 get_task 会重新 catch_up。
+    async fn invalidate_projection(&self, task_id: &str) {
+        self.cache.invalidate(task_id).await;
+    }
+
+    /// 把工具事件发到 sandbox dispatch stream `tool-invoke-<SANDBOX_REGION>`。
     /// 失败时自动重试(backoff: 100ms → 200ms → 400ms),总共最多 3 次尝试。
     async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {
         let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
-        let stream = format!("tools-region-{}", region);
+        let stream = format!("tool-invoke-{}", region);
         let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let meta = event_meta(event);
 
@@ -673,14 +661,14 @@ mod tests {
         meta.insert("step_id".into(), step_id.into());
         meta.insert("turn_id".into(), "1".into());
         meta.insert("event_type".into(), "tool_invoked".into());
-        w.produce("tools-region-test", "tool_invoked", &content, Some("t-e2e"), 0, "application/json", &meta).await.expect("dispatch produce");
+        w.produce("tool-invoke-test", "tool_invoked", &content, Some("t-e2e"), 0, "application/json", &meta).await.expect("dispatch produce");
 
         // 稍等 broker forwarder 追上(异步 tail)
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // 2. 起 sandbox consumer
         let ba_full = format!("http://{}", ba);
-        let mut consumer = GroupConsumer::join(ba_full, "ns", "tools-region-test", "sandboxes-test", "c-e2e").await.unwrap();
+        let mut consumer = GroupConsumer::join(ba_full, "ns", "tool-invoke-test", "sandboxes-test", "c-e2e").await.unwrap();
         let mut frames = consumer.consume_frames().await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut received = false;

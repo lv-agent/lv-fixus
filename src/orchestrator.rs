@@ -2,8 +2,8 @@
 //!
 //! 职责：
 //! - execute_turn: 用户请求 → WAL → context构建 → 下发fixlet → 等待结果
-//! - handle_tool_invoked: fixlet tool_call → WAL → sandbox → tool_result
 //! - handle_turn_execution_done: fixlet done → WAL → 通知HTTP handler
+//! - Tool 执行: tools-bank MCP → broker → sandbox-server (不再经 fixus)
 //!
 //! Turn 编排引擎。fixus 的中心组件:Turn 启动、Claim、恢复、健康检查。
 
@@ -35,40 +35,18 @@ pub struct DependencyHealth {
 pub struct Orchestrator {
     store: Arc<dyn EventStore>,
     registry: Arc<TaskRegistry>,
-    /// Turn 级超时（默认 5 分钟）
     turn_timeout: Duration,
-    /// Token 逐字流式发布(Redis ephemeral 快路径,仅 llm_chunk)
     token_publisher: crate::stream::TokenPublisher,
-    /// 项目工作目录(SANDBOX_WORKSPACE env 或 current_dir),注入 dispatch payload 供 sandbox-server 路径校验
     work_dir: PathBuf,
-    /// 最近一次成功 dispatch 时间(用于健康检查)
     last_dispatch_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
-    /// 最近一次收到 sandbox 结果的时间(用于健康检查)
     last_result_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// 异步 Turn 启动结果(`start_turn_async`)
 #[derive(Debug)]
 pub enum AsyncTurnStart {
-    /// Turn 已启动,后台执行中;客户端凭 turn_id 连 fixus-stream SSE 看进度
     Started { turn_id: i64 },
-    /// 检测到未完成 Turn,已触发后台恢复;本次无新 Turn
     RecoveryTriggered { incomplete_count: usize },
-}
-
-/// claim 处理结果(spec §8.3 pull-based 认领)
-#[derive(Debug)]
-pub enum ClaimOutcome {
-    /// 认领成功:已写 task_claimed,下发 claim_granted 给执行器
-    Granted {
-        task_id: String,
-        task_type: String,
-        task_brief: String,
-    },
-    /// 认领拒绝:无 ready Task 或状态迁移失败
-    Denied {
-        reason: String,
-    },
 }
 
 impl Orchestrator {
@@ -95,9 +73,6 @@ impl Orchestrator {
     }
 
 
-    /// 返回依赖健康状态。
-    /// - broker: 基于最近一次成功 dispatch 的时间(>2min 未 dispatch → degraded)
-    /// - sandbox: 基于最近一次收到结果的时间(>2min 未收到 → degraded)
     pub async fn health(&self) -> HealthStatus {
         let now = std::time::Instant::now();
         let dispatch_ago = self.last_dispatch_ok.lock().await.map(|t| now.duration_since(t).as_secs());
@@ -121,10 +96,6 @@ impl Orchestrator {
         }
     }
 
-    /// 启动 broker result consumer 后台任务。
-    ///
-    /// 消费 `tool-results-region-<region>` stream,用于投影更新和健康检查。
-    /// tools-bank 独立处理 MCP 响应,fixus 只做事件消费(不再管理 oneshot)。
     pub fn spawn_result_consumer(
         self: &Arc<Self>,
         broker_addr: &str,
@@ -132,7 +103,7 @@ impl Orchestrator {
         region: &str,
     ) {
         let orch = self.clone();
-        let stream = format!("tool-results-region-{}", region);
+        let stream = format!("tool-result-{}", region);
         let broker_addr = broker_addr.to_string();
         let namespace = namespace.to_string();
         // 每次启动用唯一 group 名,避免旧实例的 stale consumer member 占 shard(TODO: 未来 fixus 需做 HA 时改为多成员共享 group)
@@ -164,79 +135,35 @@ impl Orchestrator {
         });
     }
 
-    /// 解析 session 的 task_type(用于按 task_type 路由到 fixlet)。
-    /// task_type 是 session 创建时落库的独立业务字段,非事件派生。
     async fn resolve_task_type(&self, task_id: &str) -> Result<String> {
-        let session = self
-            .store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
-        Ok(session.task_type)
-    }
-
-    /// 处理 fixlet claim 请求(spec §8.3 pull-based 认领)。
-    ///
-    /// 1. 从 registry claim 队列匹配一个 ready Task(按 preferred_claimant 优先)
-    /// 2. service 层写 task_claimed(校验状态不变量;ready → claimed)
-    /// 3. 取 task_brief(body 编译产物),随 ClaimOutcome 返回,由 server 层下发 claim_granted
-    ///
-    /// 注:claim_granted 的 fixlet 侧执行(Turn 启动 + executing/succeeded 流转)在 Plan D 串联。
-    pub async fn handle_claim(
-        &self,
-        task_type: &str,
-        claimant: &str,
-    ) -> Result<ClaimOutcome> {
-        let Some(claimed) = self.registry.claim_next(task_type, claimant).await else {
-            return Ok(ClaimOutcome::Denied {
-                reason: format!("no ready task for task_type {}", task_type),
-            });
-        };
-
-        if let Err(e) = service::claim_task(&*self.store, &claimed.task_id, claimant).await {
+        // broker forwarder tail 是异步的:create 写完 task_created 后,
+        // catch_up 可能领先于 forwarder 发出 CaughtUp 信号却没看到该事件 → 投影里 task_type 空。
+        // 失效缓存重试,给 forwarder 追上的时间。
+        for attempt in 0..10u32 {
+            let session = self
+                .store
+                .get_task(task_id)
+                .await?
+                .ok_or_else(|| AppError::TaskNotFound(task_id.to_string()))?;
+            if !session.task_type.is_empty() {
+                return Ok(session.task_type);
+            }
             tracing::warn!(
-                "claim_task failed for {}: {} (state race? re-enqueue skipped)",
-                claimed.task_id,
-                e
+                task_id, attempt,
+                "task_type empty in projection (broker forwarder lag?) — invalidating + retry"
             );
-            return Ok(ClaimOutcome::Denied {
-                reason: format!("claim transition failed: {}", e),
-            });
+            self.store.invalidate_projection(task_id).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-
-        let task = self
-            .store
-            .get_task(&claimed.task_id)
-            .await?
-            .ok_or_else(|| AppError::TaskNotFound(claimed.task_id.clone()))?;
-        let task_brief = task
-            .body
-            .as_ref()
-            .and_then(|b| b.get("task_brief"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        tracing::info!(
-            "task {}: claimed by {} (task_type={})",
-            claimed.task_id,
-            claimant,
-            claimed.task_type
-        );
-
-        Ok(ClaimOutcome::Granted {
-            task_id: claimed.task_id,
-            task_type: claimed.task_type,
-            task_brief,
-        })
+        Err(AppError::Internal(format!(
+            "task_type unresolved for {} after 10 retries (projection never saw task_created?)",
+            task_id
+        )))
     }
+
 
     // ── Turn 执行入口 ────────────────────────────────────────────────
 
-    /// 执行一个完整的 Turn
-    ///
-    /// 这是用户 POST /turns 的入口。
-    /// 自动处理恢复、context 构建、fixlet 下发、Sandbox 调度、结果返回。
     pub async fn execute_turn(
         &self,
         task_id: &str,
@@ -279,9 +206,6 @@ impl Orchestrator {
             .await
     }
 
-    /// Turn 执行体(turn_started 已写入、turn_id 已知):
-    /// 构建 context → 注册 PendingTurn → 检查 fixlet → 派发 → 等待完成(超时/失败处理)。
-    /// 被 `execute_turn`(同步)与 `start_turn_async`(后台)复用。
     async fn run_turn_to_completion(
         &self,
         task_id: &str,
@@ -292,13 +216,12 @@ impl Orchestrator {
         // 3. 构建 context（只构建一次，传递给 dispatch）
         let ctx = context::build_llm_context(&*self.store, task_id).await?;
 
-        // 3b. 解析 task_type —— 按 task_type 路由到 fixlet(不再按 task_id)
-        let task_type = self.resolve_task_type(task_id).await?;
+        // 3b. 前置校验 task_type 可解析(不可解析则在此失败,避免注册一个派发不出去的 pending turn)
+        self.resolve_task_type(task_id).await?;
 
-        // 4. 创建 PendingTurn（含 oneshot channel，等待完成通知;记录 task_type 便于 fixlet 断连快速失败）
+        // 4. 创建 PendingTurn(含 oneshot channel,等待 broker task-end 兑现完成通知)
         let (pending, result_rx) = PendingTurn::new(
             task_id.to_string(),
-            task_type.clone(),
             turn_id,
             redo_group.to_string(),
         );
@@ -306,27 +229,8 @@ impl Orchestrator {
             .register_pending_turn(task_id, pending)
             .await;
 
-        // 5. 检查服务于该 task_type 的 fixlet 是否已连接
-        if self
-            .registry
-            .get_fixlet_for_task_type(&task_type)
-            .await
-            .is_none()
-        {
-            self.fail_turn_and_respond(
-                task_id,
-                turn_id,
-                "no_fixlet",
-                &format!("No fixlet connected for task_type {}", task_type),
-            )
-            .await?;
-            return Err(AppError::Protocol(format!(
-                "No fixlet connected for task_type {} (session {})",
-                task_type, task_id
-            )));
-        }
-
-        // 6. 下发 execute_turn 给 fixlet（复用已构建的 context）
+        // 5. 下发 turn.begin(execute_turn) 到 `task-begin-{task_type}`
+        // pull-based: fixlet 竞争消费该 stream 认领 turn,无需 fixus 推送、无需 registry 检查。
         self.dispatch_execute_turn_with_ctx(
             task_id,
             turn_id,
@@ -369,8 +273,6 @@ impl Orchestrator {
         }
     }
 
-    /// 异步启动 Turn:写 turn_started 后**立即返回 turn_id**,执行体在后台进行。
-    /// 客户端凭 turn_id 连 fixus-stream SSE,实时看事件 + token 流式。
     pub async fn start_turn_async(
         &self,
         task_id: &str,
@@ -431,9 +333,6 @@ impl Orchestrator {
         Ok(AsyncTurnStart::Started { turn_id })
     }
 
-    /// 后台恢复：检测未完成 Turn，逐个 redo，不阻塞 HTTP 请求。
-    ///
-    /// 恢复完成后客户端可以重新发起 execute_turn。
     fn spawn_background_recovery(&self, task_id: String) {
         let store = self.store.clone();
         let registry = self.registry.clone();
@@ -470,18 +369,15 @@ impl Orchestrator {
             let mut redo_success = 0;
             let mut redo_failed = 0;
 
-            // task_type 是 session 级常量,循环外解析一次(按 task_type 路由 redo)
-            let task_type = match orch.resolve_task_type(&task_id).await {
-                Ok(at) => at,
-                Err(e) => {
-                    tracing::error!(
-                        "session {}: recovery cannot resolve task_type: {}",
-                        task_id,
-                        e
-                    );
-                    return;
-                }
-            };
+            // 前置校验 task_type 可解析(循环外一次,派发前 fail-fast)
+            if let Err(e) = orch.resolve_task_type(&task_id).await {
+                tracing::error!(
+                    "session {}: recovery cannot resolve task_type: {}",
+                    task_id,
+                    e
+                );
+                return;
+            }
 
             for redo_ctx in &redo_queue {
                 tracing::info!(
@@ -494,7 +390,6 @@ impl Orchestrator {
 
                 let (pending, result_rx) = PendingTurn::new(
                     task_id.clone(),
-                    task_type.clone(),
                     redo_ctx.turn_id,
                     redo_ctx.redo_group.clone(),
                 );
@@ -593,7 +488,6 @@ impl Orchestrator {
         });
     }
 
-    /// 下发 execute_turn 消息给 fixlet（redo 路径，需刷新 context）
     async fn dispatch_execute_turn(
         &self,
         task_id: &str,
@@ -616,7 +510,6 @@ impl Orchestrator {
         .await
     }
 
-    /// 下发 execute_turn（复用已构建的 context，避免重复查询）
     async fn dispatch_execute_turn_with_ctx(
         &self,
         task_id: &str,
@@ -668,20 +561,18 @@ impl Orchestrator {
             "redo_count": redo_count,
         });
 
-        // 按 session 的 task_type 路由到对应 fixlet
+        // publish turn.begin(execute_turn) 到 `task-begin-{task_type}`
+        // pull-based: fixlet 竞争消费该 stream 认领 turn,消费后启动 agent。
         let task_type = self.resolve_task_type(task_id).await?;
-        self.registry
-            .send_to_fixlet_for_task_type(&task_type, &msg.to_string())
-            .await
-            .map_err(|e| {
-                AppError::Protocol(format!("Failed to dispatch execute_turn: {}", e))
-            })?;
+        self.store.publish_turn_begin(task_id, &task_type, &msg).await
+            .map_err(|e| AppError::Protocol(format!(
+                "Failed to publish turn.begin to task-begin-{} for task {}: {}",
+                task_type, task_id, e
+            )))?;
 
         tracing::info!(
-            "session {}: dispatched execute_turn turn_id={} redo_count={}",
-            task_id,
-            turn_id,
-            redo_count
+            "session {}: published turn.begin turn_id={} redo_count={} to task-begin-{}",
+            task_id, turn_id, redo_count, task_type
         );
 
         Ok(())
@@ -691,7 +582,6 @@ impl Orchestrator {
 
 
 
-    /// 从 WAL 读取上次尝试的 LLM 缓存（同 turn_id 下所有 llm_completed）
     async fn get_cached_llm_responses(&self, task_id: &str, turn_id: i64) -> Vec<String> {
         match self.store.get_turn_events(task_id, turn_id).await {
             Ok(events) => events
@@ -704,13 +594,8 @@ impl Orchestrator {
         }
     }
 
-    /// 回传 tool_result 到 fixlet
     // ── Turn 完成处理 ────────────────────────────────────────────────
 
-    /// 处理 fixlet 上报的 llm_chunk（流式 token）
-    ///
-    /// token 频率太高,不入 append-only 事件库;走 Redis ephemeral 快路径,
-    /// fixus-stream SUBSCRIBE 同一通道,与 logdbd 事件流 fan-in 转 SSE。
     pub async fn handle_llm_chunk(
         &self,
         task_id: &str,
@@ -727,9 +612,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 处理 fixlet 上报的 llm_completed
-    ///
-    /// 写入 llm_completed Event 到 WAL，包含 token 用量。
     pub async fn handle_llm_completed(
         &self,
         task_id: &str,
@@ -772,10 +654,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 处理 fixlet 上报的 turn_execution_done
-    ///
-    /// 1. WAL: 写 turn_completed
-    /// 2. 通知 HTTP handler（oneshot）
     pub async fn handle_turn_execution_done(
         &self,
         task_id: &str,
@@ -831,10 +709,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 处理 fixlet 上报的 turn_execution_error
-    ///
-    /// Agent 进程异常退出时调用。
-    /// 不立即 fail——先尝试 redo。只有 redo 也失败才写 turn_failed。
     pub async fn handle_turn_execution_error(
         &self,
         task_id: &str,
@@ -928,13 +802,6 @@ impl Orchestrator {
 
     // ── MCP Tool 执行 ─────────────────────────────────────────────────
 
-    /// 执行 MCP 工具调用（由 POST /mcp 触发）
-    ///
-    /// 1. WAL: tool_invoked
-    /// 2. Sandbox 执行
-    /// 3. WAL: tool_completed 或 tool_failed
-    /// 4. 返回执行结果
-    /// 写 turn_failed 并通知 HTTP handler
     async fn fail_turn_and_respond(
         &self,
         task_id: &str,
@@ -975,7 +842,6 @@ impl Orchestrator {
         Ok(outcome)
     }
 
-    /// 启动 `task-lifecycle` stream 消费者,接收 fixlet 的 turn_execution_done。
     pub fn spawn_lifecycle_consumer(
         self: &Arc<Self>,
         broker_addr: &str,
@@ -990,7 +856,7 @@ impl Orchestrator {
         tokio::spawn(async move {
             let consumer_id = format!("fixus-lifecycle-{}", instance_id);
             tracing::info!(
-                "lifecycle consumer starting: broker={} stream=task-lifecycle group={} consumer={}",
+                "lifecycle consumer starting: broker={} stream=task-end group={} consumer={}",
                 broker_addr, group, consumer_id
             );
             loop {
@@ -1010,8 +876,8 @@ impl Orchestrator {
 
 // ── Broker Result Consumer ─────────────────────────────────────────────
 
-/// 后台消费 `tool-results-region-<region>` stream,将 sandbox-server 回传的工具结果
-/// 消费 `tool-results-region-<region>` stream,记录工具结果用于投影和健康检查。
+/// 后台消费 `tool-result-<region>` stream,将 sandbox-server 回传的工具结果
+/// 消费 `tool-result-<region>` stream,记录工具结果用于投影和健康检查。
 async fn run_result_consumer(
     orch: &Arc<Orchestrator>,
     broker_addr: &str,
@@ -1111,13 +977,13 @@ async fn run_lifecycle_consumer(
     let mut consumer = GroupConsumer::join(
         format!("http://{}", broker_addr),
         namespace,
-        "task-lifecycle",
+        "task-end",
         group,
         consumer_id,
     )
     .await
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    tracing::info!("lifecycle consumer joined {} ({}), shards: {:?}", group, consumer_id, consumer.assigned_shards());
+    tracing::info!("lifecycle consumer joined {} ({}) stream=task-end, shards: {:?}", group, consumer_id, consumer.assigned_shards());
 
     let mut frames = consumer.consume_frames().await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -1137,15 +1003,39 @@ async fn run_lifecycle_consumer(
         };
         match frame.payload {
             Some(Payload::Record(rec)) => {
-                if rec.event_type != "turn_execution_done" { continue; }
                 let payload: serde_json::Value = serde_json::from_slice(&rec.content).unwrap_or_default();
                 let task_id = payload["task_id"].as_str().unwrap_or("");
-                let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
-                let max_local_seq = payload["max_local_seq"].as_i64().unwrap_or(0);
-                let final_output = payload["final_output"].as_str().unwrap_or("");
-                if task_id.is_empty() || turn_id == 0 { continue; }
-                tracing::info!("lifecycle: turn_execution_done task={} turn={}", task_id, turn_id);
-                let _ = orch.handle_turn_execution_done(task_id, turn_id, max_local_seq, final_output).await;
+                if task_id.is_empty() { continue; }
+
+                match rec.event_type.as_str() {
+                    "turn_execution_done" => {
+                        let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+                        let max_local_seq = payload["max_local_seq"].as_i64().unwrap_or(0);
+                        let final_output = payload["final_output"].as_str().unwrap_or("");
+                        if turn_id == 0 { continue; }
+                        tracing::info!("lifecycle: turn_execution_done task={} turn={}", task_id, turn_id);
+                        let _ = orch.handle_turn_execution_done(task_id, turn_id, max_local_seq, final_output).await;
+                    }
+                    "llm_completed" => {
+                        let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+                        let model = payload["model"].as_str().unwrap_or("");
+                        let input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let output_tokens = payload.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let total_tokens = payload.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if turn_id == 0 { continue; }
+                        tracing::info!("lifecycle: llm_completed task={} turn={} tokens={}", task_id, turn_id, total_tokens);
+                        let _ = orch.handle_llm_completed(task_id, turn_id, model, input_tokens, output_tokens, total_tokens).await;
+                    }
+                    "turn_execution_error" => {
+                        let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+                        let error_type = payload["error_type"].as_str().unwrap_or("unknown");
+                        let error_message = payload["error_message"].as_str().unwrap_or("");
+                        if turn_id == 0 { continue; }
+                        tracing::info!("lifecycle: turn_execution_error task={} turn={} type={}", task_id, turn_id, error_type);
+                        let _ = orch.handle_turn_execution_error(task_id, turn_id, error_type, error_message).await;
+                    }
+                    _ => {}
+                }
                 let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
             }
             _ => {}
@@ -1239,7 +1129,6 @@ mod tests {
         }
     }
 
-    /// 构建一个接好 store + registry 的 Orchestrator(TokenPublisher 无 Redis 降级)
     fn make_orch(
         store: Arc<dyn EventStore>,
         registry: Arc<TaskRegistry>,
@@ -1247,111 +1136,6 @@ mod tests {
     ) -> Orchestrator {
         Orchestrator::new(store, registry, token_publisher)
     }
-
-    #[tokio::test]
-    async fn handle_claim_denied_when_no_ready_task() {
-        let (store, _d) = setup().await;
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(Arc::new(store), registry, tp);
-
-        // 空队列 → Denied
-        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
-            ClaimOutcome::Denied { reason } => {
-                assert!(reason.contains("no ready task"), "reason: {}", reason);
-            }
-            other => panic!("expected Denied, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_claim_granted_writes_task_claimed_and_brief() {
-        let (store, _d) = setup().await;
-        let store_arc: Arc<dyn EventStore> = Arc::new(store);
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(store_arc.clone(), registry.clone(), tp);
-
-        // 创建 Task,body 带 task_brief
-        let body = serde_json::json!({ "task_brief": "fix db1 deadlocks" });
-        let prov = test_provenance();
-        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, Some(&body))
-            .await
-            .unwrap();
-        wait_seq(&*store_arc, &tid, 1).await;
-
-        // readiness 通过 + 入 claim 队列
-        service::mark_task_ready(&*store_arc, &tid).await.unwrap();
-        wait_seq(&*store_arc, &tid, 2).await;
-        registry
-            .enqueue_ready(tid.clone(), "db.repair".into(), None)
-            .await;
-
-        // claim → Granted
-        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
-            ClaimOutcome::Granted {
-                task_id,
-                task_type,
-                task_brief,
-            } => {
-                assert_eq!(task_id, tid);
-                assert_eq!(task_type, "db.repair");
-                assert_eq!(task_brief, "fix db1 deadlocks");
-            }
-            other => panic!("expected Granted, got {:?}", other),
-        }
-
-        // task_claimed 已写入 → state == Claimed
-        wait_seq(&*store_arc, &tid, 3).await;
-        assert_eq!(
-            store_arc.get_task_state(&tid).await.unwrap(),
-            Some(TaskState::Claimed)
-        );
-
-        // 队列已消费 → 再 claim 同类型 → Denied
-        match orch.handle_claim("db.repair", "fixlet-2").await.unwrap() {
-            ClaimOutcome::Denied { .. } => {}
-            other => panic!("expected Denied after drain, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_claim_denied_when_state_not_ready_invariant_guard() {
-        // 队列里塞了一个尚未 ready(Created 态)的 Task → claim_task 应拒绝(不变量)
-        let (store, _d) = setup().await;
-        let store_arc: Arc<dyn EventStore> = Arc::new(store);
-        let registry = TaskRegistry::new();
-        let tp = TokenPublisher::new().await;
-        let orch = make_orch(store_arc.clone(), registry.clone(), tp);
-
-        let prov = test_provenance();
-        let (tid, _) = service::create_task(&*store_arc, "db.repair", &prov, None)
-            .await
-            .unwrap();
-        wait_seq(&*store_arc, &tid, 1).await;
-        // 故意不 mark_task_ready 就入队(模拟竞态/bug)
-        registry
-            .enqueue_ready(tid.clone(), "db.repair".into(), None)
-            .await;
-
-        match orch.handle_claim("db.repair", "fixlet-1").await.unwrap() {
-            ClaimOutcome::Denied { reason } => {
-                assert!(
-                    reason.contains("claim transition failed"),
-                    "reason: {}",
-                    reason
-                );
-            }
-            other => panic!("expected Denied (invariant), got {:?}", other),
-        }
-        // 状态仍是 Created(未被错误迁移)
-        assert_eq!(
-            store_arc.get_task_state(&tid).await.unwrap(),
-            Some(TaskState::Created)
-        );
-    }
-
-    // ── #77: Health 相关测试 ────────────────────────────────────────────
 
     #[tokio::test]
     async fn health_status_all_unknown_when_fresh() {

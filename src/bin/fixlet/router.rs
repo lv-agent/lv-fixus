@@ -1,16 +1,14 @@
-//! fixlet 消息路由循环
+//! fixlet — 纯 broker 客户端
 //!
-//! fixlet 的核心：连接 fixus（WebSocket），管理 Agent 子进程（ACP stdio），
-//! 双向路由消息。无状态——崩溃后重启即可。
+//! 只连 broker,不连 fixus。通过 broker 接收 execute_turn,启动 Agent 子进程,
+//! 通过 broker 回传 lifecycle 事件。无状态——崩溃后重启即可。
 
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
 use logdb_client::broker::BrokerProducer;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::acp::{self, AcpClient, ParsedAcpEvent};
 use super::idempotency::TurnContext;
@@ -43,9 +41,7 @@ impl MessageAccumulator {
 /// fixlet 配置
 #[derive(Debug, Clone)]
 pub struct FixletConfig {
-    /// fixus Gateway WebSocket URL
-    pub fixus_url: String,
-    /// 此 fixlet 服务的 task_type(fixus 按它路由 execute_turn,不再绑定具体 session_id)
+    /// 此 fixlet 服务的 task_type(决定订阅哪条 `task-begin-{task_type}` stream)
     pub task_type: String,
     /// Agent 启动命令（例如 "claude-agent-acp"）
     pub agent_command: String,
@@ -56,7 +52,6 @@ pub struct FixletConfig {
 impl Default for FixletConfig {
     fn default() -> Self {
         Self {
-            fixus_url: "ws://127.0.0.1:3000/ws/fixlet".into(),
             task_type: "default".into(),
             agent_command: "claude-agent-acp".into(),
             agent_cwd: None,
@@ -64,110 +59,6 @@ impl Default for FixletConfig {
     }
 }
 
-// ── fixus Protocol 消息类型 ─────────────────────────────────────────────
-
-/// fixus → fixlet 消息
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum FixusToFixlet {
-    #[serde(rename = "execute_turn")]
-    ExecuteTurn(ExecuteTurnMsg),
-    #[serde(rename = "tool_result")]
-    ToolResult(ToolResultMsg),
-    #[serde(rename = "pong")]
-    Pong { timestamp: String },
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ExecuteTurnMsg {
-    pub session_id: String,
-    pub turn_id: i64,
-    pub input: TurnInputMsg,
-    pub context: TurnContextMsg,
-    #[serde(default)]
-    pub tools: Vec<fixus::protocol::ToolDefinition>,
-    pub redo_group: String,
-    #[serde(default)]
-    pub redo_count: i32,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TurnInputMsg {
-    pub user_input: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TurnContextMsg {
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub messages: Vec<fixus::Message>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ToolResultMsg {
-    pub step_id: String,
-    pub tool_call_id: String,
-    pub output: Value,
-}
-
-/// fixlet → fixus 消息
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "type")]
-pub enum FixletToFixus {
-    #[serde(rename = "tool_invoked")]
-    ToolInvoked {
-        session_id: String,
-        turn_id: i64,
-        step_id: String,
-        local_seq: i64,
-        tool_name: String,
-        tool_call_id: String,
-        idempotency_key: String,
-        input: Value,
-    },
-    #[serde(rename = "turn_execution_done")]
-    TurnExecutionDone {
-        session_id: String,
-        turn_id: i64,
-        max_local_seq: i64,
-        final_output: String,
-    },
-    #[serde(rename = "turn_execution_error")]
-    TurnExecutionError {
-        session_id: String,
-        turn_id: i64,
-        error_type: String,
-        error_message: String,
-    },
-    #[serde(rename = "llm_chunk")]
-    LlmChunk {
-        session_id: String,
-        turn_id: i64,
-        text: String,
-    },
-    #[serde(rename = "llm_completed")]
-    LlmCompleted {
-        session_id: String,
-        turn_id: i64,
-        model: String,
-        input_tokens: i64,
-        output_tokens: i64,
-        total_tokens: i64,
-        #[serde(default)]
-        cached_read_tokens: i64,
-        #[serde(default)]
-        cached_write_tokens: i64,
-    },
-    #[serde(rename = "ping")]
-    Ping { timestamp: String },
-}
-
-impl FixletToFixus {
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-}
 
 // ── Agent 进程管理 ──────────────────────────────────────────────────────
 
@@ -232,58 +123,49 @@ fn spawn_agent(config: &FixletConfig) -> Option<(tokio::sync::mpsc::UnboundedSen
 
 // ── 主路由循环 ──────────────────────────────────────────────────────────
 
-/// fixlet 主循环
+/// 后台 broker 认领(pull-based):竞争消费 `task-begin-{task_type}` stream,
+/// 认领到 turn.begin(execute_turn)后转交主循环执行。fixlet 不再被动接收 fixus 推送。
 ///
-/// 连接 fixus WebSocket，处理 execute_turn，启动 Agent，双向路由消息。
-/// 把 fixus 的 WebSocket 地址（ws://host:port/ws/fixlet）转成 MCP HTTP 端点
-/// （http://host:port/mcp），用于注册进 ACP session/new 的 mcpServers。
-fn fixus_mcp_url(fixus_url: &str) -> String {
-    let with_http = fixus_url
-        .strip_prefix("wss://")
-        .map(|s| format!("https://{}", s))
-        .or_else(|| fixus_url.strip_prefix("ws://").map(|s| format!("http://{}", s)))
-        .unwrap_or_else(|| fixus_url.to_string());
-    let (scheme, rest) = match with_http.split_once("://") {
-        Some((s, r)) => (s, r),
-        None => return format!("{}/mcp", with_http),
-    };
-    let host_port = rest.split('/').next().unwrap_or(rest);
-    format!("{}://{}/mcp", scheme, host_port)
-}
-
-/// 后台 broker 任务订阅:从 `tasks-{task_type}` stream 获取 ready task,通过 HTTP 认领。
-async fn broker_task_subscriber(config: FixletConfig) {
-    use logdb_client::broker::GroupConsumer;
-    use logdb_broker_proto::pb::consume_response::Payload;
-
+/// 用**稳定 group** `fixlets-{task_type}`:offset 服务端持久化,fixlet 重启后续点,
+/// 不重放历史 turn.begin(unique-per-instance group 每次重启从 earliest 读会重跑所有历史 turn)。
+/// 重启瞬间旧实例的 stale member 由 logdbd session timeout 清理 + 外层 retry 兜底
+/// (前置条件:logdbd shards > 1,否则 consumers > shards 报错)。
+/// fixlet 执行中崩溃:turn 不经 broker 重投,由 fixus turn 级 redo 兜底(发新 turn.begin)。
+async fn turn_claim_subscriber(
+    config: FixletConfig,
+    turn_tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+) {
     let broker_addr = std::env::var("BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:5100".into());
     let namespace = std::env::var("LOGDBD_NAMESPACE").unwrap_or_else(|_| "default".into());
-    let stream = format!("tasks-{}", config.task_type.replace('.', "-"));
-    let consumer_id = format!("fixlet-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
-    let group = format!("fixlets-{}", config.task_type);
+    let sanitized = config.task_type.replace('.', "-");
+    let stream = format!("task-begin-{}", sanitized);
+    let group = format!("fixlets-{}", sanitized);
+    let instance_id = uuid::Uuid::now_v7().to_string().replace('-', "");
+    let consumer_id = format!("fixlet-{}", instance_id);
 
     tracing::info!(
-        "broker task subscriber starting: broker={} stream={} group={}",
-        broker_addr, stream, group
+        "turn claim subscriber starting: broker={} stream={} group={} consumer={}",
+        broker_addr, stream, group, consumer_id
     );
 
     loop {
-        match subscribe_and_claim(&broker_addr, &namespace, &stream, &group, &consumer_id).await {
-            Ok(()) => tracing::info!("task subscriber ended normally"),
+        match claim_turns(&broker_addr, &namespace, &stream, &group, &consumer_id, &turn_tx).await {
+            Ok(()) => tracing::info!("turn claim subscriber ended normally"),
             Err(e) => {
-                tracing::error!("task subscriber error: {}; retrying in 1s", e);
+                tracing::error!("turn claim subscriber error: {}; retrying in 1s", e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
     }
 }
 
-async fn subscribe_and_claim(
+async fn claim_turns(
     broker_addr: &str,
     namespace: &str,
     stream: &str,
     group: &str,
     consumer_id: &str,
+    turn_tx: &tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use logdb_client::broker::GroupConsumer;
     use logdb_broker_proto::pb::consume_response::Payload;
@@ -296,7 +178,7 @@ async fn subscribe_and_claim(
         group,
         consumer_id,
     ).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    tracing::info!("task subscriber joined {} ({}), shards: {:?}", group, consumer_id, consumer.assigned_shards());
+    tracing::info!("turn claim joined {} ({}), shards: {:?}", group, consumer_id, consumer.assigned_shards());
 
     let mut frames = consumer.consume_frames().await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -307,7 +189,7 @@ async fn subscribe_and_claim(
             Ok(f) => { consecutive_errors = 0; f }
             Err(e) => {
                 consecutive_errors += 1;
-                tracing::error!("task consume error (consecutive={}): {}", consecutive_errors, e);
+                tracing::error!("turn claim consume error (consecutive={}): {}", consecutive_errors, e);
                 if consecutive_errors >= 3 {
                     return Err(format!("{} consecutive errors, rejoining", consecutive_errors).into());
                 }
@@ -316,14 +198,15 @@ async fn subscribe_and_claim(
         };
         match frame.payload {
             Some(Payload::Record(rec)) => {
-                if rec.event_type != "task_ready" { continue; }
+                if rec.event_type != "execute_turn" { continue; }
                 let payload: serde_json::Value = serde_json::from_slice(&rec.content).unwrap_or_default();
-                let task_id = payload["task_id"].as_str().unwrap_or("");
-                if task_id.is_empty() { continue; }
-
-                tracing::info!("task subscriber: received ready task {} — consuming directly", task_id);
-                // broker shard 分配已排他,消费即认领。直接 commit,不调 HTTP。
+                let task_id = payload.get("session_id").and_then(|v| v.as_str())
+                    .or_else(|| payload.get("task_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                tracing::info!("turn claim: received turn.begin task={} — committing and forwarding", task_id);
+                // commit 后转主循环执行;崩溃由 fixus redo 兜底(turn 级恢复)
                 let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
+                let _ = turn_tx.send(payload);
             }
             Some(Payload::CaughtUp(_)) | Some(Payload::Rebalance(_)) | Some(Payload::Assignment(_)) => {}
             None => {}
@@ -334,10 +217,14 @@ async fn subscribe_and_claim(
 }
 
 pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // 启动 broker 任务订阅(后台,不阻塞 WS 主循环)
-    let broker_config = config.clone();
+    // turn claim subscriber ↔ 主循环 通道: subscriber 认领 turn.begin 后传给主循环执行
+    let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    // 启动 turn 认领订阅(后台 pull-based,竞争消费 task-begin-{task_type})
+    let claim_config = config.clone();
+    let claim_turn_tx = turn_tx.clone();
     tokio::spawn(async move {
-        broker_task_subscriber(broker_config).await;
+        turn_claim_subscriber(claim_config, claim_turn_tx).await;
     });
 
     // broker lifecycle producer: turn_execution_done 等事件通过 broker 回传 fixus
@@ -368,334 +255,246 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
             }
         };
 
+    let lifecycle_producer_clone = lifecycle_producer.clone();
+    let lifecycle_namespace = namespace.clone();
+    let redis_conn_clone = redis_conn.clone();
+
+    // Agent 状态（在多次 execute_turn 间复用）
+    let mut active_turn: Option<TurnContext> = None;
+    let mut agent_stdin: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
+    let mut agent_stdout: Option<tokio::sync::mpsc::UnboundedReceiver<String>> = None;
+    let mut agent_child: Option<Child> = None;
+    let mut msg_accumulator = MessageAccumulator::new();
+
     loop {
-        tracing::info!("Connecting to fixus at {}", config.fixus_url);
+        tokio::select! {
+            // ── turn claim subscriber → turn.begin 到达 ──
+            Some(et_payload) = turn_rx.recv() => {
+                let task_id = et_payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+                tracing::info!("turn.begin received via broker: task={}", task_id);
 
-        let ws = match connect_async(&config.fixus_url).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                tracing::error!("Failed to connect to fixus: {}. Retrying in 3s...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                continue;
+                if let Err(e) = handle_execute_turn_from_broker(
+                    &et_payload,
+                    &mut active_turn,
+                    &mut agent_stdin,
+                    &mut agent_stdout,
+                    &mut agent_child,
+                    &config,
+                    &mut msg_accumulator,
+                    &lifecycle_producer_clone,
+                    &lifecycle_namespace,
+                ).await {
+                    tracing::error!("Error handling execute_turn: {}", e);
+                }
             }
-        };
 
-        tracing::info!("Connected to fixus");
-
-        let (mut ws_tx_raw, mut ws_rx) = ws.split();
-
-        // 发送 register 消息，声明此 fixlet 服务的 task_type
-        let register_msg = serde_json::json!({
-            "type": "register",
-            "task_type": config.task_type,
-        });
-        if let Err(e) = ws_tx_raw.send(Message::Text(register_msg.to_string().into())).await {
-            tracing::error!("Failed to send register message: {}", e);
-            continue;
-        }
-        tracing::info!("Registered for task_type {}", config.task_type);
-
-        let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx_raw));
-        let lifecycle_producer = lifecycle_producer.clone();
-        let lifecycle_namespace = namespace.clone();
-        let redis_conn = redis_conn.clone();
-
-        // 当前 activate Turn 上下文（每次 execute_turn 时替换）
-        let mut active_turn: Option<TurnContext> = None;
-        let mut agent_stdin: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
-        let mut agent_stdout: Option<tokio::sync::mpsc::UnboundedReceiver<String>> = None;
-        // Child 进程 handle（用于监控退出）
-        let mut agent_child: Option<Child> = None;
-        // 流式消息累积器
-        let mut msg_accumulator = MessageAccumulator::new();
-
-        // 发送一个初始 ping 告知 fixus fixlet 已就绪
-        {
-            let ping = FixletToFixus::Ping {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            };
-            let mut tx = ws_tx.lock().await;
-            let _ = tx.send(Message::Text(ping.to_json().into())).await;
-        }
-
-        loop {
-            tokio::select! {
-                // ── fixus → fixlet (WebSocket) ──
-                msg = ws_rx.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Err(e) = handle_fixus_message(
-                                &text,
-                                &ws_tx,
-                                &mut active_turn,
-                                &mut agent_stdin,
-                                &mut agent_stdout,
-                                &mut agent_child,
-                                &config,
-                                &mut msg_accumulator,
-                            ).await {
-                                tracing::error!("Error handling fixus message: {}", e);
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            tracing::warn!("fixus WebSocket closed, reconnecting...");
-                            break; // 跳出内层循环，重新连接
-                        }
-                        Some(Ok(Message::Ping(data))) => {
-                            let mut tx = ws_tx.lock().await;
-                            let _ = tx.send(Message::Pong(data)).await;
-                        }
-                        _ => {}
-                    }
+            // ── Agent → fixlet (stdout) ──
+            agent_msg = async {
+                match &mut agent_stdout {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
                 }
-
-                // ── Agent → fixlet (stdout) ──
-                agent_msg = async {
-                    match &mut agent_stdout {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(text) = agent_msg {
-                        if let Some(ref mut ctx) = active_turn {
-                            if let Err(e) = handle_agent_message(
-                                &text,
-                                ctx,
-                                &ws_tx,
-                                agent_stdin.as_ref(),
-                                &mut msg_accumulator,
-                                &redis_conn,
-                                &lifecycle_producer,
-                                &lifecycle_namespace,
-                            ).await {
-                                tracing::error!("Error handling agent message: {}", e);
-                            }
+            } => {
+                if let Some(text) = agent_msg {
+                    if let Some(ref mut ctx) = active_turn {
+                        if let Err(e) = handle_agent_message(
+                            &text,
+                            ctx,
+                            agent_stdin.as_ref(),
+                            &mut msg_accumulator,
+                            &redis_conn_clone,
+                            &lifecycle_producer_clone,
+                            &lifecycle_namespace,
+                        ).await {
+                            tracing::error!("Error handling agent message: {}", e);
                         }
                     }
                 }
+            }
 
-                // ── Agent 进程退出检测 ──
-                _ = async {
-                    match &mut agent_child {
-                        Some(child) => {
-                            let status = child.wait().await;
-                            Some(status)
-                        }
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    tracing::warn!("Agent process exited unexpectedly");
-                    if let Some(ref ctx) = active_turn {
-                        let error_msg = FixletToFixus::TurnExecutionError {
-                            session_id: ctx.task_id.clone(),
-                            turn_id: ctx.turn_id,
-                            error_type: "agent_process_exited".into(),
-                            error_message: "Agent process exited unexpectedly".into(),
-                        };
-                        let mut tx = ws_tx.lock().await;
-                        let _ = tx.send(Message::Text(error_msg.to_json().into())).await;
-                    }
-                    agent_stdin = None;
-                    agent_stdout = None;
-                    agent_child = None;
-                    active_turn = None;
+            // ── Agent 进程退出检测 ──
+            _ = async {
+                match &mut agent_child {
+                    Some(child) => { let status = child.wait().await; Some(status) }
+                    None => std::future::pending().await,
                 }
+            } => {
+                tracing::warn!("Agent process exited unexpectedly");
+                if let Some(ref ctx) = active_turn {
+                    let err_payload = serde_json::json!({
+                        "task_id": ctx.task_id,
+                        "turn_id": ctx.turn_id,
+                        "error_type": "agent_process_exited",
+                        "error_message": "Agent process exited unexpectedly",
+                        "event_type": "turn_execution_error",
+                    });
+                    let content = serde_json::to_vec(&err_payload).unwrap_or_default();
+                    let mut lp = lifecycle_producer_clone.lock().await;
+                    if let Err(e) = lp.produce_full(
+                        &lifecycle_namespace, "task-end", "turn_execution_error", &content,
+                        Some(&ctx.task_id), 0, "application/json", &std::collections::HashMap::from([
+                            ("task_id".into(), ctx.task_id.clone()),
+                            ("event_type".into(), "turn_execution_error".into()),
+                        ]),
+                    ).await {
+                        tracing::error!("broker produce turn_execution_error failed: {}", e);
+                    }
+                    drop(lp);
+                }
+                agent_stdin = None;
+                agent_stdout = None;
+                agent_child = None;
+                active_turn = None;
             }
         }
     }
 }
 
-/// 处理来自 fixus 的消息
-async fn handle_fixus_message(
-    text: &str,
-    ws_tx: &std::sync::Arc<tokio::sync::Mutex<impl SinkExt<Message> + Unpin>>,
+/// 处理来自 broker `task-begin-{task_type}` stream 的 turn.begin(execute_turn) payload
+async fn handle_execute_turn_from_broker(
+    payload: &serde_json::Value,
+    
     active_turn: &mut Option<TurnContext>,
     agent_stdin: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
     agent_stdout: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     agent_child: &mut Option<Child>,
     config: &FixletConfig,
     msg_accumulator: &mut MessageAccumulator,
+    lifecycle_producer: &Arc<tokio::sync::Mutex<BrokerProducer>>,
+    lifecycle_namespace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let msg: FixusToFixlet = serde_json::from_str(text)?;
+    let task_id = payload["session_id"].as_str().unwrap_or("");
+    let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+    let user_input = payload["input"]["user_input"].as_str().unwrap_or("");
+    let redo_group = payload["redo_group"].as_str().unwrap_or("");
+    let redo_count = payload["redo_count"].as_i64().unwrap_or(0) as i32;
+    let summary = payload["context"]["summary"].as_str().unwrap_or("");
+    let messages: Vec<fixus::Message> = serde_json::from_value(
+        payload["context"]["messages"].clone()
+    ).unwrap_or_default();
 
-    match msg {
-        FixusToFixlet::ExecuteTurn(et) => {
-            tracing::info!("Received execute_turn: session={}, turn={}", et.session_id, et.turn_id);
+    if task_id.is_empty() || turn_id == 0 {
+        return Err("missing session_id or turn_id".into());
+    }
 
-            // 1. 创建 Turn 上下文，重置消息累积器
-            msg_accumulator.reset();
-            let mut ctx = TurnContext::new(
-                et.session_id.clone(),
-                et.turn_id,
-                et.redo_group.clone(),
-                et.redo_count,
-            );
-            *active_turn = Some(ctx.clone());
+    tracing::info!("execute_turn: session={} turn={} redo_count={}", task_id, turn_id, redo_count);
 
-            // 2. 如果 redo_count > 0，告知 Agent 这是重做
-            let redo_note = if et.redo_count > 0 {
-                format!(
-                    "\n[fixus] This is a retry (redo_count={}, redo_group={}). Idempotency keys are available for safe retry.",
-                    et.redo_count, et.redo_group
-                )
-            } else {
-                String::new()
-            };
+    msg_accumulator.reset();
+    let mut ctx = TurnContext::new(task_id.to_string(), turn_id, redo_group.to_string(), redo_count);
+    *active_turn = Some(ctx.clone());
 
-            // 3. 构建 ACP prompt
-            let user_input = format!("{}{}", et.input.user_input, redo_note);
-            let prompt_blocks = acp::build_acp_prompt(
-                &et.context.summary,
-                &et.context.messages,
-                &user_input,
-            );
-            // ACP session/prompt 不接受 tools 字段（工具通过 session/new 的 mcpServers 注册）。
-            // 此处传空 vec,future:ACP spec 若支持 prompt-level tools 再恢复。
+    let redo_note = if redo_count > 0 {
+        format!("\n[fixus] This is a retry (redo_count={}, redo_group={}).", redo_count, redo_group)
+    } else { String::new() };
 
-            // 4. 启动新的 Agent 子进程（如果尚未启动或需要重启）
-            //
-            // 已知限制:Agent 进程跨 task 复用。fixlet 首次 execute_turn 时创建 agent 并
-            // session/new,后续 task 复用同一 agent 进程,通过 session/prompt 构造的
-            // session_id。但 claude-agent-acp 不认构造的 session_id(它只认 session/new
-            // 返回的真实 sessionId),导致跨 task 时 X-Fixus-Session-Id header 携带的是
-            // 首个 task 的 id,tools/call 归属到错误 task。
-            //
-            // 当前 workaround:每个 task 重启 fixlet。正确修复:每个 task 做 session/new +
-            // 捕获真实 sessionId,用 map 维护 session_id → task_id 映射。
-            if agent_child.is_none() {
-                if let Some((stdin_tx, stdout_rx, child)) = spawn_agent(config) {
-                    *agent_stdin = Some(stdin_tx.clone());
-                    *agent_stdout = Some(stdout_rx);
-                    *agent_child = Some(child);
+    let full_input = format!("{}{}", user_input, redo_note);
+    let prompt_blocks = acp::build_acp_prompt(summary, &messages, &full_input);
 
-                    // ACP 初始化握手
-                    let mut acp = AcpClient::new(et.session_id.clone());
-                    acp.set_stdin_tx(stdin_tx.clone());
+    // ── 1. 确保 agent 进程存在（整个 fixlet 生命周期内只 spawn 一次；复用进程省启动开销）──
+    if agent_child.is_none() {
+        match spawn_agent(config) {
+            Some((stdin_tx, stdout_rx, child)) => {
+                *agent_stdin = Some(stdin_tx.clone());
+                *agent_stdout = Some(stdout_rx);
+                *agent_child = Some(child);
 
-                    acp.initialize();
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                    // session/new — 需要 mcpServers 参数，响应中包含真实 sessionId
-                    //
-                    // ACP 的 session/prompt 没有 `tools` 字段（fixus 之前在 session/prompt
-                    // 里塞的 fixus_* 工具定义会被 claude-agent-acp 忽略），模型可见的工具
-                    // 只能来自 session/new 的 mcpServers。这里把 fixus 自身的 /mcp 端点注册
-                    // 进去：claude-agent-acp 连上后通过 tools/list 拿到 fixus_bash 等工具，
-                    // 模型调用时由 claude-agent-acp 发 tools/call 到 fixus /mcp，
-                    // fixus 的 orchestrator.execute_tool 执行（WAL + sandbox）。
-                    //
-                    // task_id 通过 X-Fixus-Session-Id header 注入：tools-bank /mcp 的 tools/call
-                    // 靠这个 header 把工具调用归属到正确的 task。
-                    let tools_bank_url = std::env::var("TOOLS_BANK_URL")
-                        .unwrap_or_else(|_| "http://127.0.0.1:3001/mcp".into());
-                    tracing::info!(
-                        "Registering tools-bank MCP server for task {}: {}",
-                        et.session_id, tools_bank_url
-                    );
-                    let session_new_id = acp.next_req_id();
-                    let session_new_msg = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": session_new_id,
-                        "method": "session/new",
-                        "params": {
-                            "cwd": config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into()),
-                            "mcpServers": [{
-                                "type": "http",
-                                "name": "fixus",
-                                "url": tools_bank_url,
-                                "headers": [
-                                    {"name": "X-Fixus-Session-Id", "value": et.session_id}
-                                ]
-                            }]
-                        }
-                    });
-                    acp.send_raw(&session_new_msg.to_string());
-
-                    // 等待 session/new 响应以获取真实 sessionId
-                    let real_session_id = loop {
-                        match agent_stdout.as_mut().unwrap().recv().await {
-                            Some(line) => {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                                    if v.get("id").and_then(|i| i.as_i64()) == Some(session_new_id) {
-                                        if let Some(sid) = v.get("result")
-                                            .and_then(|r| r.get("sessionId"))
-                                            .and_then(|s| s.as_str())
-                                        {
-                                            let model = v.get("result")
-                                                .and_then(|r| r.get("models"))
-                                                .and_then(|m| m.get("currentModelId"))
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or("");
-                                            tracing::info!("ACP session/new: sessionId={} model={}", sid, model);
-                                            ctx.model = model.to_string();
-                                            *active_turn = Some(ctx.clone()); // 同步更新
-                                            break Some(sid.to_string());
-                                        }
-                                    }
-                                    // 忽略中间通知
-                                }
-                            }
-                            None => { break None; }
-                        }
-                    };
-
-                    let real_sid = real_session_id
-                        .unwrap_or_else(|| format!("fixus:{}:turn_{}", et.session_id, et.turn_id));
-
-                    acp.session_prompt(&real_sid, prompt_blocks, vec![]);
-                } else {
-                    let error_msg = FixletToFixus::TurnExecutionError {
-                        session_id: et.session_id,
-                        turn_id: et.turn_id,
-                        error_type: "agent_spawn_failed".into(),
-                        error_message: "Failed to spawn agent process".into(),
-                    };
-                    let mut tx = ws_tx.lock().await;
-                    let _ = tx.send(Message::Text(error_msg.to_json().into())).await;
-                }
-            } else {
-                // Agent 已在运行，直接发 prompt
-                let mut acp = AcpClient::new(et.session_id.clone());
-                acp.set_stdin_tx(agent_stdin.as_ref().unwrap().clone());
-                acp.session_prompt(
-                    &format!("{}:turn_{}", et.session_id, et.turn_id),
-                    prompt_blocks,
-                    vec![],
-                );
-            }
-        }
-
-        FixusToFixlet::ToolResult(tr) => {
-            tracing::info!(
-                "Received tool_result: step_id={}, tool_call_id={}",
-                tr.step_id,
-                tr.tool_call_id
-            );
-
-            // 将结果转发给 Agent（ACP tool_result）
-            if let Some(ref stdin_tx) = agent_stdin {
-                let result_json = serde_json::to_string(&tr.output).unwrap_or_default();
-                let mut acp = AcpClient::new(
-                    active_turn
-                        .as_ref()
-                        .map(|c| c.task_id.clone())
-                        .unwrap_or_default(),
-                );
+                let mut acp = AcpClient::new(task_id.to_string());
                 acp.set_stdin_tx(stdin_tx.clone());
-
-                let session_id = active_turn
-                    .as_ref()
-                    .map(|c| format!("{}:turn_{}", c.task_id, c.turn_id))
-                    .unwrap_or_default();
-
-                acp.tool_result(&session_id, &tr.tool_call_id, &result_json);
+                acp.initialize();
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-        }
-
-        FixusToFixlet::Pong { .. } => {
-            // 心跳 pong，无需处理
+            None => {
+                tracing::error!("Failed to spawn agent process for task {}", task_id);
+                let err = serde_json::json!({
+                    "task_id": task_id, "turn_id": turn_id,
+                    "error_type": "agent_spawn_failed",
+                    "error_message": "Failed to spawn agent process",
+                    "event_type": "turn_execution_error",
+                });
+                let mut lp = lifecycle_producer.lock().await;
+                let _ = lp.produce_full(lifecycle_namespace, "task-end", "turn_execution_error",
+                    &serde_json::to_vec(&err).unwrap_or_default(), Some(task_id), 0,
+                    "application/json", &std::collections::HashMap::from([
+                        ("task_id".into(), task_id.to_string()),
+                        ("event_type".into(), "turn_execution_error".into()),
+                    ])).await;
+                drop(lp);
+                return Ok(());
+            }
         }
     }
+
+    // ── 2. 每个 turn 起新 session ──
+    // fixus 每 turn 重放全量上下文(context.messages=完整历史)。若复用 session,
+    // agent 自身存的历史会与 fixus 重放的历史重叠(上一轮内容讲两遍)。故每 turn 起新 session:
+    // 复用 agent 进程(省 spawn+initialize),不复用 session(避免重复 + 天然多 task,
+    // 每个 session/new 绑各自 task_id 到 tools-bank MCP header)。
+    let tools_bank_url = std::env::var("TOOLS_BANK_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3001/mcp".into());
+    tracing::info!("session/new for task {} turn {}: tools-bank={}", task_id, turn_id, tools_bank_url);
+
+    let mut acp = AcpClient::new(task_id.to_string());
+    acp.set_stdin_tx(agent_stdin.as_ref().unwrap().clone());
+
+    let session_new_id = acp.next_req_id();
+    acp.send_raw(&serde_json::json!({
+        "jsonrpc": "2.0", "id": session_new_id, "method": "session/new",
+        "params": {
+            "cwd": config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into()),
+            "mcpServers": [{
+                "type": "http", "name": "fixus", "url": tools_bank_url,
+                "headers": [{"name": "X-Fixus-Session-Id", "value": task_id}]
+            }]
+        }
+    }).to_string());
+
+    let real_session_id = loop {
+        match agent_stdout.as_mut().unwrap().recv().await {
+            Some(line) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v.get("id").and_then(|i| i.as_i64()) == Some(session_new_id) {
+                        if let Some(sid) = v.get("result").and_then(|r| r.get("sessionId")).and_then(|s| s.as_str()) {
+                            let model = v.get("result").and_then(|r| r.get("models"))
+                                .and_then(|m| m.get("currentModelId")).and_then(|s| s.as_str()).unwrap_or("");
+                            tracing::info!("ACP session/new: sessionId={} model={}", sid, model);
+                            ctx.model = model.to_string();
+                            *active_turn = Some(ctx.clone());
+                            break Some(sid.to_string());
+                        }
+                    }
+                }
+            }
+            None => { break None; }
+        }
+    };
+
+    // session/new 期间 agent stdout 关闭 ⇒ agent 进程已退出。清空进程句柄以便下个 turn 重新 spawn,
+    // 并回 turn_execution_error(不再用编造的 session id 硬发 prompt——那只会得到 Session not found)。
+    let real_sid = match real_session_id {
+        Some(sid) => sid,
+        None => {
+            tracing::error!("session/new failed for task {} (agent closed stdout) — agent likely dead", task_id);
+            *agent_stdin = None;
+            *agent_stdout = None;
+            *agent_child = None;
+            let err = serde_json::json!({
+                "task_id": task_id, "turn_id": turn_id,
+                "error_type": "session_create_failed",
+                "error_message": "Agent closed stdout during session/new",
+                "event_type": "turn_execution_error",
+            });
+            let mut lp = lifecycle_producer.lock().await;
+            let _ = lp.produce_full(lifecycle_namespace, "task-end", "turn_execution_error",
+                &serde_json::to_vec(&err).unwrap_or_default(), Some(task_id), 0,
+                "application/json", &std::collections::HashMap::from([
+                    ("task_id".into(), task_id.to_string()),
+                    ("event_type".into(), "turn_execution_error".into()),
+                ])).await;
+            drop(lp);
+            return Ok(());
+        }
+    };
+    acp.session_prompt(&real_sid, prompt_blocks, vec![]);
 
     Ok(())
 }
@@ -704,7 +503,7 @@ async fn handle_fixus_message(
 async fn handle_agent_message(
     text: &str,
     ctx: &mut TurnContext,
-    ws_tx: &std::sync::Arc<tokio::sync::Mutex<impl SinkExt<Message> + Unpin>>,
+    
     _agent_stdin: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
     msg_acc: &mut MessageAccumulator,
     redis_conn: &Arc<tokio::sync::Mutex<Option<redis::aio::ConnectionManager>>>,
@@ -743,49 +542,42 @@ async fn handle_agent_message(
             // 不处理思考过程
         }
 
-        ParsedAcpEvent::ToolCall(tc) => {
-            // Agent 请求执行 Tool → 转发给 fixus
-            let meta = ctx.prepare_tool_call(&tc.name, &tc.toolCallId, &tc.arguments);
-
-            tracing::info!(
-                "Agent tool_call: {} (step_id={}, local_seq={})",
-                tc.name,
-                meta.step_id,
-                meta.local_seq
+        ParsedAcpEvent::ToolCall(_tc) => {
+            // Agent tool calls 现在由 claude-agent-acp 直接通过 MCP 调用 tools-bank,
+            // 不再经 fixus WS 转发。此处仅记录。
+            tracing::debug!(
+                "Agent tool_call: {} (id={}) — handled by MCP",
+                _tc.name, _tc.toolCallId
             );
-
-            let msg = FixletToFixus::ToolInvoked {
-                session_id: ctx.task_id.clone(),
-                turn_id: ctx.turn_id,
-                step_id: meta.step_id,
-                local_seq: meta.local_seq,
-                tool_name: tc.name,
-                tool_call_id: tc.toolCallId,
-                idempotency_key: meta.idempotency_key,
-                input: tc.arguments,
-            };
-
-            let mut tx = ws_tx.lock().await;
-            let _ = tx.send(Message::Text(msg.to_json().into())).await;
         }
 
         ParsedAcpEvent::FinalMessage { usage } => {
             let final_text = msg_acc.finalize();
 
-            // 先发送 llm_completed（含 usage + model 数据）
+            // llm_completed → broker lifecycle (替代 WS)
             if let Some(ref u) = usage {
-                let llm_msg = FixletToFixus::LlmCompleted {
-                    session_id: ctx.task_id.clone(),
-                    turn_id: ctx.turn_id,
-                    model: ctx.model.clone(),
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    total_tokens: u.total_tokens,
-                    cached_read_tokens: u.cached_read_tokens,
-                    cached_write_tokens: u.cached_write_tokens,
-                };
-                let mut tx = ws_tx.lock().await;
-                let _ = tx.send(Message::Text(llm_msg.to_json().into())).await;
+                let llm_payload = serde_json::json!({
+                    "task_id": ctx.task_id,
+                    "turn_id": ctx.turn_id,
+                    "model": ctx.model,
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "total_tokens": u.total_tokens,
+                    "event_type": "llm_completed",
+                });
+                let content = serde_json::to_vec(&llm_payload).unwrap_or_default();
+                let mut lp = lifecycle_producer.lock().await;
+                if let Err(e) = lp.produce_full(
+                    &lifecycle_namespace, "task-end", "llm_completed", &content,
+                    Some(&ctx.task_id), 0, "application/json", &std::collections::HashMap::from([
+                        ("task_id".into(), ctx.task_id.clone()),
+                        ("event_type".into(), "llm_completed".into()),
+                    ]),
+                ).await {
+                    tracing::error!("broker produce llm_completed failed: {}", e);
+                }
+                drop(lp);
+
                 tracing::info!(
                     "LLM completed: {} input + {} output = {} total tokens",
                     u.input_tokens, u.output_tokens, u.total_tokens
@@ -814,7 +606,7 @@ async fn handle_agent_message(
 
             let mut lp = lifecycle_producer.lock().await;
             if let Err(e) = lp.produce_full(
-                &lifecycle_namespace, "task-lifecycle", "turn_execution_done", &content,
+                &lifecycle_namespace, "task-end", "turn_execution_done", &content,
                 Some(&ctx.task_id), 0, "application/json", &meta,
             ).await {
                 tracing::error!("broker produce turn_execution_done failed: {}", e);
@@ -834,69 +626,3 @@ async fn handle_agent_message(
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fixlet_to_fixus_serialization() {
-        let msg = FixletToFixus::ToolInvoked {
-            session_id: "sess_1".into(),
-            turn_id: 1,
-            step_id: "step_1".into(),
-            local_seq: 3,
-            tool_name: "Bash".into(),
-            tool_call_id: "call_42".into(),
-            idempotency_key: "sess_1:rg_abc:Bash:abc123".into(),
-            input: serde_json::json!({"command": "echo hello"}),
-        };
-
-        let json = msg.to_json();
-        let parsed: Value = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed["type"], "tool_invoked");
-        assert_eq!(parsed["session_id"], "sess_1");
-        assert_eq!(parsed["step_id"], "step_1");
-        assert_eq!(parsed["local_seq"], 3);
-        assert_eq!(parsed["tool_name"], "Bash");
-    }
-
-    #[test]
-    fn test_deserialize_execute_turn() {
-        let json = r#"{
-            "type": "execute_turn",
-            "session_id": "sess_1",
-            "turn_id": 1,
-            "input": {"user_input": "hello"},
-            "context": {"summary": "", "messages": []},
-            "tools": [],
-            "redo_group": "rg_abc",
-            "redo_count": 0
-        }"#;
-
-        let msg: FixusToFixlet = serde_json::from_str(json).unwrap();
-        match msg {
-            FixusToFixlet::ExecuteTurn(et) => {
-                assert_eq!(et.session_id, "sess_1");
-                assert_eq!(et.turn_id, 1);
-                assert_eq!(et.redo_group, "rg_abc");
-                assert_eq!(et.input.user_input, "hello");
-            }
-            _ => panic!("Expected ExecuteTurn"),
-        }
-    }
-
-    #[test]
-    fn test_llm_chunk_serialization() {
-        let msg = FixletToFixus::LlmChunk {
-            session_id: "sess_1".into(),
-            turn_id: 1,
-            text: "hello".into(),
-        };
-        let json = msg.to_json();
-        let parsed: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["type"], "llm_chunk");
-        assert_eq!(parsed["text"], "hello");
-    }
-}

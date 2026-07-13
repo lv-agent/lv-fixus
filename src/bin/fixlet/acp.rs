@@ -181,22 +181,6 @@ pub struct ToolCallEvent {
     pub arguments: Value,
 }
 
-/// Tool Result 消息（Client → Agent）
-#[derive(Debug, Clone, Serialize)]
-#[allow(non_snake_case)]
-pub struct ToolResultMessage {
-    pub sessionId: String,
-    pub toolCallId: String,
-    pub content: Vec<ToolResultContent>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-pub enum ToolResultContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-}
-
 /// Final Message 事件（Agent → Client）
 #[derive(Debug, Clone, Deserialize)]
 #[allow(non_snake_case)]
@@ -282,18 +266,28 @@ pub fn parse_acp_message(msg: &str) -> Option<ParsedAcpEvent> {
                         .unwrap_or("");
                     return Some(ParsedAcpEvent::ThoughtChunk(text.to_string()));
                 }
-                "tool_call" => {
+                "tool_call" | "tool_call_update" => {
                     // Claude Code 的 tool_call 在 session/update 中
+                    // tool_call_update 是新版 ACP 的 tool call 进度更新格式
                     if let Ok(tc) = serde_json::from_value::<ToolCallEvent>(update.clone()) {
                         return Some(ParsedAcpEvent::ToolCall(tc));
                     }
+                    // 解析失败时打印原始消息便于调试
+                    tracing::warn!(
+                        "Failed to parse tool_call/tool_call_update: {}",
+                        serde_json::to_string(&update).unwrap_or_default()
+                    );
                 }
                 "available_commands_update" | "usage_update" => {
                     // 元信息，忽略（可记录日志）
                     return Some(ParsedAcpEvent::Other(value));
                 }
                 _ => {
-                    tracing::debug!("Unknown session/update type: {}", update_type);
+                    tracing::debug!(
+                        "Unknown session/update type: {} payload={}",
+                        update_type,
+                        serde_json::to_string(&update).unwrap_or_default().chars().take(200).collect::<String>()
+                    );
                 }
             }
         }
@@ -443,25 +437,6 @@ impl AcpClient {
         self.send(&req.to_json());
     }
 
-    /// 发送 tool_result 回 Agent
-    pub fn tool_result(
-        &mut self,
-        session_id: &str,
-        tool_call_id: &str,
-        result_text: &str,
-    ) {
-        let msg = ToolResultMessage {
-            sessionId: session_id.to_string(),
-            toolCallId: tool_call_id.to_string(),
-            content: vec![ToolResultContent::Text {
-                text: result_text.to_string(),
-            }],
-        };
-
-        let req = AcpRequest::notification("tool_result", serde_json::to_value(msg).unwrap());
-        self.send(&req.to_json());
-    }
-
     /// 取消 session
     pub fn session_cancel(&mut self, session_id: &str) {
         let params = serde_json::json!({"sessionId": session_id});
@@ -553,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_notification_no_id() {
-        let req = AcpRequest::notification("tool_result", serde_json::json!({}));
+        let req = AcpRequest::notification("session/update", serde_json::json!({}));
         let json = req.to_json();
         let parsed: Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("id").is_none() || parsed["id"].is_null());

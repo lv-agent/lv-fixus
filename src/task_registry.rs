@@ -1,24 +1,15 @@
-//! Session Registry — fixlet 连接 + 活跃 Turn 管理
+//! Session Registry — 进程内 Turn 协调
 //!
-//! 维护两个映射：
-//! - **task_type → fixlet WebSocket sender**(按 task_type 路由 execute_turn 给 fixlet)
-//! - task_id → PendingTurn(Turn 完成时通知 HTTP handler;turn 属 session,仍按 task_id)
-//!
-//! 为什么按 task_type 而非 task_id:上游(如 nuntius)每次创建随机 task_id,
-//! 但 fixlet 实例按它服务的 task_type 注册。按 task_type 路由让任意同类型 session
-//! 都能命中对应 fixlet,无需 task_id 协调。
+//! broker 架构后,fixlet 不再 WS 连 fixus:turn 派发走 broker `task-begin-{type}`,
+//! turn 完成走 broker `task-end`。turn 认领由 fixlet 竞争消费 broker stream 完成,
+//! fixus 进程内不再维护 ready 队列。本注册表只剩**进程内**协调:
+//! - task_id → PendingTurn(Turn 完成时兑现 oneshot,通知 dispatch 后台任务)
 //!
 //! 线程安全：使用 RwLock，写少读多。
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-
-// ── 类型别名 ────────────────────────────────────────────────────────────
-
-/// WebSocket 消息发送通道
-pub type WsSender = tokio::sync::mpsc::UnboundedSender<String>;
 
 // ── TurnOutcome ─────────────────────────────────────────────────────────
 
@@ -45,8 +36,6 @@ pub enum TurnOutcome {
 /// 一个正在等待结果的 Turn
 pub struct PendingTurn {
     pub task_id: String,
-    /// 该 turn 所属 session 的 task_type(fixlet 断连时按它快速失败同类型 pending turn)
-    pub task_type: String,
     pub turn_id: i64,
     pub redo_group: String,
     /// Turn 完成时通知 HTTP handler
@@ -56,7 +45,6 @@ pub struct PendingTurn {
 impl PendingTurn {
     pub fn new(
         task_id: String,
-        task_type: String,
         turn_id: i64,
         redo_group: String,
     ) -> (Self, oneshot::Receiver<TurnOutcome>) {
@@ -64,7 +52,6 @@ impl PendingTurn {
         (
             Self {
                 task_id,
-                task_type,
                 turn_id,
                 redo_group,
                 result_tx: tx,
@@ -76,191 +63,17 @@ impl PendingTurn {
 
 // ── TaskRegistry ─────────────────────────────────────────────────────
 
-/// 队列中的 ready Task(等待执行器 claim)
-#[derive(Debug, Clone)]
-pub struct ReadyTask {
-    pub task_id: String,
-    pub task_type: String,
-    /// blocked 恢复时,优先 offer 给原执行器(spec §4.3)
-    pub preferred_claimant: Option<String>,
-    /// 全局入队序号(FIFO 公平性 + liveness 兜底取最旧)
-    pub seq: u64,
-}
-
-/// claim 匹配结果
-#[derive(Debug, Clone)]
-pub struct ClaimedTask {
-    pub task_id: String,
-    pub task_type: String,
-}
-
-impl From<ReadyTask> for ClaimedTask {
-    fn from(r: ReadyTask) -> Self {
-        Self {
-            task_id: r.task_id,
-            task_type: r.task_type,
-        }
-    }
-}
-
-/// 单个 task_type 的 ready 队列:双 deque 结构,claim_next O(1)。
-/// - `neutral`:无 preferred_claimant 的任务(FIFO)
-/// - `preferred`:claimant → 该 claimant 专属(优先认领)的任务
-#[derive(Debug, Default)]
-struct ReadyQueue {
-    neutral: VecDeque<ReadyTask>,
-    preferred: HashMap<String, VecDeque<ReadyTask>>,
-}
-
-/// 全局 fixlet 连接注册表(按 task_type 路由)+ 活跃 Turn
+/// 进程内 Turn 协调(Turn 完成时兑现 oneshot,通知 dispatch 后台任务)
 pub struct TaskRegistry {
-    /// task_type → fixlet WebSocket sender(一种 task_type 一个 fixlet;worker-pool 待扩展)
-    by_task_type: RwLock<HashMap<String, WsSender>>,
     /// task_id → 当前活跃的 PendingTurn
     active_turns: RwLock<HashMap<String, PendingTurn>>,
-    /// task_type → 待认领的 ready Task 双 deque 队列
-    ready_queue: RwLock<HashMap<String, ReadyQueue>>,
-    /// ready 队列入队序号(全局单调,FIFO 公平性)
-    seq_counter: AtomicU64,
 }
 
 impl TaskRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            by_task_type: RwLock::new(HashMap::new()),
             active_turns: RwLock::new(HashMap::new()),
-            ready_queue: RwLock::new(HashMap::new()),
-            seq_counter: AtomicU64::new(0),
         })
-    }
-
-    // ── fixlet 连接管理(按 task_type)──
-
-    /// fixlet 连接时注册它服务的 task_type(一种 task_type 一个 fixlet)
-    pub async fn register_fixlet(&self, task_type: &str, sender: WsSender) {
-        let mut map = self.by_task_type.write().await;
-        let old = map.insert(task_type.to_string(), sender);
-        if old.is_some() {
-            tracing::info!(
-                "task_type {}: fixlet reconnected (old connection replaced)",
-                task_type
-            );
-        } else {
-            tracing::info!("task_type {}: fixlet registered", task_type);
-        }
-    }
-
-    /// fixlet 断开时注销其 task_type,并快速失败该类型下所有 pending turn
-    /// (fixlet 已断,继续等只会拖到 turn 超时;主动通知 HTTP handler)
-    pub async fn unregister_fixlet(&self, task_type: &str) {
-        self.by_task_type.write().await.remove(task_type);
-
-        let mut turns = self.active_turns.write().await;
-        let to_fail: Vec<String> = turns
-            .iter()
-            .filter(|(_, p)| p.task_type == task_type)
-            .map(|(sid, _)| sid.clone())
-            .collect();
-        for sid in to_fail {
-            if let Some(p) = turns.remove(&sid) {
-                let _ = p.result_tx.send(TurnOutcome::Failed {
-                    turn_id: p.turn_id,
-                    error_type: "fixlet_disconnected".into(),
-                    error_message: format!("fixlet for task_type {} disconnected", task_type),
-                });
-            }
-        }
-        tracing::info!("task_type {}: fixlet unregistered", task_type);
-    }
-
-    /// 查找服务于指定 task_type 的 fixlet 发送通道
-    pub async fn get_fixlet_for_task_type(&self, task_type: &str) -> Option<WsSender> {
-        let map = self.by_task_type.read().await;
-        map.get(task_type).cloned()
-    }
-
-    /// 向服务于指定 task_type 的 fixlet 发送消息
-    pub async fn send_to_fixlet_for_task_type(
-        &self,
-        task_type: &str,
-        msg: &str,
-    ) -> Result<(), String> {
-        let sender = self
-            .get_fixlet_for_task_type(task_type)
-            .await
-            .ok_or_else(|| format!("No fixlet connected for task_type {}", task_type))?;
-
-        sender.send(msg.to_string()).map_err(|e| {
-            format!(
-                "Failed to send message to fixlet for task_type {}: {}",
-                task_type, e
-            )
-        })
-    }
-
-    // ── Claim 队列(ready Task 待认领)──
-
-    /// 把 ready Task 入队(orchestrator 在 mark_task_ready 后调用)。
-    /// `preferred_claimant` 用于 blocked 恢复时优先原执行器(spec §4.3)。
-    pub async fn enqueue_ready(
-        &self,
-        task_id: String,
-        task_type: String,
-        preferred_claimant: Option<String>,
-    ) {
-        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
-        let task = ReadyTask {
-            task_id,
-            task_type,
-            preferred_claimant: preferred_claimant.clone(),
-            seq,
-        };
-        let mut q = self.ready_queue.write().await;
-        let queue = q.entry(task.task_type.clone()).or_default();
-        match preferred_claimant {
-            Some(c) => queue
-                .preferred
-                .entry(c)
-                .or_default()
-                .push_back(task),
-            None => queue.neutral.push_back(task),
-        }
-    }
-
-    /// claimant 认领一个 task_type 的 ready Task(O(1) 常规路径)。
-    ///
-    /// 顺序:
-    /// 1. `preferred[claimant]` 非空 → 取其队首(claimant 专属优先,O(1))
-    /// 2. `neutral` 非空 → 取队首(无 preferred 的 FIFO,O(1))
-    /// 3. liveness 兜底:取**别的** claimant 的 preferred 中最旧的一项(O(num_claimants),个位数)
-    ///    —— spec §4.3「允许其他 agent 认领」(原执行器超时/拒绝时)
-    // TODO(Plan D): fixus 重启后 ready_queue 为空,需从 get_task_state==Ready 的事件流重建。
-    pub async fn claim_next(
-        &self,
-        task_type: &str,
-        claimant: &str,
-    ) -> Option<ClaimedTask> {
-        let mut q = self.ready_queue.write().await;
-        let queue = q.get_mut(task_type)?;
-
-        // 1. claimant 专属
-        if let Some(dq) = queue.preferred.get_mut(claimant) {
-            if let Some(task) = dq.pop_front() {
-                return Some(ClaimedTask::from(task));
-            }
-        }
-        // 2. neutral FIFO
-        if let Some(task) = queue.neutral.pop_front() {
-            return Some(ClaimedTask::from(task));
-        }
-        // 3. liveness:别的 claimant 的 preferred 里取最旧(seq 最小)
-        let (claimant_key, min_seq) = queue
-            .preferred
-            .iter()
-            .filter_map(|(k, dq)| dq.front().map(|t| (k.clone(), t.seq)))
-            .min_by_key(|(_, s)| *s)?;
-        let task = queue.preferred.get_mut(&claimant_key)?.pop_front()?;
-        Some(ClaimedTask::from(task))
     }
 
     // ── PendingTurn 管理 ──
@@ -322,48 +135,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_register_and_send() {
-        let registry = TaskRegistry::new();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("database.repair", tx).await;
-
-        registry
-            .send_to_fixlet_for_task_type("database.repair", "hello")
-            .await
-            .unwrap();
-
-        let msg = rx.recv().await.unwrap();
-        assert_eq!(msg, "hello");
-    }
-
-    #[tokio::test]
-    async fn test_send_to_unknown_task_type_fails() {
-        let registry = TaskRegistry::new();
-        let result = registry
-            .send_to_fixlet_for_task_type("nonexistent", "msg")
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_unregister_cleanup() {
-        let registry = TaskRegistry::new();
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("database.repair", tx).await;
-        assert!(registry.get_fixlet_for_task_type("database.repair").await.is_some());
-
-        registry.unregister_fixlet("database.repair").await;
-        assert!(registry.get_fixlet_for_task_type("database.repair").await.is_none());
-    }
-
-    #[tokio::test]
     async fn test_pending_turn_lifecycle() {
         let registry = TaskRegistry::new();
 
         let (pending, mut rx) =
-            PendingTurn::new("sess_1".into(), "database.repair".into(), 1, "rg_001".into());
+            PendingTurn::new("sess_1".into(), 1, "rg_001".into());
         registry.register_pending_turn("sess_1", pending).await;
 
         // 完成 Turn
@@ -391,158 +167,4 @@ mod tests {
         assert!(registry.take_pending_turn("sess_1").await.is_none());
     }
 
-    #[tokio::test]
-    async fn test_unregister_fails_pending_turns_of_task_type() {
-        let registry = TaskRegistry::new();
-
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("database.repair", tx).await;
-
-        // 两个同 task_type 的 session 都有 pending turn
-        let (p1, mut rx1) =
-            PendingTurn::new("sess_a".into(), "database.repair".into(), 1, "rg1".into());
-        let (p2, mut rx2) =
-            PendingTurn::new("sess_b".into(), "database.repair".into(), 1, "rg2".into());
-        // 另一种 task_type 的 pending turn 不应被动
-        let (p3, mut rx3) =
-            PendingTurn::new("sess_c".into(), "deploy.service".into(), 1, "rg3".into());
-        registry.register_pending_turn("sess_a", p1).await;
-        registry.register_pending_turn("sess_b", p2).await;
-        registry.register_pending_turn("sess_c", p3).await;
-
-        // database.repair 的 fixlet 断开 → 该类型 pending turn 快速失败,deploy.service 不受影响
-        registry.unregister_fixlet("database.repair").await;
-
-        match rx1.try_recv().unwrap() {
-            TurnOutcome::Failed { error_type, .. } => assert_eq!(error_type, "fixlet_disconnected"),
-            other => panic!("Expected Failed for sess_a, got {:?}", other),
-        }
-        assert!(matches!(
-            rx2.try_recv().unwrap(),
-            TurnOutcome::Failed { .. }
-        ));
-        // deploy.service 的 turn 仍在等待
-        assert!(rx3.try_recv().is_err());
-        assert!(registry.take_pending_turn("sess_c").await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_claim_queue_fifo() {
-        let registry = TaskRegistry::new();
-
-        // 两个 ready 的同 task_type 任务
-        registry
-            .enqueue_ready("task_a".into(), "db.repair".into(), None)
-            .await;
-        registry
-            .enqueue_ready("task_b".into(), "db.repair".into(), None)
-            .await;
-
-        // fixlet-1 claim:FIFO → task_a
-        let c1 = registry.claim_next("db.repair", "fixlet-1").await;
-        assert_eq!(c1.map(|c| c.task_id), Some("task_a".into()));
-
-        // 无 task_type 匹配 → None
-        assert!(registry.claim_next("other.type", "fixlet-1").await.is_none());
-
-        // task_b 仍 ready
-        let c2 = registry.claim_next("db.repair", "fixlet-2").await;
-        assert_eq!(c2.map(|c| c.task_id), Some("task_b".into()));
-        assert!(registry.claim_next("db.repair", "fixlet-3").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_blocked_requeue_prefers_original_claimant() {
-        let registry = TaskRegistry::new();
-        // blocked 恢复回 ready,带 preferred_claimant=fixlet-1
-        registry
-            .enqueue_ready("task_x".into(), "db.repair".into(), Some("fixlet-1".into()))
-            .await;
-        registry
-            .enqueue_ready("task_y".into(), "db.repair".into(), None)
-            .await;
-
-        // fixlet-1 claim:优先 preferred → task_x
-        let c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
-        assert_eq!(c.task_id, "task_x");
-
-        // fixlet-2 claim(无 preferred 匹配):task_y
-        let c = registry.claim_next("db.repair", "fixlet-2").await.unwrap();
-        assert_eq!(c.task_id, "task_y");
-    }
-
-    #[tokio::test]
-    async fn test_register_by_task_type() {
-        let registry = TaskRegistry::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.register_fixlet("db.repair", tx).await;
-        assert!(registry.get_fixlet_for_task_type("db.repair").await.is_some());
-    }
-
-    // ── 性能测试(#[ignore])──────────────────────────────────────────────
-    // 跑法:cargo test --lib -- --ignored perf_ --nocapture
-
-    fn report_ns(name: &str, mut samples: Vec<u64>) {
-        samples.sort_unstable();
-        let n = samples.len();
-        if n == 0 {
-            println!("[perf] {}: no samples", name);
-            return;
-        }
-        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
-        let sum: u64 = samples.iter().sum();
-        println!(
-            "[perf] {:<28} n={:>6}  p50={:>6}ns  p95={:>6}ns  p99={:>6}ns  avg={:>6}ns  total={:.2}µs",
-            name, n, p(50), p(95), p(99), sum / n as u64, sum as f64 / 1000.0
-        );
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn perf_claim_next_fifo() {
-        // FIFO 路径(无 preferred_claimant 扫描):enqueue N,逐个 claim。
-        let registry = TaskRegistry::new();
-        let n = 5000;
-        for i in 0..n {
-            registry
-                .enqueue_ready(format!("task_{}", i), "db.repair".into(), None)
-                .await;
-        }
-        let mut ns = Vec::with_capacity(n);
-        for _ in 0..n {
-            let t0 = std::time::Instant::now();
-            let c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
-            ns.push(t0.elapsed().as_nanos() as u64);
-            assert_eq!(c.task_type, "db.repair");
-        }
-        report_ns("claim_next (FIFO)", ns);
-        // 队列已耗尽
-        assert!(registry.claim_next("db.repair", "fixlet-1").await.is_none());
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn perf_claim_next_preferred_scan() {
-        // preferred-miss 路径(claimant 无专属任务):neutral 空 → liveness 兜底取别的
-        // claimant 的 preferred 中最旧一项,O(num_claimants) 而非 O(queue)。
-        let registry = TaskRegistry::new();
-        let n = 5000;
-        // 全部 preferred=other-claimant;claimant=fixlet-1 走 liveness 兜底
-        for i in 0..n {
-            registry
-                .enqueue_ready(
-                    format!("task_{}", i),
-                    "db.repair".into(),
-                    Some("other".into()),
-                )
-                .await;
-        }
-        let mut ns = Vec::with_capacity(n);
-        for _ in 0..n {
-            let t0 = std::time::Instant::now();
-            let _c = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
-            ns.push(t0.elapsed().as_nanos() as u64);
-        }
-        report_ns("claim_next (preferred-miss, liveness fallback)", ns);
-    }
 }

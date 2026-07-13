@@ -251,7 +251,7 @@ async fn tools_call(
     let timeout_secs = default_timeout(tool_name);
     let sandbox_timeout_ms = timeout_secs.saturating_sub(5).max(5) * 1000;
     let work_dir = state.work_dir.to_string_lossy().to_string();
-    let stream = format!("tools-region-{}", state.region);
+    let stream = format!("tool-invoke-{}", state.region);
 
     let payload = serde_json::json!({
         "step_type": "tool_call",
@@ -356,7 +356,7 @@ async fn run_result_consumer(
     namespace: &str,
     region: &str,
 ) {
-    let stream = format!("tool-results-region-{}", region);
+    let stream = format!("tool-result-{}", region);
     let instance_id = Uuid::now_v7().to_string().replace('-', "");
     let group = format!("tools-bank-results-{}", &instance_id[..12]);
     let consumer_id = format!("tools-bank-{}", instance_id);

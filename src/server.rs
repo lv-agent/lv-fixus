@@ -6,18 +6,16 @@
 //! - 事件记录（单个、批量）
 //! - 上下文构建
 //! - 恢复管理
-//! - WebSocket（fixlet 长连接）
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{ws::Message, Path, State, WebSocketUpgrade},
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use crate::error::AppError;
 use crate::orchestrator::Orchestrator;
@@ -206,8 +204,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/sessions/{task_id}/token-usage",
             get(get_token_usage_handler),
         )
-        // WebSocket
-        .route("/ws/fixlet", get(fixlet_ws_handler))
         // Health
         .route("/health", get(health_handler))
         .with_state(state)
@@ -319,26 +315,9 @@ async fn mark_ready_handler(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
+    // task_ready 退回纯 WAL 状态事件:turn 认领已改 broker pull-based(认领的是 turn,不是 task),
+    // 不再需要 broker stream 也不需要内存 claim 队列。
     let event = service::mark_task_ready(&*state.store, &task_id).await?;
-
-    let task = service::get_task_info(&*state.store, &task_id)
-        .await?
-        .ok_or_else(|| AppError::TaskNotFound(task_id.clone()))?;
-    let task_brief = task.body.as_ref()
-        .and_then(|b| b.get("task_brief"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    // 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅(替代内存队列)
-    if let Err(e) = state.store.publish_ready_task(&task_id, &task.task_type, task_brief, None).await {
-        tracing::warn!("publish_ready_task failed for {}: {} — falling back to memory queue", task_id, e);
-    }
-
-    // 同时入内存队列(兼容直连 fixlet 的 WS claim 路径;broker 路径优先)
-    state
-        .registry
-        .enqueue_ready(task_id.clone(), task.task_type, None)
-        .await;
 
     Ok(Json(ApiResponse::ok(serde_json::json!({
         "task_id": event.task_id,
@@ -680,218 +659,6 @@ async fn get_token_usage_handler(
     Ok(Json(ApiResponse::ok(stats)))
 }
 
-// ── WebSocket Handler ───────────────────────────────────────────────────
-
-/// fixlet WebSocket handler — 消息路由到 Orchestrator
-async fn fixlet_ws_handler(
-    State(state): State<AppState>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_fixlet_ws(socket, state))
-}
-
-async fn handle_fixlet_ws(
-    socket: axum::extract::ws::WebSocket,
-    state: AppState,
-) {
-    tracing::info!("fixlet WebSocket connected");
-
-    let (mut ws_tx, mut ws_rx) = socket.split();
-    let orch = orchestrator(&state);
-
-    // 创建 mpsc channel 用于 orchestrator → fixlet 的下行消息
-    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-    // 当前连接服务的 task_type(收到 register 后确定,用于按 task_type 路由)
-    let mut current_task_type: Option<String> = None;
-
-    loop {
-        tokio::select! {
-            // ── fixlet → fixus (WebSocket 上行) ──
-            ws_msg = ws_rx.next() => {
-                match ws_msg {
-                    Some(Ok(Message::Text(text))) => {
-                        let text_str = text.to_string();
-
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text_str) {
-                            let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                            match msg_type {
-                                // fixlet 注册自己服务的 task_type(按 task_type 路由,
-                                // 不再绑定具体 task_id)
-                                "register" => {
-                                    if let Some(at) = parsed.get("task_type").and_then(|v| v.as_str()) {
-                                        tracing::info!("fixlet registered for task_type {}", at);
-                                        current_task_type = Some(at.to_string());
-                                        state.registry.register_fixlet(at, msg_tx.clone()).await;
-                                    } else {
-                                        tracing::warn!(
-                                            "fixlet register missing task_type: {}",
-                                            text_str
-                                        );
-                                    }
-                                }
-
-                                // 执行器认领 ready Task(spec §8.3 pull-based claim)
-                                "claim" => {
-                                    let task_type = parsed["task_type"].as_str().unwrap_or("");
-                                    let claimant = parsed["claimant"].as_str().unwrap_or("");
-                                    match orch.handle_claim(task_type, claimant).await {
-                                        Ok(crate::orchestrator::ClaimOutcome::Granted {
-                                            task_id,
-                                            task_type,
-                                            task_brief,
-                                        }) => {
-                                            // 构建 context(从事件流)并下发 claim_granted
-                                            let ctx = match crate::context::build_llm_context(
-                                                &*state.store,
-                                                &task_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(c) => c,
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        "claim: build context failed for {}: {}",
-                                                        task_id,
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            };
-                                            let granted = serde_json::json!({
-                                                "type": "claim_granted",
-                                                "session_id": task_id, // wire 名保留(值=task_id)
-                                                "task_type": task_type,
-                                                "task_brief": task_brief,
-                                                "context": {
-                                                    "summary": ctx.summary,
-                                                    "messages": ctx.messages,
-                                                },
-                                            });
-                                            if let Err(e) = state
-                                                .registry
-                                                .send_to_fixlet_for_task_type(&task_type, &granted.to_string())
-                                                .await
-                                            {
-                                                tracing::error!("claim: send claim_granted failed: {}", e);
-                                            }
-                                        }
-                                        Ok(crate::orchestrator::ClaimOutcome::Denied { reason }) => {
-                                            let denied = serde_json::json!({
-                                                "type": "claim_denied",
-                                                "reason": reason
-                                            });
-                                            let _ = state
-                                                .registry
-                                                .send_to_fixlet_for_task_type(task_type, &denied.to_string())
-                                                .await;
-                                        }
-                                        Err(e) => tracing::error!("handle_claim error: {}", e),
-                                    }
-                                }
-
-                                // Agent 请求执行 Tool
-                                // Agent 完成 Turn
-                                "turn_execution_done" => {
-                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
-                                    let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
-                                    let max_local_seq = parsed["max_local_seq"].as_i64().unwrap_or(0);
-                                    let final_output = parsed["final_output"].as_str().unwrap_or("");
-
-                                    if let Err(e) = orch.handle_turn_execution_done(
-                                        task_id, turn_id, max_local_seq, final_output,
-                                    ).await {
-                                        tracing::error!("handle_turn_execution_done failed: {}", e);
-                                    }
-                                }
-
-                                // Agent 进程异常退出
-                                "turn_execution_error" => {
-                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
-                                    let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
-                                    let error_type = parsed["error_type"].as_str().unwrap_or("unknown");
-                                    let error_message = parsed["error_message"].as_str().unwrap_or("");
-
-                                    if let Err(e) = orch.handle_turn_execution_error(
-                                        task_id, turn_id, error_type, error_message,
-                                    ).await {
-                                        tracing::error!("handle_turn_execution_error failed: {}", e);
-                                    }
-                                }
-
-                                // LLM 流式 token（实时转发）
-                                "llm_chunk" => {
-                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
-                                    let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
-                                    let text = parsed["text"].as_str().unwrap_or("");
-                                    let _ = orch.handle_llm_chunk(task_id, turn_id, text).await;
-                                }
-
-                                // LLM 调用完成（含 token 用量）
-                                "llm_completed" => {
-                                    let task_id = parsed["session_id"].as_str().unwrap_or("");
-                                    let turn_id = parsed["turn_id"].as_i64().unwrap_or(0);
-                                    let model = parsed["model"].as_str().unwrap_or("");
-                                    let input_tokens = parsed["input_tokens"].as_i64().unwrap_or(0);
-                                    let output_tokens = parsed["output_tokens"].as_i64().unwrap_or(0);
-                                    let total_tokens = parsed["total_tokens"].as_i64().unwrap_or(0);
-
-                                    if let Err(e) = orch.handle_llm_completed(
-                                        task_id, turn_id, model,
-                                        input_tokens, output_tokens, total_tokens,
-                                    ).await {
-                                        tracing::error!("handle_llm_completed failed: {}", e);
-                                    }
-                                }
-
-                                // 心跳
-                                "ping" => {
-                                    let pong = serde_json::json!({
-                                        "type": "pong",
-                                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    });
-                                    let _ = ws_tx.send(Message::Text(pong.to_string().into())).await;
-                                }
-
-                                _ => {
-                                    tracing::debug!("Unknown fixlet message type: {}", msg_type);
-                                }
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        let _ = ws_tx.send(Message::Pong(data)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        tracing::info!("fixlet WebSocket disconnected");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            // ── fixus → fixlet (下行消息路由) ──
-            down_msg = msg_rx.recv() => {
-                match down_msg {
-                    Some(msg) => {
-                        if ws_tx.send(Message::Text(msg.into())).await.is_err() {
-                            tracing::error!("Failed to send message to fixlet via WS");
-                            break;
-                        }
-                    }
-                    None => break, // mpsc channel closed
-                }
-            }
-        }
-    }
-
-    // fixlet 断连时清理(按 task_type 注销 + 快速失败该类型 pending turn)
-    if let Some(ref at) = current_task_type {
-        state.registry.unregister_fixlet(at).await;
-    }
-}
-
 // ── Health Handler ──────────────────────────────────────────────────────
 
 async fn health_handler(
@@ -997,10 +764,10 @@ mod tests {
         }
     }
 
-    /// 直调 handler(不经 HTTP 栈),验证 /ready 端到端:写 task_ready + 入 claim 队列
+    /// 直调 handler(不经 HTTP 栈),验证 /ready 端到端:写 task_ready 事件 + 投影到 ready
     #[tokio::test]
-    async fn mark_ready_handler_writes_event_and_enqueues() {
-        let (state, registry, _d) = setup().await;
+    async fn mark_ready_handler_writes_event() {
+        let (state, _registry, _d) = setup().await;
         let prov = test_provenance();
         let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None)
             .await
@@ -1023,10 +790,6 @@ mod tests {
             state.store.get_task_state(&tid).await.unwrap(),
             Some(crate::models::TaskState::Ready)
         );
-
-        // 已入 claim 队列 → claim_next 能取到
-        let claimed = registry.claim_next("db.repair", "fixlet-1").await.unwrap();
-        assert_eq!(claimed.task_id, tid);
     }
 
     /// 直调 /state handler

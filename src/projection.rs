@@ -155,7 +155,9 @@ impl TaskProjection {
             EventType::TaskCanceled => self.state = TaskState::Canceled,
 
             EventType::TurnStarted => {
-                if self.state == TaskState::Claimed {
+                // pull-based 模型下无独立 task 级 claim(fixlet 认领的是 turn),
+                // 故 turn 派发时 task 从 Ready 或 Claimed 直接进入 Executing。
+                if matches!(self.state, TaskState::Ready | TaskState::Claimed) {
                     self.state = TaskState::Executing;
                 }
                 if let Some(tid) = turn_id {
@@ -356,6 +358,15 @@ impl ProjectionCache {
             m.order.push_back(task_id.to_string());
         }
         proj
+    }
+
+    /// 失效缓存项(下次 ensure_projection 会重新 catch_up)。
+    /// 用于 broker forwarder lag 时强制重读——catch_up 可能领先于 forwarder tail
+    /// 发出 CaughtUp 信号却没看到刚写入的事件(如 task_created),留下空投影。
+    pub async fn invalidate(&self, task_id: &str) {
+        let mut m = self.inner.write().await;
+        m.map.remove(task_id);
+        m.order.retain(|id| id != task_id);
     }
 
     /// 从 broker consume 新事件,建/更新投射。

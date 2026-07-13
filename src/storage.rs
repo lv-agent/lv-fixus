@@ -110,11 +110,15 @@ pub trait EventStore: Send + Sync {
 
     // ── Dispatch ────────────────────────────────────────────────────────
 
-    /// 把 ready task 发布到 broker stream `tasks-{task_type}`,供 fixlet 订阅。
+    /// 把 turn.begin(execute_turn) 发布到 `task-begin-{task_type}`,供 fixlet 竞争认领。
     /// 默认 no-op;BrokerEventStore 覆盖。
-    async fn publish_ready_task(&self, _task_id: &str, _task_type: &str, _task_brief: &str, _preferred_claimant: Option<&str>) -> Result<()> {
+    async fn publish_turn_begin(&self, _task_id: &str, _task_type: &str, _payload: &serde_json::Value) -> Result<()> {
         Ok(())
     }
+
+    /// 失效 task 投影缓存(下次 get_task 重新 catch_up)。默认 no-op;BrokerEventStore 覆盖。
+    /// 用于 broker forwarder lag 时强制重读(catch_up 可能没看到刚写的事件)。
+    async fn invalidate_projection(&self, _task_id: &str) {}
 
     /// 把工具事件发到 sandbox dispatch stream(Plan D)。
     /// 默认 no-op;BrokerEventStore 覆盖。
