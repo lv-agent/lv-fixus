@@ -531,6 +531,60 @@ pub fn classify_failure(error_type: &str, _error_message: &str) -> FailureReason
     }
 }
 
+/// write chokepoint 的 task 迁移合法性 guard(CR-7 defense-in-depth)。
+///
+/// 非任务态事件(llm/tool/turn-非 started)→ 直接 Ok(不关心 task 态)。
+/// 任务态事件 → 校验 `current → target` 合法(复用 [`TaskState::can_transition`]),
+/// **特判 `turn_started`**:pull-based 可从 `Ready|Claimed` 直入 `Executing`(跳过 claimed)。
+/// `current=None`(冷缓存/首事件)→ 仅 `task_created` 合法。
+///
+/// 设计见 `docs/superpowers/plans/2026-07-13-cr7-write-invariant-guard.md`。
+pub fn validate_task_event_transition(
+    current: Option<TaskState>,
+    event_type: EventType,
+) -> crate::error::Result<()> {
+    use TaskState::*;
+    let target: Option<TaskState> = match event_type {
+        EventType::TaskCreated => Some(Created),
+        EventType::TaskReady => Some(Ready),
+        EventType::TaskClaimed => Some(Claimed),
+        EventType::TaskBlocked => Some(Blocked),
+        EventType::TaskSucceeded => Some(Succeeded),
+        EventType::TaskFailed => Some(Failed),
+        EventType::TaskCanceled => Some(Canceled),
+        EventType::TurnStarted => Some(Executing),
+        _ => return Ok(()), // 非任务态事件:不改变 task 态,不校验
+    };
+    let target = target.unwrap();
+    match current {
+        None => {
+            if event_type == EventType::TaskCreated {
+                Ok(())
+            } else {
+                Err(crate::error::AppError::LifecycleInvariant(format!(
+                    "{:?}:无当前态(首事件必须是 task_created)", event_type
+                )))
+            }
+        }
+        Some(from) => {
+            let legal = if event_type == EventType::TurnStarted {
+                // pull-based:Ready 或 Claimed → Executing(可跳 claimed)
+                matches!(from, Ready | Claimed)
+            } else {
+                TaskState::can_transition(from, target)
+            };
+            if legal {
+                Ok(())
+            } else {
+                Err(crate::error::AppError::LifecycleInvariant(format!(
+                    "非法 task 迁移:{:?} → {:?}(事件 {:?})",
+                    from, target, event_type
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod failure_reason_tests {
     use super::*;
@@ -580,6 +634,141 @@ mod failure_reason_tests {
         assert_eq!(FailureReason::RedoDispatchFailed.as_str(), "redo_dispatch_failed");
         assert_eq!(FailureReason::ApplicationError.as_str(), "application_error");
         assert_eq!(FailureReason::Unknown.as_str(), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod write_invariant_tests {
+    use super::*;
+    use crate::error::AppError;
+
+    #[test]
+    fn guard_allows_legal_task_transitions() {
+        // Created → Ready
+        assert!(validate_task_event_transition(Some(TaskState::Created), EventType::TaskReady).is_ok());
+        // Ready → Claimed
+        assert!(validate_task_event_transition(Some(TaskState::Ready), EventType::TaskClaimed).is_ok());
+        // Claimed → Executing(经 turn_started)
+        assert!(validate_task_event_transition(Some(TaskState::Claimed), EventType::TurnStarted).is_ok());
+        // Executing → Succeeded / Failed / Canceled
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::TaskSucceeded).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::TaskFailed).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::TaskCanceled).is_ok());
+        // Executing → Blocked;Blocked → Ready
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::TaskBlocked).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Blocked), EventType::TaskReady).is_ok());
+        // Created → Canceled;Ready → Canceled
+        assert!(validate_task_event_transition(Some(TaskState::Created), EventType::TaskCanceled).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Ready), EventType::TaskCanceled).is_ok());
+    }
+
+    #[test]
+    fn guard_rejects_illegal_task_transitions() {
+        // Created → Failed(跳过 ready/executing)
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Created), EventType::TaskFailed),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        // 终态迁出:Succeeded → Ready
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Succeeded), EventType::TaskReady),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        // Created → Claimed(跳过 ready)
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Created), EventType::TaskClaimed),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        // 重复 task_created(已有当前态)
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Created), EventType::TaskCreated),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+    }
+
+    #[test]
+    fn guard_turn_started_special_from_ready() {
+        // pull-based:turn_started 从 Ready 合法(跳 claimed);从 Executing/Blocked/Created 非法
+        assert!(validate_task_event_transition(Some(TaskState::Ready), EventType::TurnStarted).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Claimed), EventType::TurnStarted).is_ok());
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Executing), EventType::TurnStarted),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Blocked), EventType::TurnStarted),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        assert!(matches!(
+            validate_task_event_transition(Some(TaskState::Created), EventType::TurnStarted),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+    }
+
+    #[test]
+    fn guard_none_current_only_allows_task_created() {
+        assert!(validate_task_event_transition(None, EventType::TaskCreated).is_ok());
+        assert!(matches!(
+            validate_task_event_transition(None, EventType::TaskReady),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+        assert!(matches!(
+            validate_task_event_transition(None, EventType::TurnStarted),
+            Err(AppError::LifecycleInvariant(_))
+        ));
+    }
+
+    #[test]
+    fn guard_ignores_non_task_events() {
+        // llm/tool/turn(非 started)事件不改变 task 态 → Ok
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::LlmInvoked).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::ToolInvoked).is_ok());
+        assert!(validate_task_event_transition(Some(TaskState::Executing), EventType::TurnCompleted).is_ok());
+        assert!(validate_task_event_transition(None, EventType::LlmCompleted).is_ok());
+    }
+
+    // ── 性能(#[ignore],cargo test --lib -- --ignored perf_validate --nocapture)──
+    // guard 纯函数 O(1) match,write chokepoint 每个任务态事件调一次。测 ns/次。
+
+    fn report_perf(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_validate_task_event_transition() {
+        let cases = [
+            (Some(TaskState::Created), EventType::TaskReady),
+            (Some(TaskState::Executing), EventType::TaskFailed),
+            (Some(TaskState::Ready), EventType::TurnStarted),
+            (Some(TaskState::Executing), EventType::LlmInvoked), // 非任务态快路径
+            (None, EventType::TaskCreated),
+        ];
+        for _ in 0..10_000 {
+            for (s, e) in &cases {
+                let _ = validate_task_event_transition(*s, e.clone());
+            }
+        }
+        let n = 50_000;
+        let mut ns = Vec::with_capacity(n);
+        for i in 0..n {
+            let (s, e) = &cases[i % cases.len()];
+            let t0 = std::time::Instant::now();
+            let _ = validate_task_event_transition(*s, e.clone());
+            ns.push(t0.elapsed().as_nanos() as u64);
+        }
+        report_perf("validate_task_event_transition", "ns", ns);
     }
 }
 

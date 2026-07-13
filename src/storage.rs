@@ -642,6 +642,10 @@ impl EventStore for LogdbdEventStore {
             &event.event_type,
             &event.payload,
         )?;
+        // 注:CR-7 task 迁移合法性 guard 只装在 production 路径 broker_store.write_event。
+        // LogdbdEventStore 是 test impl,其 storage-mechanics 测试(seq 连续性/终态唯一/
+        // incomplete turns)需直接写**非全生命周期**事件序列,装 guard 会破坏它们。
+        // service 层 transition_task 已为两 impl 的 service 路径校验迁移合法性。
 
         let content = serde_json::to_vec(&event.payload)
             .map_err(|e| AppError::Internal(format!("json: {}", e)))?;

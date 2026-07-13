@@ -194,6 +194,14 @@ impl EventStore for BrokerEventStore {
     async fn write_event(&self, event: &AgentEvent) -> Result<i64> {
         event.validate_scope().map_err(|msg| AppError::LifecycleInvariant(msg))?;
         crate::models::validate_payload_required_fields(&event.event_type, &event.payload)?;
+        // CR-7:task 迁移合法性(defense-in-depth,防绕过 service 脏写)。current 从投影
+        // 缓存读;冷缓存=None ⇒ 仅 task_created 合法(首事件语义)。task 终态唯一由
+        // can_transition(终态不可迁出)顺带保证。
+        let current = match self.cache.get(&event.task_id).await {
+            Some(proj) => Some(proj.read().await.state),
+            None => None,
+        };
+        crate::models::validate_task_event_transition(current, event.event_type.clone())?;
         let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let meta = event_meta(event);
         let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
