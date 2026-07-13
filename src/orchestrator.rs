@@ -697,6 +697,14 @@ impl Orchestrator {
         )
         .await?;
 
+        // 打点(CR-8):token 用量实时计数(cross-task 观测,按 task_type/model)。
+        let tt = self
+            .resolve_task_type(task_id)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
+        self.metrics
+            .record_llm_tokens(&tt, model, input_tokens, output_tokens, total_tokens);
+
         tracing::info!(
             "session {}: llm_completed turn={} tokens(in={} out={} total={})",
             task_id,
@@ -2010,6 +2018,38 @@ mod tests {
         println!(
             "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
             name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    // ── CR-8 §4.2 集成测试(token metrics)────────────────────────────────
+
+    /// §4.2:handle_llm_completed → token 计数进 metrics(render 含)。
+    #[tokio::test]
+    async fn cr8_llm_completed_records_token_metrics() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry, tp);
+
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_llm_completed(&tid, turn_id, "claude-sonnet-5", 100, 20, 120)
+            .await
+            .unwrap();
+        wait_seq(&*store, &tid, 5).await; // setup 到 4,llm_completed = 5
+
+        let out = orch.metrics_handle().render();
+        assert!(
+            out.contains("fixus_token_input_tokens_total{model=\"claude-sonnet-5\",task_type=\"default\"} 100"),
+            "input tokens:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_token_output_tokens_total{model=\"claude-sonnet-5\",task_type=\"default\"} 20"),
+            "output tokens:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_token_total_tokens_total{model=\"claude-sonnet-5\",task_type=\"default\"} 120"),
+            "total tokens:\n{}", out
         );
     }
 

@@ -204,11 +204,13 @@ impl TaskProjection {
                                 call_count: 0,
                                 prompt_tokens: 0,
                                 completion_tokens: 0,
+                                total_tokens: 0,
                             },
                         );
                         entry.call_count += 1;
                         entry.prompt_tokens += usage["prompt_tokens"].as_i64().unwrap_or(0);
                         entry.completion_tokens += usage["completion_tokens"].as_i64().unwrap_or(0);
+                        entry.total_tokens += usage["total_tokens"].as_i64().unwrap_or(0);
                     }
                 }
             }

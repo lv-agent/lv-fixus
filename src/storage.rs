@@ -1170,6 +1170,10 @@ impl EventStore for LogdbdEventStore {
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|x| x.as_i64())
                 .unwrap_or(0);
+            let total = usage
+                .and_then(|u| u.get("total_tokens"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
 
             let e = map.entry(model.clone()).or_insert_with(|| {
                 TokenUsageStats {
@@ -1177,11 +1181,13 @@ impl EventStore for LogdbdEventStore {
                     call_count: 0,
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    total_tokens: 0,
                 }
             });
             e.call_count += 1;
             e.prompt_tokens += prompt;
             e.completion_tokens += completion;
+            e.total_tokens += total;
         }
         let mut stats: Vec<_> = map.into_values().collect();
         stats.sort_by(|a, b| a.model.cmp(&b.model));

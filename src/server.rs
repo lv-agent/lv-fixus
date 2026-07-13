@@ -697,9 +697,9 @@ async fn write_summary_handler(
 async fn get_token_usage_handler(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> Result<Json<ApiResponse<Vec<crate::models::TokenUsageStats>>>, AppError> {
-    let stats = service::get_token_usage_stats(&*state.store, &task_id).await?;
-    Ok(Json(ApiResponse::ok(stats)))
+) -> Result<Json<ApiResponse<crate::models::TokenUsageResponse>>, AppError> {
+    let by_model = service::get_token_usage_stats(&*state.store, &task_id).await?;
+    Ok(Json(ApiResponse::ok(crate::models::TokenUsageResponse::from_by_model(by_model))))
 }
 
 // ── Health Handler ──────────────────────────────────────────────────────

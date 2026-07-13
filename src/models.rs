@@ -772,6 +772,46 @@ mod write_invariant_tests {
     }
 }
 
+#[cfg(test)]
+mod token_usage_tests {
+    use super::*;
+
+    fn stat(model: &str, calls: i64, p: i64, c: i64, t: i64) -> TokenUsageStats {
+        TokenUsageStats { model: model.into(), call_count: calls, prompt_tokens: p, completion_tokens: c, total_tokens: t }
+    }
+
+    #[test]
+    fn rollup_sums_across_models() {
+        let resp = TokenUsageResponse::from_by_model(vec![
+            stat("claude-sonnet-5", 2, 100, 20, 120),
+            stat("claude-haiku", 1, 50, 5, 55),
+        ]);
+        assert_eq!(resp.totals.call_count, 3);
+        assert_eq!(resp.totals.prompt_tokens, 150);
+        assert_eq!(resp.totals.completion_tokens, 25);
+        assert_eq!(resp.totals.total_tokens, 175);
+        assert_eq!(resp.by_model.len(), 2);
+    }
+
+    #[test]
+    fn rollup_empty_is_zero() {
+        let resp = TokenUsageResponse::from_by_model(vec![]);
+        assert_eq!(resp.totals.total_tokens, 0);
+        assert!(resp.by_model.is_empty());
+    }
+
+    #[test]
+    fn token_usage_stats_serializes_total() {
+        let s = stat("m", 1, 10, 5, 15);
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"total_tokens\":15"));
+        // 反序列化旧数据(无 total_tokens)→ default 0(#[serde(default)])
+        let legacy = r#"{"model":"m","call_count":1,"prompt_tokens":10,"completion_tokens":5}"#;
+        let parsed: TokenUsageStats = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.total_tokens, 0);
+    }
+}
+
 // ── Task ─────────────────────────────────────────────────────────────────
 
 /// Tenant — 多租户隔离单元
@@ -1082,13 +1122,46 @@ pub struct StepExecution {
     pub duration_ms: Option<f64>,
 }
 
-/// Token 消耗统计
+/// Token 消耗统计(per model,单 task)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageStats {
     pub model: String,
     pub call_count: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// 总 token(prompt+completion;CR-8 G1 补全)。某些 backend 直接给 total,优于自算。
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// Token 用量总计(跨 model 汇总,单 task)。CR-8 G1:per-task rollup。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsageTotals {
+    pub call_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// `/token-usage` 响应:per-model 明细 + 跨 model 总计。CR-8 G1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsageResponse {
+    pub by_model: Vec<TokenUsageStats>,
+    pub totals: TokenUsageTotals,
+}
+
+impl TokenUsageResponse {
+    /// 从 per-model 明细算总计 rollup。
+    pub fn from_by_model(by_model: Vec<TokenUsageStats>) -> Self {
+        let mut totals = TokenUsageTotals::default();
+        for s in &by_model {
+            totals.call_count += s.call_count;
+            totals.prompt_tokens += s.prompt_tokens;
+            totals.completion_tokens += s.completion_tokens;
+            totals.total_tokens += s.total_tokens;
+        }
+        Self { by_model, totals }
+    }
 }
 
 // ── 校验工具 ────────────────────────────────────────────────────────────

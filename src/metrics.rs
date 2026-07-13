@@ -27,6 +27,9 @@ pub struct Metrics {
     retry_attempts: IntCounterVec,  // {task_type}
     task_created: IntCounterVec,    // {task_type}
     watchdog_reclaims: IntCounterVec, // {task_type}  CR-6 turn 看门狗回收
+    token_input: IntCounterVec,       // {task_type, model}  CR-8 token 用量(input)
+    token_output: IntCounterVec,      // {task_type, model}  CR-8 token 用量(output)
+    token_total: IntCounterVec,       // {task_type, model}  CR-8 token 用量(total)
     queue_wait: HistogramVec,       // {task_type}  秒
     turn_duration: HistogramVec,    // {task_type, outcome}  秒
     in_flight: IntGaugeVec,         // {task_type}
@@ -81,6 +84,30 @@ impl Metrics {
             &["task_type"],
         )
         .expect("watchdog_reclaims opts");
+        let token_input = IntCounterVec::new(
+            Opts::new(
+                "fixus_token_input_tokens_total",
+                "Input (prompt) tokens consumed, summed per llm_completed (CR-8)",
+            ),
+            &["task_type", "model"],
+        )
+        .expect("token_input opts");
+        let token_output = IntCounterVec::new(
+            Opts::new(
+                "fixus_token_output_tokens_total",
+                "Output (completion) tokens consumed, summed per llm_completed (CR-8)",
+            ),
+            &["task_type", "model"],
+        )
+        .expect("token_output opts");
+        let token_total = IntCounterVec::new(
+            Opts::new(
+                "fixus_token_total_tokens_total",
+                "Total tokens consumed, summed per llm_completed (CR-8)",
+            ),
+            &["task_type", "model"],
+        )
+        .expect("token_total opts");
         let queue_wait = HistogramVec::new(
             HistogramOpts::new(
                 "fixus_turn_queue_wait_seconds",
@@ -138,6 +165,12 @@ impl Metrics {
             .expect("register task_created");
         reg.register(Box::new(watchdog_reclaims.clone()))
             .expect("register watchdog_reclaims");
+        reg.register(Box::new(token_input.clone()))
+            .expect("register token_input");
+        reg.register(Box::new(token_output.clone()))
+            .expect("register token_output");
+        reg.register(Box::new(token_total.clone()))
+            .expect("register token_total");
         reg.register(Box::new(queue_wait.clone()))
             .expect("register queue_wait");
         reg.register(Box::new(turn_duration.clone()))
@@ -157,6 +190,9 @@ impl Metrics {
             retry_attempts,
             task_created,
             watchdog_reclaims,
+            token_input,
+            token_output,
+            token_total,
             queue_wait,
             turn_duration,
             in_flight,
@@ -197,6 +233,26 @@ impl Metrics {
 
     pub fn record_watchdog_reclaim(&self, task_type: &str) {
         self.watchdog_reclaims.with_label_values(&[task_type]).inc();
+    }
+
+    /// 记一次 llm_completed 的 token 用量(CR-8 实时观测,非持久 billing)。
+    pub fn record_llm_tokens(
+        &self,
+        task_type: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        total_tokens: i64,
+    ) {
+        self.token_input
+            .with_label_values(&[task_type, model])
+            .inc_by(input_tokens.max(0) as u64);
+        self.token_output
+            .with_label_values(&[task_type, model])
+            .inc_by(output_tokens.max(0) as u64);
+        self.token_total
+            .with_label_values(&[task_type, model])
+            .inc_by(total_tokens.max(0) as u64);
     }
 
     // ── pull(渲染前 sync)───────────────────────────────────────────────
@@ -240,6 +296,7 @@ mod tests {
         m.record_retry("claude");
         m.record_task_created("claude");
         m.record_watchdog_reclaim("claude");
+        m.record_llm_tokens("claude", "claude-sonnet-5", 100, 20, 120);
         m.set_in_flight("claude", 0);
         m.set_pending("claude", 0);
         m.set_dependency_up(DEP_BROKER, true);
@@ -251,6 +308,9 @@ mod tests {
             "fixus_retry_attempts_total",
             "fixus_task_created_total",
             "fixus_turn_watchdog_reclaims_total",
+            "fixus_token_input_tokens_total",
+            "fixus_token_output_tokens_total",
+            "fixus_token_total_tokens_total",
             "fixus_turn_queue_wait_seconds",
             "fixus_turn_duration_seconds",
             "fixus_in_flight_turns",
