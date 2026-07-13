@@ -469,6 +469,7 @@ pub enum FailureReason {
     RedoDispatchFailed,
     BrokerError,
     SandboxTimeout,
+    AgentUnresponsive,
     // ── 应用/终态类:不重试 ──
     ApplicationError,
     Policy,
@@ -487,6 +488,7 @@ impl FailureReason {
             Self::RedoDispatchFailed => "redo_dispatch_failed",
             Self::BrokerError => "broker_error",
             Self::SandboxTimeout => "sandbox_timeout",
+            Self::AgentUnresponsive => "agent_unresponsive",
             Self::ApplicationError => "application_error",
             Self::Policy => "policy",
             Self::Canceled => "canceled",
@@ -504,6 +506,7 @@ impl FailureReason {
                 | Self::RedoDispatchFailed
                 | Self::BrokerError
                 | Self::SandboxTimeout
+                | Self::AgentUnresponsive
                 | Self::Unknown
         )
     }
@@ -520,6 +523,7 @@ pub fn classify_failure(error_type: &str, _error_message: &str) -> FailureReason
         "redo_dispatch_failed" => FailureReason::RedoDispatchFailed,
         "broker_error" => FailureReason::BrokerError,
         "sandbox_timeout" => FailureReason::SandboxTimeout,
+        "agent_unresponsive" => FailureReason::AgentUnresponsive,
         "application_error" => FailureReason::ApplicationError,
         "policy" => FailureReason::Policy,
         "canceled" => FailureReason::Canceled,
@@ -539,6 +543,7 @@ mod failure_reason_tests {
         assert_eq!(classify_failure("redo_dispatch_failed", ""), FailureReason::RedoDispatchFailed);
         assert_eq!(classify_failure("broker_error", ""), FailureReason::BrokerError);
         assert_eq!(classify_failure("sandbox_timeout", ""), FailureReason::SandboxTimeout);
+        assert_eq!(classify_failure("agent_unresponsive", ""), FailureReason::AgentUnresponsive);
         assert_eq!(classify_failure("application_error", ""), FailureReason::ApplicationError);
         assert_eq!(classify_failure("policy", ""), FailureReason::Policy);
         assert_eq!(classify_failure("canceled", ""), FailureReason::Canceled);
@@ -558,6 +563,7 @@ mod failure_reason_tests {
         assert!(FailureReason::RedoDispatchFailed.is_retryable());
         assert!(FailureReason::BrokerError.is_retryable());
         assert!(FailureReason::SandboxTimeout.is_retryable());
+        assert!(FailureReason::AgentUnresponsive.is_retryable());
         assert!(FailureReason::Unknown.is_retryable());
     }
 

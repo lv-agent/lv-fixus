@@ -8,6 +8,7 @@
 //! - 恢复管理
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
@@ -110,6 +111,23 @@ pub async fn start() -> Result<(), AppError> {
     orchestrator.spawn_result_consumer(&broker_addr, &namespace, &region);
     // 启动 broker lifecycle consumer(fixlet turn_execution_done → broker → fixus)
     orchestrator.spawn_lifecycle_consumer(&broker_addr, &namespace);
+    // turn 看门狗(CR-6):回收派发后无终态的 turn(治 background recovery 等路径的卡死)。
+    // env:FIXUS_TURN_LEASE_SECS(默认 300,同 turn_timeout)/ FIXUS_WATCHDOG_INTERVAL_SECS(默认 60)
+    let turn_lease = Duration::from_secs(
+        std::env::var("FIXUS_TURN_LEASE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(300),
+    );
+    let watchdog_interval = Duration::from_secs(
+        std::env::var("FIXUS_WATCHDOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(60),
+    );
+    orchestrator.spawn_turn_watchdog(turn_lease, watchdog_interval);
 
     let state = AppState {
         store,

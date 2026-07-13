@@ -26,6 +26,7 @@ pub struct Metrics {
     turn_terminal: IntCounterVec,   // {task_type, outcome}
     retry_attempts: IntCounterVec,  // {task_type}
     task_created: IntCounterVec,    // {task_type}
+    watchdog_reclaims: IntCounterVec, // {task_type}  CR-6 turn 看门狗回收
     queue_wait: HistogramVec,       // {task_type}  秒
     turn_duration: HistogramVec,    // {task_type, outcome}  秒
     in_flight: IntGaugeVec,         // {task_type}
@@ -72,6 +73,14 @@ impl Metrics {
             &["task_type"],
         )
         .expect("task_created opts");
+        let watchdog_reclaims = IntCounterVec::new(
+            Opts::new(
+                "fixus_turn_watchdog_reclaims_total",
+                "Turns reclaimed by the watchdog (dispatched but no terminal within turn_lease)",
+            ),
+            &["task_type"],
+        )
+        .expect("watchdog_reclaims opts");
         let queue_wait = HistogramVec::new(
             HistogramOpts::new(
                 "fixus_turn_queue_wait_seconds",
@@ -127,6 +136,8 @@ impl Metrics {
             .expect("register retry_attempts");
         reg.register(Box::new(task_created.clone()))
             .expect("register task_created");
+        reg.register(Box::new(watchdog_reclaims.clone()))
+            .expect("register watchdog_reclaims");
         reg.register(Box::new(queue_wait.clone()))
             .expect("register queue_wait");
         reg.register(Box::new(turn_duration.clone()))
@@ -145,6 +156,7 @@ impl Metrics {
             turn_terminal,
             retry_attempts,
             task_created,
+            watchdog_reclaims,
             queue_wait,
             turn_duration,
             in_flight,
@@ -181,6 +193,10 @@ impl Metrics {
 
     pub fn record_task_created(&self, task_type: &str) {
         self.task_created.with_label_values(&[task_type]).inc();
+    }
+
+    pub fn record_watchdog_reclaim(&self, task_type: &str) {
+        self.watchdog_reclaims.with_label_values(&[task_type]).inc();
     }
 
     // ── pull(渲染前 sync)───────────────────────────────────────────────
@@ -223,6 +239,7 @@ mod tests {
         m.record_turn_terminal("claude", OUTCOME_SUCCESS, 0.1);
         m.record_retry("claude");
         m.record_task_created("claude");
+        m.record_watchdog_reclaim("claude");
         m.set_in_flight("claude", 0);
         m.set_pending("claude", 0);
         m.set_dependency_up(DEP_BROKER, true);
@@ -233,6 +250,7 @@ mod tests {
             "fixus_turn_terminal_total",
             "fixus_retry_attempts_total",
             "fixus_task_created_total",
+            "fixus_turn_watchdog_reclaims_total",
             "fixus_turn_queue_wait_seconds",
             "fixus_turn_duration_seconds",
             "fixus_in_flight_turns",

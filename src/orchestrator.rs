@@ -66,6 +66,13 @@ pub enum AsyncTurnStart {
     RecoveryTriggered { incomplete_count: usize },
 }
 
+/// 解析 dispatch_times 的 key `{task_id}:{turn_id}` → (task_id, turn_id)。
+/// task_id(task_<uuid>,无冒号)与 turn_id 之间用最后一个冒号分隔(防御)。
+fn parse_turn_key(key: &str) -> Option<(String, i64)> {
+    let (tid, turn) = key.rsplit_once(':')?;
+    Some((tid.to_string(), turn.parse().ok()?))
+}
+
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
@@ -1151,6 +1158,73 @@ impl Orchestrator {
         self.dispatch_pending(&task_type).await;
     }
 
+    // ── turn 看门狗(CR-6)──────────────────────────────────────────────
+
+    /// 扫描 `dispatch_times`,回收派发超 `lease` 未终态的 turn:触发
+    /// [`Self::handle_turn_execution_error`](`agent_unresponsive`,CR-3 治理 retry/fail +
+    /// release_slot),并刷新该 turn 的 dispatch_times(重计 lease 窗,避免每轮重复触发;
+    /// CR-3 `max_attempts` 预算封顶收敛)。返回回收数。看门狗循环调此。
+    pub async fn reclaim_stale_turns(&self, lease: Duration) -> usize {
+        let now = std::time::Instant::now();
+        let stale: Vec<String> = {
+            let dt = self.dispatch_times.lock().await;
+            dt.iter()
+                .filter(|(_, t)| now.duration_since(**t) > lease)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        for key in &stale {
+            let (task_id, turn_id) = match parse_turn_key(key) {
+                Some(v) => v,
+                None => continue,
+            };
+            let tt = self
+                .resolve_task_type(&task_id)
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
+            tracing::warn!(
+                "turn watchdog: reclaim {} turn {} (no terminal in {:?})",
+                task_id,
+                turn_id,
+                lease
+            );
+            self.metrics.record_watchdog_reclaim(&tt);
+            // 刷新 lease 窗;CR-3 预算封顶 ⇒ 最多 max_attempts+1 轮后 Failed
+            self.dispatch_times
+                .lock()
+                .await
+                .insert(key.clone(), std::time::Instant::now());
+            let _ = self
+                .handle_turn_execution_error(
+                    &task_id,
+                    turn_id,
+                    "agent_unresponsive",
+                    "no terminal event within turn_lease",
+                )
+                .await;
+        }
+        stale.len()
+    }
+
+    /// 启动后台看门狗:周期 `interval` 扫描,派发超 `lease` 未终态的 turn 回收。
+    pub fn spawn_turn_watchdog(self: &Arc<Self>, lease: Duration, interval: Duration) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                "turn watchdog starting: lease={:?} interval={:?}",
+                lease,
+                interval
+            );
+            loop {
+                tokio::time::sleep(interval).await;
+                let reclaimed = orch.reclaim_stale_turns(lease).await;
+                if reclaimed > 0 {
+                    tracing::info!("turn watchdog reclaimed {} turn(s)", reclaimed);
+                }
+            }
+        });
+    }
+
     pub fn spawn_lifecycle_consumer(
         self: &Arc<Self>,
         broker_addr: &str,
@@ -1798,6 +1872,176 @@ mod tests {
             out.contains("fixus_retry_attempts_total{task_type=\"default\"} 1"),
             "retry counter:\n{}", out
         );
+    }
+
+    // ── CR-6 §4.2 集成测试(turn 看门狗)──────────────────────────────────
+
+    #[test]
+    fn parse_turn_key_splits_task_and_turn() {
+        assert_eq!(parse_turn_key("task_abc:3"), Some(("task_abc".into(), 3)));
+        assert_eq!(parse_turn_key("task_abc"), None); // 无冒号
+        assert_eq!(parse_turn_key("task_abc:x"), None); // turn 非数字
+    }
+
+    /// §4.2:派发后无终态超 lease → 看门狗回收 → CR-3 治理(max_attempts=0 → 直接 Fail)。
+    #[tokio::test]
+    async fn cr6_watchdog_reclaims_stale_turn() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 0 }); // 不重试 → 直接 Fail
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        orch.enqueue_and_dispatch(&tid, turn_id, "do work", "rg", 0, vec![])
+            .await
+            .unwrap();
+        // backdate 到 120s 前(模拟派发后久无终态)
+        orch.dispatch_times.lock().await.insert(
+            format!("{}:{}", tid, turn_id),
+            std::time::Instant::now() - std::time::Duration::from_secs(120),
+        );
+
+        let n = orch.reclaim_stale_turns(std::time::Duration::from_secs(60)).await;
+        assert!(n >= 1, "应回收 stale turn");
+        wait_seq(&*store, &tid, 6).await; // turn_failed(5) + task_failed(6)
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed),
+            "max_attempts=0 + agent_unresponsive → 直接 Failed"
+        );
+        // watchdog 计数 +1
+        let out = orch.metrics_handle().render();
+        assert!(
+            out.contains("fixus_turn_watchdog_reclaims_total{task_type=\"default\"}"),
+            "watchdog reclaim 计数应有:{}", out
+        );
+    }
+
+    /// §4.2:fresh turn(< lease)不被回收。
+    #[tokio::test]
+    async fn cr6_watchdog_skips_fresh_turn() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp);
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+        orch.enqueue_and_dispatch(&tid, turn_id, "do work", "rg", 0, vec![])
+            .await
+            .unwrap();
+
+        // lease=3600s,dispatch_times 是 fresh → 不回收
+        let n = orch.reclaim_stale_turns(std::time::Duration::from_secs(3600)).await;
+        assert_eq!(n, 0, "fresh turn 不该回收");
+        assert_ne!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed),
+            "fresh turn 状态不变"
+        );
+    }
+
+    /// §4.2:看门狗 + CR-3 预算收敛(max_attempts=1 → 2 轮后 Failed,不无限循环)。
+    #[tokio::test]
+    async fn cr6_watchdog_converges_via_retry_budget() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 1 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+        orch.enqueue_and_dispatch(&tid, turn_id, "do work", "rg", 0, vec![])
+            .await
+            .unwrap();
+
+        let lease = std::time::Duration::from_secs(60);
+        let backdate = || std::time::Instant::now() - std::time::Duration::from_secs(120);
+
+        // 第 1 轮:retry(attempts 0→1),未 Failed
+        orch.dispatch_times
+            .lock()
+            .await
+            .insert(format!("{}:{}", tid, turn_id), backdate());
+        let _ = orch.reclaim_stale_turns(lease).await;
+        assert_ne!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed),
+            "预算内第 1 轮不该 Failed"
+        );
+
+        // 第 2 轮:attempts=1, 1<1 false → Fail(收敛,无无限循环)
+        orch.dispatch_times
+            .lock()
+            .await
+            .insert(format!("{}:{}", tid, turn_id), backdate());
+        let _ = orch.reclaim_stale_turns(lease).await;
+        wait_seq(&*store, &tid, 6).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed),
+            "第 2 轮预算耗尽应 Failed"
+        );
+    }
+
+    // ── 性能测试(#[ignore],cargo test --lib -- --ignored perf_ --nocapture)──
+    // 看门狗每 interval 扫一次 dispatch_times(纯 HashMap 遍历 + lock)。测最常见
+    // "无 stale" 扫描成本。不断言阈值,数字供人读。
+
+    fn report_perf(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_watchdog_scan_at_scale() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry, tp);
+        // 填 5000 条 dispatch_times(全 fresh)
+        {
+            let mut dt = orch.dispatch_times.lock().await;
+            let now = std::time::Instant::now();
+            for i in 0..5000u32 {
+                dt.insert(format!("task_{i}:1"), now);
+            }
+        }
+        let lease = std::time::Duration::from_secs(3600); // 全 fresh → 只扫不回收
+        for _ in 0..5 {
+            let _ = orch.reclaim_stale_turns(lease).await; // warm-up
+        }
+        let n = 50;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let r = orch.reclaim_stale_turns(lease).await;
+            us.push(t0.elapsed().as_micros() as u64);
+            assert_eq!(r, 0, "fresh 不该回收");
+        }
+        report_perf("watchdog scan (5000 in-flight)", "µs", us);
     }
 
 }
