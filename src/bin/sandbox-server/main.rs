@@ -50,6 +50,18 @@ struct Cli {
     /// consumer group 名称
     #[arg(long, default_value = "sandboxes")]
     group: String,
+
+    /// GC:sweep 周期(秒)(CR-5)
+    #[arg(long, default_value = "300")]
+    gc_interval_secs: u64,
+
+    /// GC:session idle 阈值(秒),超过则回收(CR-5)
+    #[arg(long, default_value = "3600")]
+    gc_max_idle_secs: u64,
+
+    /// GC:活跃 session 数上限,超限按 LRU 回收(CR-5)
+    #[arg(long, default_value = "100")]
+    gc_max_sessions: usize,
 }
 
 // ── Idempotence Cache ──
@@ -83,6 +95,16 @@ async fn main() {
     let stream = format!("tool-invoke-{}", cli.region);
     let consumer_id = format!("sandbox-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
 
+    // CR-5:后台 session/work_dir GC。
+    spawn_gc_task(
+        session_mgr.clone(),
+        std::time::Duration::from_secs(cli.gc_interval_secs),
+        session::GcPolicy {
+            max_idle: std::time::Duration::from_secs(cli.gc_max_idle_secs),
+            max_sessions: cli.gc_max_sessions,
+        },
+    );
+
     tracing::info!("sandbox pull-worker starting: broker={} stream={} group={} consumer={}",
         cli.broker_addr, stream, cli.group, consumer_id);
 
@@ -105,6 +127,32 @@ async fn main() {
             }
         }
     }
+}
+
+/// CR-5:周期性 sweep session/work_dir(idle 淘汰 + LRU 超容 + 盘上 orphan)。
+/// sweep 是 sync + 极短(锁 + 少量 fs),inline 调用即可;有淘汰才记日志。
+fn spawn_gc_task(
+    mgr: Arc<SessionManager>,
+    interval: std::time::Duration,
+    policy: session::GcPolicy,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            "session gc task starting: interval={:?} max_idle={:?} max_sessions={}",
+            interval, policy.max_idle, policy.max_sessions
+        );
+        loop {
+            tokio::time::sleep(interval).await;
+            let report = mgr.sweep(&policy);
+            if report.evicted_sessions > 0 || report.removed_orphans > 0 {
+                tracing::info!(
+                    "session gc: evicted {} sessions, removed {} orphans",
+                    report.evicted_sessions,
+                    report.removed_orphans
+                );
+            }
+        }
+    });
 }
 
 async fn run_consumer(
