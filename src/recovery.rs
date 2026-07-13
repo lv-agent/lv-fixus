@@ -125,6 +125,7 @@ pub async fn check_session_recovery(
 /// 对单个未完成 Turn 做出恢复决策
 ///
 /// 分析 Turn 内未完成 Step 的 Tool 类型，决定恢复策略。
+/// 决策核心是纯函数 [`decide_recovery_from_steps`];此处只负责取数(本 turn 的未完成 step)。
 pub async fn decide_turn_recovery(
     store: &dyn EventStore,
     task_id: &str,
@@ -140,19 +141,35 @@ pub async fn decide_turn_recovery(
         .filter(|s| s.turn_id == incomplete_turn.turn_id)
         .collect();
 
+    Ok(decide_recovery_from_steps(incomplete_turn, &turn_incomplete))
+}
+
+/// 纯函数:根据本 turn 的未完成 step 列表做恢复决策(无 store 依赖,便于测试)。
+///
+/// 决策规则:
+/// - 无未完成 step → [`RecoveryDecision::SafeToRedo`](空),redo_count/redo_group 原样透传。
+/// - 含任一非幂等写 step → [`RecoveryDecision::RequiresHumanIntervention`],
+///   只有非幂等 step 进 `blocking_steps`(安全 step 不混入)。
+/// - 全为纯读/幂等写 → [`RecoveryDecision::SafeToRedo`],全部 step 进 `incomplete_steps`。
+///
+/// 注:未知 tool 名 / payload 缺 `tool_name` 默认按非幂等处理(安全优先),即进入 blocking。
+fn decide_recovery_from_steps(
+    incomplete_turn: &IncompleteTurn,
+    turn_incomplete: &[IncompleteStep],
+) -> RecoveryDecision {
     if turn_incomplete.is_empty() {
-        return Ok(RecoveryDecision::SafeToRedo {
+        return RecoveryDecision::SafeToRedo {
             turn_id: incomplete_turn.turn_id,
             redo_group: incomplete_turn.redo_group.clone(),
             redo_count: incomplete_turn.redo_count,
             incomplete_steps: vec![],
-        });
+        };
     }
 
     let mut blocking_steps = Vec::new();
     let mut safe_steps = Vec::new();
 
-    for step in &turn_incomplete {
+    for step in turn_incomplete {
         let tool_name = step
             .payload
             .get("tool_name")
@@ -170,18 +187,18 @@ pub async fn decide_turn_recovery(
     }
 
     if blocking_steps.is_empty() {
-        Ok(RecoveryDecision::SafeToRedo {
+        RecoveryDecision::SafeToRedo {
             turn_id: incomplete_turn.turn_id,
             redo_group: incomplete_turn.redo_group.clone(),
             redo_count: incomplete_turn.redo_count,
             incomplete_steps: safe_steps,
-        })
+        }
     } else {
-        Ok(RecoveryDecision::RequiresHumanIntervention {
+        RecoveryDecision::RequiresHumanIntervention {
             turn_id: incomplete_turn.turn_id,
             redo_group: incomplete_turn.redo_group.clone(),
             blocking_steps,
-        })
+        }
     }
 }
 
@@ -264,6 +281,8 @@ pub struct RedoContext {
 }
 
 /// 从 turn_started payload 中提取 redo 上下文
+///
+/// 取数(本 turn 事件流) + 委托纯函数 [`build_redo_context_from_events`]。
 pub async fn build_redo_context(
     store: &dyn EventStore,
     task_id: &str,
@@ -273,29 +292,37 @@ pub async fn build_redo_context(
         .get_turn_events(task_id, incomplete_turn.turn_id)
         .await?;
 
+    Ok(build_redo_context_from_events(task_id, incomplete_turn, &events))
+}
+
+/// 纯函数:从 turn 事件流中定位 TurnStarted,构造重做上下文(无 store 依赖,便于测试)。
+///
+/// - 找到 TurnStarted → [`Some`](`Option::Some`)(`redo_count` 递增,`redo_group` 不变,
+///   `user_input` 取自 payload,缺省为空串)。
+/// - 找不到 TurnStarted → [`None`](`Option::None`)(无法重建上下文)。
+fn build_redo_context_from_events(
+    task_id: &str,
+    incomplete_turn: &IncompleteTurn,
+    events: &[AgentEvent],
+) -> Option<RedoContext> {
     let turn_started = events
         .iter()
-        .find(|e| e.event_type == EventType::TurnStarted);
+        .find(|e| e.event_type == EventType::TurnStarted)?;
 
-    match turn_started {
-        Some(event) => {
-            let user_input = event
-                .payload
-                .get("user_input")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+    let user_input = turn_started
+        .payload
+        .get("user_input")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-            Ok(Some(RedoContext {
-                task_id: task_id.to_string(),
-                turn_id: incomplete_turn.turn_id,
-                redo_group: incomplete_turn.redo_group.clone(),
-                redo_count: incomplete_turn.redo_count + 1,
-                user_input,
-            }))
-        }
-        None => Ok(None),
-    }
+    Some(RedoContext {
+        task_id: task_id.to_string(),
+        turn_id: incomplete_turn.turn_id,
+        redo_group: incomplete_turn.redo_group.clone(),
+        redo_count: incomplete_turn.redo_count + 1,
+        user_input,
+    })
 }
 
 /// Session 级恢复入口
@@ -362,3 +389,293 @@ pub async fn validate_turn_seq_continuity(
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    // ── fixture ───────────────────────────────────────────────────────
+
+    fn incomplete_turn(turn_id: i64, redo_group: &str, redo_count: i32) -> IncompleteTurn {
+        IncompleteTurn {
+            turn_id,
+            redo_group: redo_group.to_string(),
+            redo_count,
+            turn_started_at: Utc::now(),
+        }
+    }
+
+    fn incomplete_step(turn_id: i64, step_id: &str, tool_name: &str) -> IncompleteStep {
+        IncompleteStep {
+            seq: 1,
+            turn_id,
+            step_id: step_id.to_string(),
+            start_event_type: "tool_invoked".to_string(),
+            payload: json!({ "tool_name": tool_name, "tool_call_id": "tcid-1" }),
+            started_at: Utc::now(),
+        }
+    }
+
+    // ── classify_tool(纯函数,穷举三桶 + 默认)──────────────────────
+
+    #[test]
+    fn classify_read_only_tools() {
+        for t in &[
+            "get_weather",
+            "search",
+            "read_file",
+            "list_directory",
+            "get_order_status",
+            "query_database",
+            "fetch_url",
+            "calculate",
+            "parse",
+        ] {
+            assert_eq!(
+                classify_tool(t),
+                ToolRecoveryStrategy::ReadOnly,
+                "tool {t} 应为 ReadOnly"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_idempotent_write_tools() {
+        for t in &[
+            "update_config",
+            "set_status",
+            "upsert_record",
+            "create_or_update",
+            "deploy_versioned",
+        ] {
+            assert_eq!(
+                classify_tool(t),
+                ToolRecoveryStrategy::IdempotentWrite,
+                "tool {t} 应为 IdempotentWrite"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_non_idempotent_write_tools() {
+        for t in &[
+            "send_email",
+            "create_order",
+            "process_payment",
+            "send_notification",
+            "delete_record",
+            "submit_form",
+        ] {
+            assert_eq!(
+                classify_tool(t),
+                ToolRecoveryStrategy::NonIdempotentWrite,
+                "tool {t} 应为 NonIdempotentWrite"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_unknown_defaults_to_non_idempotent_safe() {
+        // 未知 tool 默认非幂等(安全优先)—— 重做会保守转人工
+        assert_eq!(classify_tool("brand_new_tool"), ToolRecoveryStrategy::NonIdempotentWrite);
+        assert_eq!(classify_tool(""), ToolRecoveryStrategy::NonIdempotentWrite);
+    }
+
+    // ── decide_recovery_from_steps(纯函数)──────────────────────────
+
+    #[test]
+    fn decide_empty_steps_is_safe_to_redo() {
+        let it = incomplete_turn(7, "rg-1", 0);
+        match decide_recovery_from_steps(&it, &[]) {
+            RecoveryDecision::SafeToRedo {
+                turn_id,
+                redo_group,
+                redo_count,
+                incomplete_steps,
+            } => {
+                assert_eq!(turn_id, 7);
+                assert_eq!(redo_group, "rg-1");
+                assert_eq!(redo_count, 0);
+                assert!(incomplete_steps.is_empty());
+            }
+            other => panic!("应为 SafeToRedo, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_all_read_only_is_safe_to_redo() {
+        let it = incomplete_turn(7, "rg", 1);
+        let steps = vec![
+            incomplete_step(7, "s1", "read_file"),
+            incomplete_step(7, "s2", "search"),
+        ];
+        match decide_recovery_from_steps(&it, &steps) {
+            RecoveryDecision::SafeToRedo { incomplete_steps, .. } => {
+                assert_eq!(incomplete_steps.len(), 2);
+            }
+            other => panic!("应为 SafeToRedo, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_all_idempotent_writes_are_safe() {
+        let it = incomplete_turn(7, "rg", 2);
+        let steps = vec![incomplete_step(7, "s1", "upsert_record")];
+        match decide_recovery_from_steps(&it, &steps) {
+            RecoveryDecision::SafeToRedo { incomplete_steps, .. } => {
+                assert_eq!(incomplete_steps.len(), 1);
+            }
+            other => panic!("应为 SafeToRedo, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_mixed_read_and_idempotent_is_safe() {
+        let it = incomplete_turn(7, "rg", 0);
+        let steps = vec![
+            incomplete_step(7, "s1", "read_file"),
+            incomplete_step(7, "s2", "set_status"),
+        ];
+        match decide_recovery_from_steps(&it, &steps) {
+            RecoveryDecision::SafeToRedo { incomplete_steps, .. } => {
+                assert_eq!(incomplete_steps.len(), 2);
+            }
+            other => panic!("应为 SafeToRedo, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_single_non_idempotent_blocks_turn() {
+        let it = incomplete_turn(7, "rg", 0);
+        let steps = vec![incomplete_step(7, "s1", "send_email")];
+        match decide_recovery_from_steps(&it, &steps) {
+            RecoveryDecision::RequiresHumanIntervention { blocking_steps, .. } => {
+                assert_eq!(blocking_steps.len(), 1);
+                assert_eq!(blocking_steps[0].step_id, "s1");
+            }
+            other => panic!("应为 RequiresHumanIntervention, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_non_idempotent_among_safe_blocks_and_only_carries_blocking() {
+        // 一个 blocking 出现 → 整 turn 转人工;且只有非幂等进 blocking,安全 step 不混入
+        let it = incomplete_turn(7, "rg", 0);
+        let steps = vec![
+            incomplete_step(7, "s1", "read_file"),       // safe
+            incomplete_step(7, "s2", "process_payment"), // blocking
+            incomplete_step(7, "s3", "send_email"),      // blocking
+        ];
+        match decide_recovery_from_steps(&it, &steps) {
+            RecoveryDecision::RequiresHumanIntervention { blocking_steps, .. } => {
+                assert_eq!(blocking_steps.len(), 2);
+                let ids: Vec<&str> = blocking_steps.iter().map(|s| s.step_id.as_str()).collect();
+                assert!(ids.contains(&"s2"));
+                assert!(ids.contains(&"s3"));
+            }
+            other => panic!("应为 RequiresHumanIntervention, 得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_unknown_tool_is_treated_as_blocking() {
+        // 未知 tool 默认非幂等 → blocking
+        let it = incomplete_turn(7, "rg", 0);
+        let steps = vec![incomplete_step(7, "s1", "something_new")];
+        assert!(matches!(
+            decide_recovery_from_steps(&it, &steps),
+            RecoveryDecision::RequiresHumanIntervention { .. }
+        ));
+    }
+
+    #[test]
+    fn decide_step_missing_tool_name_defaults_to_blocking() {
+        // payload 无 tool_name → unwrap_or("unknown") → 非幂等 → blocking
+        let it = incomplete_turn(7, "rg", 0);
+        let mut step = incomplete_step(7, "s1", "x");
+        step.payload = json!({});
+        assert!(matches!(
+            decide_recovery_from_steps(&it, std::slice::from_ref(&step)),
+            RecoveryDecision::RequiresHumanIntervention { .. }
+        ));
+    }
+
+    #[test]
+    fn decide_propagates_turn_metadata_into_blocking() {
+        let it = incomplete_turn(42, "group-abc", 3);
+        match decide_recovery_from_steps(&it, &[incomplete_step(42, "s1", "send_email")]) {
+            RecoveryDecision::RequiresHumanIntervention { turn_id, redo_group, .. } => {
+                assert_eq!(turn_id, 42);
+                assert_eq!(redo_group, "group-abc");
+            }
+            other => panic!("应为 RequiresHumanIntervention, 得到 {other:?}"),
+        }
+    }
+
+    // ── build_redo_context_from_events(纯函数)──────────────────────
+
+    #[test]
+    fn redo_context_none_when_no_turn_started() {
+        let it = incomplete_turn(5, "rg", 0);
+        let events = vec![AgentEvent::new(
+            "t1".into(),
+            Some(5),
+            None,
+            EventType::LlmCompleted,
+            json!({}),
+        )];
+        assert!(build_redo_context_from_events("t1", &it, &events).is_none());
+    }
+
+    #[test]
+    fn redo_context_extracts_user_input_and_increments_count() {
+        let it = incomplete_turn(5, "rg-7", 2);
+        let events = vec![AgentEvent::new(
+            "t1".into(),
+            Some(5),
+            None,
+            EventType::TurnStarted,
+            json!({ "user_input": "redo me" }),
+        )];
+        let ctx = build_redo_context_from_events("t1", &it, &events).expect("应有 ctx");
+        assert_eq!(ctx.task_id, "t1");
+        assert_eq!(ctx.turn_id, 5);
+        assert_eq!(ctx.redo_group, "rg-7");
+        assert_eq!(ctx.redo_count, 3); // 2 + 1
+        assert_eq!(ctx.user_input, "redo me");
+    }
+
+    #[test]
+    fn redo_context_empty_user_input_when_payload_missing() {
+        let it = incomplete_turn(5, "rg", 0);
+        let events = vec![AgentEvent::new(
+            "t1".into(),
+            Some(5),
+            None,
+            EventType::TurnStarted,
+            json!({}),
+        )];
+        let ctx = build_redo_context_from_events("t1", &it, &events).expect("应有 ctx");
+        assert_eq!(ctx.user_input, "");
+    }
+
+    #[test]
+    fn redo_context_finds_turn_started_among_many_events() {
+        let it = incomplete_turn(5, "rg", 0);
+        let events = vec![
+            AgentEvent::new("t1".into(), Some(5), None, EventType::LlmInvoked, json!({})),
+            AgentEvent::new(
+                "t1".into(),
+                Some(5),
+                None,
+                EventType::TurnStarted,
+                json!({ "user_input": "hi" }),
+            ),
+            AgentEvent::new("t1".into(), Some(5), None, EventType::LlmCompleted, json!({})),
+        ];
+        let ctx = build_redo_context_from_events("t1", &it, &events).expect("应有 ctx");
+        assert_eq!(ctx.user_input, "hi");
+    }
+}
