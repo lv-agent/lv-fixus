@@ -8,7 +8,6 @@
 //! 不依赖 fixus。只与 broker 对话。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::Json, routing::{get, post}, Router};
@@ -36,9 +35,6 @@ struct Cli {
 
     #[arg(long, default_value = "3001")]
     port: u16,
-
-    #[arg(long, default_value = "/tmp")]
-    work_dir: PathBuf,
 }
 
 // ── Tool Registry ──
@@ -185,7 +181,6 @@ struct AppState {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingToolResult>>>>,
     namespace: String,
     region: String,
-    work_dir: PathBuf,
 }
 
 // ── Idempotency helpers ──
@@ -250,9 +245,10 @@ async fn tools_call(
     let idempotency_key = build_key(task_id, tool_name, args);
     let timeout_secs = default_timeout(tool_name);
     let sandbox_timeout_ms = timeout_secs.saturating_sub(5).max(5) * 1000;
-    let work_dir = state.work_dir.to_string_lossy().to_string();
     let stream = format!("tool-invoke-{}", state.region);
 
+    // work_dir 不再由 tools-bank 决定:传 task_id 作 session_id,
+    // sandbox-server 据此 get_or_create → base_dir/{task_id} 做 per-task 隔离。
     let payload = serde_json::json!({
         "step_type": "tool_call",
         "tool_name": tool_name,
@@ -260,7 +256,7 @@ async fn tools_call(
         "idempotency_key": idempotency_key,
         "input": args,
         "local_seq": 0,
-        "work_dir": work_dir,
+        "session_id": task_id,
         "timeout_ms": sandbox_timeout_ms,
     });
 
@@ -449,7 +445,6 @@ async fn main() {
         pending: Arc::new(Mutex::new(HashMap::new())),
         namespace: cli.namespace.clone(),
         region: cli.region.clone(),
-        work_dir: cli.work_dir.clone(),
     });
 
     // Background result consumer

@@ -7,7 +7,6 @@
 //!
 //! Turn 编排引擎。fixus 的中心组件:Turn 启动、Claim、恢复、健康检查。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +36,6 @@ pub struct Orchestrator {
     registry: Arc<TaskRegistry>,
     turn_timeout: Duration,
     token_publisher: crate::stream::TokenPublisher,
-    work_dir: PathBuf,
     last_dispatch_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     last_result_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
@@ -55,18 +53,11 @@ impl Orchestrator {
         registry: Arc<TaskRegistry>,
         token_publisher: crate::stream::TokenPublisher,
     ) -> Self {
-        let work_dir = std::env::var("SANDBOX_WORKSPACE")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        tracing::info!("orchestrator work_dir={}", work_dir.display());
         Self {
             store,
             registry,
             turn_timeout: Duration::from_secs(300),
             token_publisher,
-            work_dir,
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -308,7 +299,6 @@ impl Orchestrator {
             registry: self.registry.clone(),
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
-            work_dir: PathBuf::from("/tmp"),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -361,7 +351,6 @@ impl Orchestrator {
                 registry: registry.clone(),
                 turn_timeout,
                 token_publisher,
-                work_dir: PathBuf::from("/tmp"),
                 last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
                 last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
             };

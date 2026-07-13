@@ -193,10 +193,12 @@ async fn run_consumer(
                 let ns = cli.namespace.clone();
                 let rs = result_stream.to_string();
                 let cache_clone = cache.clone();
+                // 优先用 payload 的 session_id(=task_id)做 per-task 隔离目录;
+                // 兜底 step_id(per-call)。tools-bank 传 session_id → base_dir/{task_id}。
                 let work_dir = payload
-                    .get("work_dir")
+                    .get("session_id")
                     .and_then(|v| v.as_str())
-                    .map(PathBuf::from)
+                    .map(|sid| session_mgr.get_or_create(sid))
                     .unwrap_or_else(|| session_mgr.get_or_create(&step_id));
                 let tool_name_fix = tool_name.strip_prefix("fixus_").unwrap_or(&tool_name).to_string();
 
