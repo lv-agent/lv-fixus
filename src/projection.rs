@@ -27,6 +27,8 @@ pub struct TaskProjection {
     pub task_type: String,
     pub provenance: Provenance,
     pub body: Option<serde_json::Value>,
+    /// 优先级(CR-1):大者优先派发。从 task_created payload 析出。
+    pub priority: i32,
 
     // 投影 state
     pub state: TaskState,
@@ -72,6 +74,7 @@ impl TaskProjection {
                 created_by: String::new(),
             },
             body: None,
+            priority: 0,
             state: TaskState::Created,
             max_seq: 0,
             max_turn_id: 0,
@@ -145,6 +148,7 @@ impl TaskProjection {
                     }
                 }
                 self.body = payload.get("body").filter(|v| !v.is_null()).cloned();
+                self.priority = payload["priority"].as_i64().unwrap_or(0) as i32;
                 self.state = TaskState::Created;
             }
             EventType::TaskReady => self.state = TaskState::Ready,

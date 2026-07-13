@@ -82,11 +82,23 @@ pub async fn start() -> Result<(), AppError> {
 
     let registry = TaskRegistry::new();
     let token_publisher = Arc::new(crate::stream::TokenPublisher::new().await);
-    let orchestrator = Arc::new(Orchestrator::new(
-        store.clone(),
-        registry.clone(),
-        (*token_publisher).clone(),
-    ));
+    // retry 预算(CR-3):env `FIXUS_MAX_RETRY_ATTEMPTS`,默认 2(同 multica)。负值/非法 → 默认。
+    let max_attempts = std::env::var("FIXUS_MAX_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n >= 0)
+        .unwrap_or(2);
+    // per-type 并发闸(CR-1+2):env `FIXUS_MAX_CONCURRENT_PER_TYPE`,默认 6(同 multica)。
+    let max_concurrent = std::env::var("FIXUS_MAX_CONCURRENT_PER_TYPE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(6);
+    let orchestrator = Arc::new(
+        Orchestrator::new(store.clone(), registry.clone(), (*token_publisher).clone())
+            .with_retry_policy(crate::retry::RetryPolicy { max_attempts })
+            .with_max_concurrent(max_concurrent),
+    );
     // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
     let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
     orchestrator.spawn_result_consumer(&broker_addr, &namespace, &region);
@@ -239,6 +251,7 @@ async fn create_session_handler(
         task_type,
         &prov,
         req.body.as_ref(),
+        req.priority,
     )
     .await?;
 
@@ -461,6 +474,7 @@ async fn fail_turn_handler(
         error_type,
         error_message,
         stack_trace,
+        Some(crate::models::classify_failure(error_type, error_message)),
     )
     .await?;
 
@@ -769,7 +783,7 @@ mod tests {
     async fn mark_ready_handler_writes_event() {
         let (state, _registry, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None)
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0)
             .await
             .unwrap();
         wait_seq(&state, &tid, 1).await;
@@ -797,7 +811,7 @@ mod tests {
     async fn get_task_state_handler_returns_projection() {
         let (state, _reg, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None)
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0)
             .await
             .unwrap();
         wait_seq(&state, &tid, 1).await;

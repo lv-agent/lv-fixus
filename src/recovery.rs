@@ -13,7 +13,7 @@
 //! 有未完成 Turn → 读取 redo_group → 判断 Tool 类型 → 下发重做
 
 use crate::error::Result;
-use crate::models::{AgentEvent, EventType, IncompleteStep, IncompleteTurn};
+use crate::models::{AgentEvent, EventType, FailureReason, IncompleteStep, IncompleteTurn};
 use crate::storage::EventStore;
 use crate::service;
 
@@ -215,7 +215,8 @@ pub async fn skip_non_idempotent_step(
             "Recovery skipped: non-idempotent tool '{}' had an in-flight step at crash time. Requires human review.",
             step.payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown")
         ),
-        false,
+        // 非幂等写在崩溃点的悬空 step —— 终态(需人工),不可重试
+        Some(FailureReason::ApplicationError),
         1,
         0,
     )
@@ -243,6 +244,7 @@ pub async fn fail_turn_with_non_idempotent_block(
             blocking_steps.len()
         ),
         None,
+        Some(FailureReason::ApplicationError),
     )
     .await?;
 

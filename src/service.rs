@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::{
-    AgentEvent, EventType, SummaryMarkerPayload, TurnCompletedPayload, TurnFailedPayload,
-    TurnStartedPayload,
+    AgentEvent, EventType, FailureReason, SummaryMarkerPayload, TurnCompletedPayload,
+    TurnFailedPayload, TurnStartedPayload,
 };
 use crate::storage::EventStore;
 
@@ -27,6 +27,7 @@ pub async fn create_task(
     task_type: &str,
     provenance: &crate::models::Provenance,
     body: Option<&serde_json::Value>,
+    priority: i32,
 ) -> Result<(String, AgentEvent)> {
     let tenant_id = provenance
         .source_tenant_id
@@ -34,7 +35,7 @@ pub async fn create_task(
         .unwrap_or_else(|| "default".to_string());
     let user_id = provenance.source_user_id.clone().unwrap_or_default();
     store
-        .create_task(task_type, &tenant_id, &user_id, provenance, body)
+        .create_task(task_type, &tenant_id, &user_id, provenance, body, priority)
         .await
 }
 
@@ -127,17 +128,24 @@ pub async fn succeed_task(
 }
 
 /// executing → failed
+///
+/// `failure_reason`(CR-3):结构化失败分类,写入 task_failed 事件 payload,便于审计/按因统计。
 pub async fn fail_task(
     store: &dyn EventStore,
     task_id: &str,
     reason: &str,
+    failure_reason: Option<FailureReason>,
 ) -> Result<AgentEvent> {
+    let mut payload = serde_json::json!({ "reason": reason });
+    if let Some(fr) = failure_reason {
+        payload["failure_reason"] = serde_json::to_value(fr)?;
+    }
     transition_task(
         store,
         task_id,
         crate::models::TaskState::Failed,
         EventType::TaskFailed,
-        serde_json::json!({ "reason": reason }),
+        payload,
     )
     .await
 }
@@ -276,10 +284,12 @@ pub async fn fail_turn(
     error_type: &str,
     error_message: &str,
     stack_trace: Option<&str>,
+    failure_reason: Option<FailureReason>,
 ) -> Result<AgentEvent> {
     let payload = serde_json::to_value(TurnFailedPayload {
         error_type: error_type.to_string(),
         error_message: error_message.to_string(),
+        failure_reason,
         stack_trace: stack_trace.map(|s| s.to_string()),
     })?;
 
@@ -457,17 +467,19 @@ pub async fn record_llm_failed(
     step_id: &str,
     error_type: &str,
     error_message: &str,
-    retryable: bool,
+    failure_reason: Option<FailureReason>,
     attempt: i32,
     local_seq: i64,
 ) -> Result<AgentEvent> {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "error_type": error_type,
         "error_message": error_message,
-        "retryable": retryable,
         "attempt": attempt,
         "local_seq": local_seq,
     });
+    if let Some(fr) = failure_reason {
+        payload["failure_reason"] = serde_json::to_value(fr)?;
+    }
 
     let event = AgentEvent::new(
         task_id.to_string(),
@@ -572,18 +584,20 @@ pub async fn record_tool_failed(
     tool_call_id: &str,
     error_type: &str,
     error_message: &str,
-    retryable: bool,
+    failure_reason: Option<FailureReason>,
     attempt: i32,
     local_seq: i64,
 ) -> Result<AgentEvent> {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "tool_call_id": tool_call_id,
         "error_type": error_type,
         "error_message": error_message,
-        "retryable": retryable,
         "attempt": attempt,
         "local_seq": local_seq,
     });
+    if let Some(fr) = failure_reason {
+        payload["failure_reason"] = serde_json::to_value(fr)?;
+    }
 
     let event = AgentEvent::new(
         task_id.to_string(),
@@ -887,7 +901,7 @@ mod tests {
     async fn create_task_assigns_id_and_created_state() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, ev) = create_task(&store, "db.repair", &prov, None)
+        let (tid, ev) = create_task(&store, "db.repair", &prov, None, 0)
             .await
             .unwrap();
         assert_eq!(ev.event_type, EventType::TaskCreated);
@@ -903,7 +917,7 @@ mod tests {
     async fn lifecycle_transitions_enforce_invariants() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
         wait_seq(&store, &tid, 1).await;
 
         // 非法:created → claimed(跳过 ready)
@@ -957,7 +971,7 @@ mod tests {
     async fn cancel_from_blocked_returns_to_ready() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
         wait_seq(&store, &tid, 1).await;
         mark_task_ready(&store, &tid).await.unwrap();
         wait_seq(&store, &tid, 2).await;
@@ -986,7 +1000,7 @@ mod tests {
         let (store, _d) = setup().await;
         let prov = test_provenance();
         // created → canceled
-        let (tid, _) = create_task(&store, "db.repair", &prov, None).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
         wait_seq(&store, &tid, 1).await;
         cancel_task(&store, &tid, "abandoned").await.unwrap();
         wait_seq(&store, &tid, 2).await;

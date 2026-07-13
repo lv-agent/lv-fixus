@@ -452,6 +452,131 @@ impl TaskState {
     }
 }
 
+// ── FailureReason(CR-3 失败分类法)──────────────────────────────────────
+// 详见 docs/superpowers/plans/2026-07-13-cr3-failure-taxonomy-retry-budget.md
+
+/// 失败原因分类法(CR-3)。
+///
+/// 区分「基础设施类(瞬态,预算内重试)」与「应用/终态类(不重试)」。
+/// `retry::RetryPolicy` 据此 + 预算决定 Retry / Fail。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    // ── 基础设施类:retryable ──
+    AgentSpawnFailed,
+    SessionCreateFailed,
+    AgentProcessExited,
+    RedoDispatchFailed,
+    BrokerError,
+    SandboxTimeout,
+    // ── 应用/终态类:不重试 ──
+    ApplicationError,
+    Policy,
+    Canceled,
+    // ── 兜底:按 retryable 处理(预算内重试),避免新错误类型静默杀 task ──
+    Unknown,
+}
+
+impl FailureReason {
+    /// snake_case 字面量(用于事件负载序列化 / 审计)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AgentSpawnFailed => "agent_spawn_failed",
+            Self::SessionCreateFailed => "session_create_failed",
+            Self::AgentProcessExited => "agent_process_exited",
+            Self::RedoDispatchFailed => "redo_dispatch_failed",
+            Self::BrokerError => "broker_error",
+            Self::SandboxTimeout => "sandbox_timeout",
+            Self::ApplicationError => "application_error",
+            Self::Policy => "policy",
+            Self::Canceled => "canceled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// 是否值得在预算内重试。
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::AgentSpawnFailed
+                | Self::SessionCreateFailed
+                | Self::AgentProcessExited
+                | Self::RedoDispatchFailed
+                | Self::BrokerError
+                | Self::SandboxTimeout
+                | Self::Unknown
+        )
+    }
+}
+
+/// 从 error_type(+ error_message 辅助)推断失败分类。纯函数,无副作用。
+///
+/// 未知 error_type → [`FailureReason::Unknown`](按可重试处理,由预算兜底)。
+pub fn classify_failure(error_type: &str, _error_message: &str) -> FailureReason {
+    match error_type {
+        "agent_spawn_failed" => FailureReason::AgentSpawnFailed,
+        "session_create_failed" => FailureReason::SessionCreateFailed,
+        "agent_process_exited" => FailureReason::AgentProcessExited,
+        "redo_dispatch_failed" => FailureReason::RedoDispatchFailed,
+        "broker_error" => FailureReason::BrokerError,
+        "sandbox_timeout" => FailureReason::SandboxTimeout,
+        "application_error" => FailureReason::ApplicationError,
+        "policy" => FailureReason::Policy,
+        "canceled" => FailureReason::Canceled,
+        _ => FailureReason::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+
+    #[test]
+    fn classify_known_types() {
+        assert_eq!(classify_failure("agent_spawn_failed", ""), FailureReason::AgentSpawnFailed);
+        assert_eq!(classify_failure("session_create_failed", ""), FailureReason::SessionCreateFailed);
+        assert_eq!(classify_failure("agent_process_exited", ""), FailureReason::AgentProcessExited);
+        assert_eq!(classify_failure("redo_dispatch_failed", ""), FailureReason::RedoDispatchFailed);
+        assert_eq!(classify_failure("broker_error", ""), FailureReason::BrokerError);
+        assert_eq!(classify_failure("sandbox_timeout", ""), FailureReason::SandboxTimeout);
+        assert_eq!(classify_failure("application_error", ""), FailureReason::ApplicationError);
+        assert_eq!(classify_failure("policy", ""), FailureReason::Policy);
+        assert_eq!(classify_failure("canceled", ""), FailureReason::Canceled);
+    }
+
+    #[test]
+    fn classify_unknown_falls_back() {
+        assert_eq!(classify_failure("something_new", ""), FailureReason::Unknown);
+        assert_eq!(classify_failure("", ""), FailureReason::Unknown);
+    }
+
+    #[test]
+    fn infra_and_unknown_are_retryable() {
+        assert!(FailureReason::AgentSpawnFailed.is_retryable());
+        assert!(FailureReason::SessionCreateFailed.is_retryable());
+        assert!(FailureReason::AgentProcessExited.is_retryable());
+        assert!(FailureReason::RedoDispatchFailed.is_retryable());
+        assert!(FailureReason::BrokerError.is_retryable());
+        assert!(FailureReason::SandboxTimeout.is_retryable());
+        assert!(FailureReason::Unknown.is_retryable());
+    }
+
+    #[test]
+    fn application_and_terminal_not_retryable() {
+        assert!(!FailureReason::ApplicationError.is_retryable());
+        assert!(!FailureReason::Policy.is_retryable());
+        assert!(!FailureReason::Canceled.is_retryable());
+    }
+
+    #[test]
+    fn as_str_snake_case() {
+        assert_eq!(FailureReason::AgentProcessExited.as_str(), "agent_process_exited");
+        assert_eq!(FailureReason::RedoDispatchFailed.as_str(), "redo_dispatch_failed");
+        assert_eq!(FailureReason::ApplicationError.as_str(), "application_error");
+        assert_eq!(FailureReason::Unknown.as_str(), "unknown");
+    }
+}
+
 // ── Task ─────────────────────────────────────────────────────────────────
 
 /// Tenant — 多租户隔离单元
@@ -483,6 +608,9 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// 优先级(CR-1):大者优先派发。默认 0。
+    #[serde(default)]
+    pub priority: i32,
 }
 
 impl Task {
@@ -505,6 +633,7 @@ impl Task {
             body,
             created_at: Utc::now(),
             metadata: None,
+            priority: 0,
         }
     }
 }
@@ -564,6 +693,9 @@ pub struct TaskTransitionPayload {
     /// 认领/执行该 Task 的执行器标识(claimed 时填,用于 preferred_claimant)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimant: Option<String>,
+    /// 失败分类(CR-3);仅 failed 迁移填,task_failed 事件可直接查失败原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<FailureReason>,
 }
 
 /// summary_marker 的 payload
@@ -601,6 +733,9 @@ pub struct TurnCompletedPayload {
 pub struct TurnFailedPayload {
     pub error_type: String,
     pub error_message: String,
+    /// 失败分类(CR-3);终态失败时填,便于审计/按因统计
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<FailureReason>,
     #[serde(default)]
     pub stack_trace: Option<String>,
 }
@@ -640,8 +775,9 @@ pub struct LlmCompletedPayload {
 pub struct LlmFailedPayload {
     pub error_type: String,
     pub error_message: String,
-    #[serde(default)]
-    pub retryable: bool,
+    /// 失败分类(CR-3);替代旧的 retryable:bool
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<FailureReason>,
     #[serde(default)]
     pub attempt: i32,
     pub local_seq: i64,
@@ -678,8 +814,9 @@ pub struct ToolFailedPayload {
     pub tool_call_id: String,
     pub error_type: String,
     pub error_message: String,
-    #[serde(default)]
-    pub retryable: bool,
+    /// 失败分类(CR-3);替代旧的 retryable:bool
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<FailureReason>,
     #[serde(default)]
     pub attempt: i32,
     pub local_seq: i64,

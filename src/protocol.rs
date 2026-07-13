@@ -58,6 +58,9 @@ pub struct CreateSessionRequest {
     pub body: Option<serde_json::Value>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// 优先级(CR-1):大者优先派发。默认 0。
+    #[serde(default)]
+    pub priority: i32,
 }
 
 /// 创建 Session 响应

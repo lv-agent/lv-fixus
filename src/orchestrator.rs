@@ -7,11 +7,14 @@
 //!
 //! Turn 编排引擎。fixus 的中心组件:Turn 启动、Claim、恢复、健康检查。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{AppError, Result};
-use crate::models::AgentEvent;
+use crate::models::{classify_failure, AgentEvent, FailureReason};
+use crate::dispatcher::{Dispatcher, QueuedTurn};
+use crate::retry::{RetryDecision, RetryPolicy};
 use crate::task_registry::{PendingTurn, TaskRegistry, TurnOutcome};
 use crate::storage::EventStore;
 use crate::{context, recovery, service};
@@ -36,6 +39,15 @@ pub struct Orchestrator {
     registry: Arc<TaskRegistry>,
     turn_timeout: Duration,
     token_publisher: crate::stream::TokenPublisher,
+    /// 失败重试预算(CR-3)
+    retry_policy: RetryPolicy,
+    /// 派发调度器(CR-1+2):per-task_type 优先队列 + 并发闸
+    dispatcher: Arc<Dispatcher>,
+    /// per-turn 重试计数器(in-memory,key = `{task_id}:{turn_id}`)。CR-3。
+    ///
+    /// **已知局限**:fixus 重启会重置;重启后由 `recovery.rs` 接管(独立有界路径)。
+    /// 跨重启持久化预算 = 后续 CR-3c(加 `TurnRetryScheduled` 持久事件)。
+    retry_attempts: Arc<tokio::sync::Mutex<HashMap<String, i32>>>,
     last_dispatch_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     last_result_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
@@ -58,9 +70,24 @@ impl Orchestrator {
             registry,
             turn_timeout: Duration::from_secs(300),
             token_publisher,
+            retry_policy: RetryPolicy::default(),
+            dispatcher: Arc::new(Dispatcher::new(6)),
+            retry_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// 覆盖默认 retry 预算(CR-3)。`max_attempts` = 一个 turn 最多重试次数(不含首跑)。
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// 覆盖默认 per-type 并发上限(CR-1+2)。默认 6。
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        self.dispatcher = Arc::new(Dispatcher::new(max_concurrent));
+        self
     }
 
 
@@ -204,10 +231,7 @@ impl Orchestrator {
         user_input: &str,
         redo_group: &str,
     ) -> Result<TurnOutcome> {
-        // 3. 构建 context（只构建一次，传递给 dispatch）
-        let ctx = context::build_llm_context(&*self.store, task_id).await?;
-
-        // 3b. 前置校验 task_type 可解析(不可解析则在此失败,避免注册一个派发不出去的 pending turn)
+        // 3. 前置校验 task_type 可解析(不可解析则在此失败,避免注册一个派发不出去的 pending turn)
         self.resolve_task_type(task_id).await?;
 
         // 4. 创建 PendingTurn(含 oneshot channel,等待 broker task-end 兑现完成通知)
@@ -220,18 +244,10 @@ impl Orchestrator {
             .register_pending_turn(task_id, pending)
             .await;
 
-        // 5. 下发 turn.begin(execute_turn) 到 `task-begin-{task_type}`
-        // pull-based: fixlet 竞争消费该 stream 认领 turn,无需 fixus 推送、无需 registry 检查。
-        self.dispatch_execute_turn_with_ctx(
-            task_id,
-            turn_id,
-            user_input,
-            redo_group,
-            0,
-            &[],
-            &ctx,
-        )
-        .await?;
+        // 5. 经调度器入队 + 派发(CR-1+2:按 priority/容量;redo_count=0,空 cache)。
+        //    pull-based: fixlet 竞争消费 `task-begin-{type}` 认领 turn。
+        self.enqueue_and_dispatch(task_id, turn_id, user_input, redo_group, 0, vec![])
+            .await?;
 
         // 7. 等待 Turn 完成（超时保护）
         match tokio::time::timeout(self.turn_timeout, result_rx).await {
@@ -299,6 +315,9 @@ impl Orchestrator {
             registry: self.registry.clone(),
             turn_timeout: self.turn_timeout,
             token_publisher: self.token_publisher.clone(),
+            retry_policy: self.retry_policy,
+            dispatcher: self.dispatcher.clone(),
+            retry_attempts: self.retry_attempts.clone(),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -328,6 +347,9 @@ impl Orchestrator {
         let registry = self.registry.clone();
         let turn_timeout = self.turn_timeout;
         let token_publisher = self.token_publisher.clone();
+        let retry_policy = self.retry_policy;
+        let retry_attempts = self.retry_attempts.clone();
+        let dispatcher = self.dispatcher.clone();
 
         tokio::spawn(async move {
             tracing::info!("session {}: background recovery started", task_id);
@@ -351,6 +373,9 @@ impl Orchestrator {
                 registry: registry.clone(),
                 turn_timeout,
                 token_publisher,
+                retry_policy,
+                dispatcher,
+                retry_attempts,
                 last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
                 last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
             };
@@ -387,19 +412,21 @@ impl Orchestrator {
                 let cached = orch
                     .get_cached_llm_responses(&task_id, redo_ctx.turn_id)
                     .await;
+                // 经调度器入队 + 派发(CR-1+2);produce 失败由 dispatch_pending 内部终态收口,
+                // 这里只兜 resolve/get_task 失败。
                 if let Err(e) = orch
-                    .dispatch_execute_turn(
+                    .enqueue_and_dispatch(
                         &task_id,
                         redo_ctx.turn_id,
                         &redo_ctx.user_input,
                         &redo_ctx.redo_group,
                         redo_ctx.redo_count,
-                        &cached,
+                        cached,
                     )
                     .await
                 {
                     tracing::error!(
-                        "session {}: redo dispatch failed for turn {}: {}",
+                        "session {}: redo enqueue/dispatch failed for turn {}: {}",
                         task_id,
                         redo_ctx.turn_id,
                         e
@@ -662,6 +689,15 @@ impl Orchestrator {
         let _event =
             service::complete_turn(&*self.store, task_id, turn_id, final_output).await?;
 
+        // turn 成功完成 → 清 per-turn 重试计数器(CR-3)
+        self.retry_attempts
+            .lock()
+            .await
+            .remove(&format!("{}:{}", task_id, turn_id));
+
+        // turn 终态 → 释放调度器容量槽 + 续派队里下一个(CR-1+2)
+        self.release_slot_and_redispatch(task_id).await;
+
         // 2. 统计该 Turn 的事件数量
         let turn_events = self
             .store
@@ -705,24 +741,23 @@ impl Orchestrator {
         error_type: &str,
         error_message: &str,
     ) -> Result<()> {
+        let reason = classify_failure(error_type, error_message);
         tracing::error!(
-            "session {}: turn_execution_error turn_id={} type={}: {} — attempting redo",
+            "session {}: turn_execution_error turn_id={} type={} reason={:?}: {}",
             task_id,
             turn_id,
             error_type,
+            reason,
             error_message
         );
 
-        // 1. 读取原始 turn_started 获取 redo 上下文
-        let turn_events = self
-            .store
-            .get_turn_events(task_id, turn_id)
-            .await?;
+        // 1. 读取原始 turn_started 获取 redo 上下文(user_input / redo_group)
+        let turn_events = self.store.get_turn_events(task_id, turn_id).await?;
         let turn_started = turn_events
             .iter()
             .find(|e| e.event_type == crate::models::EventType::TurnStarted);
 
-        let (user_input, redo_group, redo_count) = match turn_started {
+        let (user_input, redo_group) = match turn_started {
             Some(event) => {
                 let input = event
                     .payload
@@ -736,69 +771,113 @@ impl Orchestrator {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let rc = event
-                    .payload
-                    .get("redo_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
-                (input, rg, rc + 1)
+                (input, rg)
             }
             None => {
-                // 没有 turn_started，无法 redo
-                self.fail_turn_and_respond(task_id, turn_id, error_type, error_message)
+                // 没有 turn_started,无法 redo → 终态收口
+                self.fail_task_with_reason(task_id, turn_id, reason, error_type, error_message)
                     .await?;
                 return Ok(());
             }
         };
 
-        tracing::info!(
-            "session {}: redo turn {} redo_count={} redo_group={}",
-            task_id,
-            turn_id,
-            redo_count,
-            redo_group
-        );
+        // 2. 决策(CR-3):用 in-memory per-turn 重试计数器作 current。
+        //    Retry ⇒ 计数器 +1 并重派;Fail ⇒ 清计数器并终态收口。
+        let key = format!("{}:{}", task_id, turn_id);
+        let decision = {
+            let mut attempts = self.retry_attempts.lock().await;
+            let current = attempts.get(&key).copied().unwrap_or(0);
+            let d = self.retry_policy.decide(reason, current);
+            match &d {
+                RetryDecision::Retry { .. } => {
+                    attempts.insert(key.clone(), current + 1);
+                }
+                RetryDecision::Fail { .. } => {
+                    attempts.remove(&key);
+                }
+            }
+            d
+        };
 
-        // 2. 查询上次尝试的 LLM 缓存，注入后分发 redo
-        let cached = self.get_cached_llm_responses(task_id, turn_id).await;
-        if let Err(e) = self
-            .dispatch_execute_turn(
-                task_id,
-                turn_id,
-                &user_input,
-                &redo_group,
-                redo_count,
-                &cached,
-            )
-            .await
-        {
-            tracing::error!(
-                "session {}: failed to dispatch redo: {}",
-                task_id,
-                e
-            );
-            self.fail_turn_and_respond(
-                task_id,
-                turn_id,
-                "redo_dispatch_failed",
-                &e.to_string(),
-            )
-            .await?;
+        match decision {
+            RetryDecision::Retry {
+                next_redo_count, ..
+            } => {
+                tracing::info!(
+                    "session {}: retry turn {} attempt={} reason={:?} redo_group={}",
+                    task_id,
+                    turn_id,
+                    next_redo_count,
+                    reason,
+                    redo_group
+                );
+                let cached = self.get_cached_llm_responses(task_id, turn_id).await;
+                if let Err(e) = self
+                    .dispatch_with_retry(
+                        task_id,
+                        turn_id,
+                        &user_input,
+                        &redo_group,
+                        next_redo_count,
+                        &cached,
+                    )
+                    .await
+                {
+                    // dispatch 反复失败(broker 不可达等)→ 终态收口
+                    tracing::error!(
+                        "session {}: retry dispatch exhausted for turn {}: {}",
+                        task_id,
+                        turn_id,
+                        e
+                    );
+                    self.fail_task_with_reason(
+                        task_id,
+                        turn_id,
+                        FailureReason::RedoDispatchFailed,
+                        "redo_dispatch_failed",
+                        &e.to_string(),
+                    )
+                    .await?;
+                }
+            }
+            RetryDecision::Fail {
+                budget_exhausted, ..
+            } => {
+                tracing::warn!(
+                    "session {}: turn {} terminal fail reason={:?} budget_exhausted={}",
+                    task_id,
+                    turn_id,
+                    reason,
+                    budget_exhausted
+                );
+                self.fail_task_with_reason(task_id, turn_id, reason, error_type, error_message)
+                    .await?;
+                self.release_slot_and_redispatch(task_id).await;
+            }
         }
 
         Ok(())
     }
 
-    // ── MCP Tool 执行 ─────────────────────────────────────────────────
+    // ── 失败终态收口(CR-3)─────────────────────────────────────────────
 
-    async fn fail_turn_and_respond(
+    /// 终态失败:写 `turn_failed`(带 failure_reason)+ task `Executing→Failed`(带 failure_reason)
+    /// + 通知 HTTP handler。修复此前 turn_failed 后 task 永远卡 Executing 的 bug。
+    async fn fail_task_with_reason(
         &self,
         task_id: &str,
         turn_id: i64,
+        reason: FailureReason,
         error_type: &str,
         error_message: &str,
     ) -> Result<TurnOutcome> {
-        // WAL: 写 turn_failed
+        // 清 per-turn 重试计数器
+        self.retry_attempts
+            .lock()
+            .await
+            .remove(&format!("{}:{}", task_id, turn_id));
+
+        // WAL: turn_failed(带 failure_reason)
         if let Err(e) = service::fail_turn(
             &*self.store,
             task_id,
@@ -806,11 +885,28 @@ impl Orchestrator {
             error_type,
             error_message,
             None,
+            Some(reason),
         )
         .await
         {
             tracing::error!(
                 "session {}: failed to write turn_failed: {}",
+                task_id,
+                e
+            );
+        }
+
+        // WAL: task Executing → Failed(带 failure_reason)。task_failed 终态,不再卡 Executing。
+        if let Err(e) = service::fail_task(
+            &*self.store,
+            task_id,
+            &format!("{}: {}", reason.as_str(), error_type),
+            Some(reason),
+        )
+        .await
+        {
+            tracing::error!(
+                "session {}: failed to transition task to Failed: {}",
                 task_id,
                 e
             );
@@ -829,6 +925,154 @@ impl Orchestrator {
             .await;
 
         Ok(outcome)
+    }
+
+    /// 同步阻塞路径的终态失败(timeout / channel_closed / recovery 的 dispatch 失败)。
+    ///
+    /// 这些场景**不重试**(重试会延长阻塞的 HTTP 调用):分类后直接 [`Self::fail_task_with_reason`]。
+    /// 异步 agent 崩溃路径([`Self::handle_turn_execution_error`])才走 retry 预算。
+    async fn fail_turn_and_respond(
+        &self,
+        task_id: &str,
+        turn_id: i64,
+        error_type: &str,
+        error_message: &str,
+    ) -> Result<TurnOutcome> {
+        let reason = classify_failure(error_type, error_message);
+        let outcome = self
+            .fail_task_with_reason(task_id, turn_id, reason, error_type, error_message)
+            .await?;
+        // 终态失败也释放槽 + 续派(超时 / channel_closed / recovery 兜底)
+        self.release_slot_and_redispatch(task_id).await;
+        Ok(outcome)
+    }
+
+    /// `dispatch_execute_turn` 的有界 in-process 重试(CR-3):broker produce 失败时,
+    /// 短退避重试最多 `max_attempts` 次。与 turn 级 redo 预算正交(dispatch 失败不产生
+    /// 新 turn_started、不递增 redo 计数),两层共用 `max_attempts` 上限。
+    async fn dispatch_with_retry(
+        &self,
+        task_id: &str,
+        turn_id: i64,
+        user_input: &str,
+        redo_group: &str,
+        redo_count: i32,
+        cached: &[String],
+    ) -> Result<()> {
+        let max = self.retry_policy.max_attempts.max(1);
+        let mut last_err: Option<String> = None;
+        for attempt in 0..max {
+            match self
+                .dispatch_execute_turn(task_id, turn_id, user_input, redo_group, redo_count, cached)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!(
+                        "session {}: dispatch attempt {}/{} failed for turn {}: {}",
+                        task_id,
+                        attempt + 1,
+                        max,
+                        turn_id,
+                        msg
+                    );
+                    last_err = Some(msg);
+                    if attempt + 1 < max {
+                        tokio::time::sleep(Duration::from_millis(200u64 << (attempt.min(4) as u32)))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(AppError::Protocol(format!(
+            "dispatch failed after {} attempts: {}",
+            max,
+            last_err.unwrap_or_default()
+        )))
+    }
+
+    // ── 派发调度器接线(CR-1+2)──────────────────────────────────────────
+
+    /// 把一个 turn 入队并尽量派发(按容量/优先级)。
+    /// 用于**新 turn**派发(execute_turn / recovery redo);**不**用于 Retry(Retry 槽位已持有,
+    /// 走 dispatch_with_retry 直接重派)。
+    async fn enqueue_and_dispatch(
+        &self,
+        task_id: &str,
+        turn_id: i64,
+        user_input: &str,
+        redo_group: &str,
+        redo_count: i32,
+        cached_llm: Vec<String>,
+    ) -> Result<()> {
+        let task_type = self.resolve_task_type(task_id).await?;
+        let priority = self
+            .store
+            .get_task(task_id)
+            .await?
+            .map(|t| t.priority)
+            .unwrap_or(0);
+        self.dispatcher.enqueue(QueuedTurn {
+            task_type: task_type.clone(),
+            task_id: task_id.to_string(),
+            turn_id,
+            user_input: user_input.to_string(),
+            redo_group: redo_group.to_string(),
+            redo_count,
+            cached_llm,
+            priority,
+        });
+        self.dispatch_pending(&task_type).await;
+        Ok(())
+    }
+
+    /// 把该 type 队列里能派的 turn 都派出去(直到容量满或队列空)。
+    /// `try_pop` 已 `in_flight++`;派发失败则 `on_turn_terminal` 释放 + 终态收口,继续下一个。
+    async fn dispatch_pending(&self, task_type: &str) {
+        loop {
+            let turn = match self.dispatcher.try_pop(task_type) {
+                Some(t) => t,
+                None => return,
+            };
+            let tid = turn.task_id.clone();
+            let turn_id = turn.turn_id;
+            let tt = turn.task_type.clone();
+            if let Err(e) = self
+                .dispatch_with_retry(&tid, turn_id, &turn.user_input, &turn.redo_group, turn.redo_count, &turn.cached_llm)
+                .await
+            {
+                tracing::error!(
+                    "session {}: dispatch failed for turn {}: {} — releasing slot + terminal fail",
+                    tid,
+                    turn_id,
+                    e
+                );
+                self.dispatcher.on_turn_terminal(&tt);
+                let _ = self
+                    .fail_task_with_reason(&tid, turn_id, FailureReason::RedoDispatchFailed, "redo_dispatch_failed", &e.to_string())
+                    .await;
+                continue;
+            }
+            // 派发成功:turn 在途,等终态事件(done/error)释放。继续填下一个槽。
+        }
+    }
+
+    /// turn 终态(完成/失败/超时)后:释放一个容量槽 + 续派队里下一个。
+    async fn release_slot_and_redispatch(&self, task_id: &str) {
+        let task_type = match self.resolve_task_type(task_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "release_slot: resolve_task_type failed for {}: {}",
+                    task_id,
+                    e
+                );
+                return;
+            }
+        };
+        self.dispatcher.on_turn_terminal(&task_type);
+        self.dispatch_pending(&task_type).await;
     }
 
     pub fn spawn_lifecycle_consumer(
@@ -1161,6 +1405,218 @@ mod tests {
         *orch.last_result_ok.lock().await = Some(std::time::Instant::now());
         let h = orch.health().await;
         assert_eq!(h.sandbox.status, "ok");
+    }
+
+    // ── CR-3 §4.2 集成测试(失败分类 + retry 预算)──────────────────────
+
+    /// 建一个 task 并推进到 Executing(create→ready→claim→start_turn)。
+    /// 每步后 `wait_seq` 等 logdbd 异步写入可见。
+    async fn cr3_setup_task_at_executing(
+        store: &dyn EventStore,
+    ) -> (String, i64, String) {
+        let (tid, _) = service::create_task(store, "default", &test_provenance(), None, 0)
+            .await
+            .unwrap();
+        wait_seq(store, &tid, 1).await;
+        service::mark_task_ready(store, &tid).await.unwrap();
+        wait_seq(store, &tid, 2).await;
+        service::claim_task(store, &tid, "fixlet-test").await.unwrap();
+        wait_seq(store, &tid, 3).await;
+        let (turn_id, redo_group, _) =
+            service::start_turn(store, &tid, "do work", None).await.unwrap();
+        wait_seq(store, &tid, 4).await;
+        (tid, turn_id, redo_group)
+    }
+
+    /// §4.2:agent 崩溃(`agent_process_exited`)超预算(max_attempts=2)⇒ task Failed,
+    /// 且 `turn_failed` 带 `failure_reason`。此前行为:无限 redo + task 永远卡 Executing。
+    #[tokio::test]
+    async fn cr3_agent_crash_budget_exhausted_fails_task() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 2 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        // 前 2 次 → Retry(dispatch 到 broker,LogdbdEventStore 的 publish_turn_begin 是 no-op Ok);
+        // 第 3 次 → 预算耗尽 → Fail
+        for i in 0..3 {
+            orch.handle_turn_execution_error(&tid, turn_id, "agent_process_exited", "boom")
+                .await
+                .unwrap();
+            if i < 2 {
+                assert_ne!(
+                    store.get_task_state(&tid).await.unwrap(),
+                    Some(TaskState::Failed),
+                    "attempt {}: 预算内不该 Failed",
+                    i
+                );
+            }
+        }
+        // 第 3 次 Fail 写 turn_failed(seq5)+ task_failed(seq6);等可见再断言
+        wait_seq(&*store, &tid, 6).await;
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed)
+        );
+
+        // turn_failed 恰好 1 个(只在终态 Fail 时写),且带 failure_reason
+        let events = store.get_turn_events(&tid, turn_id).await.unwrap();
+        let tfs: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == EventType::TurnFailed)
+            .collect();
+        assert_eq!(tfs.len(), 1, "应只有 1 个 turn_failed(预算内 Retry 不写)");
+        let fr = tfs[0]
+            .payload
+            .get("failure_reason")
+            .and_then(|v| v.as_str());
+        assert_eq!(fr, Some("agent_process_exited"));
+    }
+
+    /// §4.2:终态原因(`application_error`)立即 Fail —— 不消耗预算、不重试。
+    #[tokio::test]
+    async fn cr3_terminal_reason_fails_immediately() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 5 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        // application_error 一次即 Fail(不可重试),即便预算=5
+        orch.handle_turn_execution_error(&tid, turn_id, "application_error", "bad output")
+            .await
+            .unwrap();
+        wait_seq(&*store, &tid, 6).await;
+
+        assert_eq!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed)
+        );
+        let events = store.get_turn_events(&tid, turn_id).await.unwrap();
+        let fr = events
+            .iter()
+            .find(|e| e.event_type == EventType::TurnFailed)
+            .and_then(|e| e.payload.get("failure_reason").and_then(|v| v.as_str()));
+        assert_eq!(fr, Some("application_error"));
+    }
+
+    /// §4.2:预算内 Retry 后 turn 成功完成 → 计数器清零,task 未 Failed。
+    #[tokio::test]
+    async fn cr3_retry_within_budget_then_success() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 2 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        // 1 次 agent 崩溃 → Retry(计数=1),仍未 Failed
+        orch.handle_turn_execution_error(&tid, turn_id, "agent_process_exited", "hiccup")
+            .await
+            .unwrap();
+        assert_ne!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed)
+        );
+
+        // turn 成功完成 → 清计数器,写 turn_completed(seq5),task 未 Failed
+        orch.handle_turn_execution_done(&tid, turn_id, 0, "ok")
+            .await
+            .unwrap();
+        wait_seq(&*store, &tid, 5).await;
+        assert_ne!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed)
+        );
+        let events = store.get_turn_events(&tid, turn_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == EventType::TurnCompleted),
+            "应有 turn_completed"
+        );
+    }
+
+    // ── CR-1+2 §4.2 集成测试(派发调度器接线)──────────────────────────────
+    //
+    // 注:`execute_turn` 会阻塞在 result_rx(turn_timeout),且 LogdbdEventStore 的
+    // publish_turn_begin 是 no-op,无法从 broker 侧观测派发序。故这里直接调
+    // enqueue_and_dispatch / release_slot_and_redispatch(不阻塞),用 dispatcher 的
+    // in_flight / pending_count 验证 orchestrator↔dispatcher 接线。
+    // priority 顺序由 dispatcher 单测(§4.1)覆盖。
+
+    /// §4.2:并发闸端到端 —— max=1 时第 2 个 turn 排队,首个终态后第 2 个被续派。
+    #[tokio::test]
+    async fn cr12_concurrency_cap_and_redispatch() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry, tp).with_max_concurrent(1);
+
+        let prov = test_provenance();
+        let (ta, _) = service::create_task(&*store, "default", &prov, None, 0).await.unwrap();
+        let (tb, _) = service::create_task(&*store, "default", &prov, None, 0).await.unwrap();
+        wait_seq(&*store, &ta, 1).await;
+        wait_seq(&*store, &tb, 1).await;
+
+        // A 入队 + 派发(max=1 → in_flight=1)
+        orch.enqueue_and_dispatch(&ta, 1, "a", "rg_a", 0, vec![])
+            .await
+            .unwrap();
+        assert_eq!(orch.dispatcher.in_flight("default"), 1);
+        assert_eq!(orch.dispatcher.pending_count("default"), 0);
+
+        // B 入队(max=1 满 → B 排队;in_flight 仍 1,pending=1)
+        orch.enqueue_and_dispatch(&tb, 1, "b", "rg_b", 0, vec![])
+            .await
+            .unwrap();
+        assert_eq!(orch.dispatcher.in_flight("default"), 1);
+        assert_eq!(orch.dispatcher.pending_count("default"), 1);
+
+        // A 终态 → 释放槽 → B 续派(in_flight 回到 1,pending=0)
+        orch.release_slot_and_redispatch(&ta).await;
+        assert_eq!(
+            orch.dispatcher.in_flight("default"),
+            1,
+            "B 应被续派,占住释放的槽"
+        );
+        assert_eq!(orch.dispatcher.pending_count("default"), 0);
+    }
+
+    /// §4.2:priority 透传 —— 高优先 task 的 turn 入队时 priority 进队列(CR-1 数据通路)。
+    #[tokio::test]
+    async fn cr12_priority_threaded_through_task() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry, tp).with_max_concurrent(2);
+
+        let prov = test_provenance();
+        let (th, _) = service::create_task(&*store, "default", &prov, None, 9).await.unwrap();
+        wait_seq(&*store, &th, 1).await;
+
+        // 高优先 task 的 turn 入队;priority 从 task head 读出进 QueuedTurn(dispatch_pending 派发后 in_flight=1)
+        orch.enqueue_and_dispatch(&th, 1, "hi", "rg", 0, vec![])
+            .await
+            .unwrap();
+        assert_eq!(orch.dispatcher.in_flight("default"), 1);
+        // 派出去的 turn 是 priority=9(由 task priority 透传;dispatch_pending 已取走,
+        // 这里仅断言计数,顺序正确性见 dispatcher §4.1 pop_order_is_priority_desc)
     }
 
 }

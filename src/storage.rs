@@ -41,6 +41,7 @@ pub trait EventStore: Send + Sync {
         user_id: &str,
         provenance: &Provenance,
         body: Option<&serde_json::Value>,
+        priority: i32,
     ) -> Result<(String, AgentEvent)>;
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>>;
@@ -421,6 +422,7 @@ impl EventStore for LogdbdEventStore {
         user_id: &str,
         provenance: &Provenance,
         body: Option<&serde_json::Value>,
+        priority: i32,
     ) -> Result<(String, AgentEvent)> {
         // fixus 分配 task_id(UUIDv7,全局唯一单调)— spec §8.4
         let task_id = format!(
@@ -432,6 +434,7 @@ impl EventStore for LogdbdEventStore {
             "task_type": task_type,
             "provenance": provenance,
             "body": body.cloned().unwrap_or(serde_json::Value::Null),
+            "priority": priority,
         });
         let content = serde_json::to_vec(&payload)
             .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
@@ -532,6 +535,7 @@ impl EventStore for LogdbdEventStore {
             body: payload.get("body").filter(|v| !v.is_null()).cloned(),
             created_at: Utc::now(),
             metadata: None,
+            priority: payload["priority"].as_i64().unwrap_or(0) as i32,
         }))
     }
 
@@ -1440,7 +1444,7 @@ mod logdbd_tests {
     async fn create_test_task(store: &LogdbdEventStore, task_type: &str) -> String {
         let prov = test_provenance();
         let (tid, _ev) = store
-            .create_task(task_type, "t", "u", &prov, None)
+            .create_task(task_type, "t", "u", &prov, None, 0)
             .await
             .unwrap();
         tid
@@ -1461,7 +1465,7 @@ mod logdbd_tests {
             created_by: "test".into(),
         };
         let (tid, ev) = store
-            .create_task("claude-code", "tenant-a", "user-1", &prov, None)
+            .create_task("claude-code", "tenant-a", "user-1", &prov, None, 0)
             .await
             .unwrap();
         assert_eq!(ev.event_type, EventType::TaskCreated);
@@ -1662,7 +1666,7 @@ mod logdbd_tests {
         let (store, _dir) = setup().await;
         let prov = test_provenance();
         let (sid, ev) = store
-            .create_task("a", "t", "u", &prov, None)
+            .create_task("a", "t", "u", &prov, None, 0)
             .await
             .unwrap();
         assert_eq!(ev.seq, 1, "task_created seq must be 1");
@@ -1790,7 +1794,7 @@ mod logdbd_tests {
         let (store, _dir) = setup().await;
         let prov = test_provenance();
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, None)
+            .create_task("db.repair", "t", "u", &prov, None, 0)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;
@@ -1879,7 +1883,7 @@ mod logdbd_tests {
         // warm-up( primes logdbd 连接 / segment)
         for _ in 0..20 {
             let (tid, _) = store
-                .create_task("db.repair", "t", "u", &prov, None)
+                .create_task("db.repair", "t", "u", &prov, None, 0)
                 .await
                 .unwrap();
             wait_seq(&store, &tid, 1).await;
@@ -1889,7 +1893,7 @@ mod logdbd_tests {
         for _ in 0..n {
             let t0 = std::time::Instant::now();
             let (tid, _) = store
-                .create_task("db.repair", "t", "u", &prov, None)
+                .create_task("db.repair", "t", "u", &prov, None, 0)
                 .await
                 .unwrap();
             us.push(t0.elapsed().as_micros() as u64);
@@ -1904,7 +1908,7 @@ mod logdbd_tests {
         let (store, _d) = setup().await;
         let prov = test_provenance();
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, None)
+            .create_task("db.repair", "t", "u", &prov, None, 0)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;
@@ -1956,7 +1960,7 @@ mod logdbd_tests {
         let prov = test_provenance();
         let body = serde_json::json!({"task_brief":"fix db1","contract":{"x":1}});
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, Some(&body))
+            .create_task("db.repair", "t", "u", &prov, Some(&body), 0)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;
