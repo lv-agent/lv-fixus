@@ -172,4 +172,50 @@ mod tests {
     fn default_policy_is_two_attempts() {
         assert_eq!(RetryPolicy::default().max_attempts, 2);
     }
+
+    // ── perf(CR-3):decide 在重试热路径的开销 ──────────────────────
+
+    #[ignore]
+    #[test]
+    fn perf_retry_decide_at_scale() {
+        use std::time::Instant;
+        let policy = RetryPolicy { max_attempts: 2 };
+        let reasons = [
+            FailureReason::AgentProcessExited,
+            FailureReason::BrokerError,
+            FailureReason::ApplicationError,
+            FailureReason::Unknown,
+            FailureReason::SandboxTimeout,
+        ];
+        const N: usize = 50_000;
+        let mut samples: Vec<u64> = Vec::with_capacity(N);
+        // 防编译器优化掉 decide:累加决策输出
+        let mut acc: u64 = 0;
+        for i in 0..N {
+            let reason = reasons[i % reasons.len()];
+            let redo = (i % 4) as i32;
+            let t0 = Instant::now();
+            let d = policy.decide(reason, redo);
+            samples.push(t0.elapsed().as_nanos() as u64);
+            match d {
+                RetryDecision::Retry { next_redo_count, .. } => acc += next_redo_count as u64,
+                RetryDecision::Fail { budget_exhausted, .. } => acc += budget_exhausted as u64,
+            }
+        }
+        report("perf_retry_decide", &mut samples);
+        // correctness:同输入同输出(确定性),且 acc 被用到
+        assert_eq!(
+            policy.decide(FailureReason::AgentProcessExited, 0),
+            RetryDecision::Retry { reason: FailureReason::AgentProcessExited, next_redo_count: 1 }
+        );
+        println!("perf_retry_decide acc={acc}");
+    }
+
+    fn report(label: &str, samples: &mut [u64]) {
+        samples.sort_unstable();
+        let n = samples.len();
+        let pct = |p: f64| samples[((n as f64 - 1.0) * p).round() as usize];
+        let avg = samples.iter().sum::<u64>() / n as u64;
+        println!("{label}: n={n} p50={}ns p95={}ns p99={}ns avg={}ns", pct(0.50), pct(0.95), pct(0.99), avg);
+    }
 }

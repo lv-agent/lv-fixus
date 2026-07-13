@@ -37,6 +37,18 @@ impl MessageAccumulator {
     }
 }
 
+/// 由 task_type 算认领 stream 名 + 稳定 group 名。
+///
+/// 点号转义:`.` 在 stream 名里非法(logdbd 限制,见 memory dev-stack-startup),
+/// 故 `task_type` 里的 `.` 换成 `-`。抽成纯函数便于测试。
+fn stream_and_group_for(task_type: &str) -> (String, String) {
+    let sanitized = task_type.replace('.', "-");
+    (
+        format!("task-begin-{}", sanitized),
+        format!("fixlets-{}", sanitized),
+    )
+}
+
 // ── 配置 ────────────────────────────────────────────────────────────────
 
 /// fixlet 配置
@@ -134,9 +146,7 @@ async fn turn_claim_subscriber(
 ) {
     let broker_addr = std::env::var("BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:5100".into());
     let namespace = std::env::var("LOGDBD_NAMESPACE").unwrap_or_else(|_| "default".into());
-    let sanitized = config.task_type.replace('.', "-");
-    let stream = format!("task-begin-{}", sanitized);
-    let group = format!("fixlets-{}", sanitized);
+    let (stream, group) = stream_and_group_for(&config.task_type);
     let instance_id = uuid::Uuid::now_v7().to_string().replace('-', "");
     let consumer_id = format!("fixlet-{}", instance_id);
 
@@ -347,6 +357,63 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
+/// 解析后的 execute_turn(fixus → fixlet 的 turn.begin 契约)。
+struct ParsedExecuteTurn {
+    task_id: String,
+    turn_id: i64,
+    user_input: String,
+    redo_group: String,
+    redo_count: i32,
+    summary: String,
+    messages: Vec<fixus::Message>,
+}
+
+/// 解析 execute_turn payload(fixus → fixlet 的 turn.begin 契约)。
+///
+/// 字段约定:
+/// - `session_id` → task_id(fixus 历史字段名;`task_id` 也接受)
+/// - `turn_id` / `redo_group` / `redo_count` — turn 标识与重做计数
+/// - `input.user_input` — 本 turn 用户输入
+/// - `context.summary` / `context.messages` — LLM 上下文(摘要 + 增量)
+///
+/// 校验:`session_id` 空 或 `turn_id == 0` → `Err`(缺关键标识)。
+/// 抽成纯函数便于测试 fixus↔fixlet 线契约。
+fn parse_execute_turn_payload(
+    payload: &serde_json::Value,
+) -> Result<ParsedExecuteTurn, &'static str> {
+    let task_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let turn_id = payload.get("turn_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if task_id.is_empty() || turn_id == 0 {
+        return Err("missing session_id or turn_id");
+    }
+    Ok(ParsedExecuteTurn {
+        task_id,
+        turn_id,
+        user_input: payload
+            .get("input")
+            .and_then(|v| v.get("user_input"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        redo_group: payload.get("redo_group").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        redo_count: payload.get("redo_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        summary: payload
+            .get("context")
+            .and_then(|v| v.get("summary"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        messages: serde_json::from_value(
+            payload.get("context").and_then(|v| v.get("messages")).cloned().unwrap_or_default(),
+        )
+        .unwrap_or_default(),
+    })
+}
+
 /// 处理来自 broker `task-begin-{task_type}` stream 的 turn.begin(execute_turn) payload
 async fn handle_execute_turn_from_broker(
     payload: &serde_json::Value,
@@ -360,19 +427,14 @@ async fn handle_execute_turn_from_broker(
     lifecycle_producer: &Arc<tokio::sync::Mutex<BrokerProducer>>,
     lifecycle_namespace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let task_id = payload["session_id"].as_str().unwrap_or("");
-    let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
-    let user_input = payload["input"]["user_input"].as_str().unwrap_or("");
-    let redo_group = payload["redo_group"].as_str().unwrap_or("");
-    let redo_count = payload["redo_count"].as_i64().unwrap_or(0) as i32;
-    let summary = payload["context"]["summary"].as_str().unwrap_or("");
-    let messages: Vec<fixus::Message> = serde_json::from_value(
-        payload["context"]["messages"].clone()
-    ).unwrap_or_default();
-
-    if task_id.is_empty() || turn_id == 0 {
-        return Err("missing session_id or turn_id".into());
-    }
+    let parsed = parse_execute_turn_payload(payload)?;
+    let ParsedExecuteTurn { task_id, turn_id, user_input, redo_group, redo_count, summary, messages } = parsed;
+    // 影子绑定为 &str —— 保持下游用法(Some(task_id)、build_acp_prompt(summary,…))类型不变,
+    // 底层 String 由上面的解构绑定持有,活到函数末尾。
+    let task_id = task_id.as_str();
+    let user_input = user_input.as_str();
+    let redo_group = redo_group.as_str();
+    let summary = summary.as_str();
 
     tracing::info!("execute_turn: session={} turn={} redo_count={}", task_id, turn_id, redo_count);
 
@@ -624,3 +686,160 @@ async fn handle_agent_message(
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── MessageAccumulator ──────────────────────────────────────────
+
+    #[test]
+    fn accumulator_new_finalizes_empty() {
+        let acc = MessageAccumulator::new();
+        assert_eq!(acc.finalize(), "");
+    }
+
+    #[test]
+    fn accumulator_appends_in_order() {
+        let mut acc = MessageAccumulator::new();
+        acc.append("Hello, ");
+        acc.append("world");
+        acc.append("!");
+        assert_eq!(acc.finalize(), "Hello, world!");
+    }
+
+    #[test]
+    fn accumulator_reset_clears() {
+        let mut acc = MessageAccumulator::new();
+        acc.append("keep?");
+        acc.reset();
+        assert_eq!(acc.finalize(), "");
+        // reset 后可继续累积
+        acc.append("again");
+        assert_eq!(acc.finalize(), "again");
+    }
+
+    // ── stream_and_group_for(认领路由,点号转义)────────────────────
+
+    #[test]
+    fn stream_and_group_normal_task_type() {
+        let (s, g) = stream_and_group_for("claude");
+        assert_eq!(s, "task-begin-claude");
+        assert_eq!(g, "fixlets-claude");
+    }
+
+    #[test]
+    fn stream_and_group_dots_are_sanitized() {
+        // 点号在 stream 名非法 → 换成 -(memory dev-stack-startup 的坑)
+        let (s, g) = stream_and_group_for("acp.claude.v2");
+        assert_eq!(s, "task-begin-acp-claude-v2");
+        assert_eq!(g, "fixlets-acp-claude-v2");
+    }
+
+    #[test]
+    fn stream_and_group_empty_task_type() {
+        let (s, g) = stream_and_group_for("");
+        assert_eq!(s, "task-begin-");
+        assert_eq!(g, "fixlets-");
+    }
+
+    // ── parse_execute_turn_payload(fixus→fixlet 线契约)─────────────
+
+    fn full_payload() -> serde_json::Value {
+        json!({
+            "session_id": "task-1",
+            "turn_id": 5,
+            "input": { "user_input": "hello" },
+            "redo_group": "rg-1",
+            "redo_count": 2,
+            "context": {
+                "summary": "prior summary",
+                "messages": [
+                    { "role": "user", "content": "hi" },
+                    { "role": "assistant", "content": "hey" }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn parse_full_valid_payload() {
+        let p = parse_execute_turn_payload(&full_payload()).expect("应解析成功");
+        assert_eq!(p.task_id, "task-1");
+        assert_eq!(p.turn_id, 5);
+        assert_eq!(p.user_input, "hello");
+        assert_eq!(p.redo_group, "rg-1");
+        assert_eq!(p.redo_count, 2);
+        assert_eq!(p.summary, "prior summary");
+        assert_eq!(p.messages.len(), 2);
+        assert_eq!(p.messages[0].role, "user");
+        assert_eq!(p.messages[1].content, "hey");
+    }
+
+    #[test]
+    fn parse_missing_session_id_errors() {
+        let mut p = full_payload();
+        p["session_id"] = json!(null);
+        assert!(parse_execute_turn_payload(&p).is_err());
+    }
+
+    #[test]
+    fn parse_empty_session_id_errors() {
+        let mut p = full_payload();
+        p["session_id"] = json!("");
+        assert!(parse_execute_turn_payload(&p).is_err());
+    }
+
+    #[test]
+    fn parse_turn_id_zero_errors() {
+        let mut p = full_payload();
+        p["turn_id"] = json!(0);
+        assert!(parse_execute_turn_payload(&p).is_err());
+    }
+
+    #[test]
+    fn parse_missing_turn_id_defaults_to_zero_then_errors() {
+        let mut p = full_payload();
+        p_object_remove(&mut p, "turn_id");
+        assert!(parse_execute_turn_payload(&p).is_err(), "缺 turn_id 默认 0 → 应 Err");
+    }
+
+    #[test]
+    fn parse_uses_session_id_not_task_id_alias() {
+        // 当前契约只认 session_id;仅有 task_id(无 session_id)→ Err。
+        // 文档化此行为(若未来要加 task_id 别名,更新此测试)。
+        let p = json!({ "task_id": "task-1", "turn_id": 5 });
+        assert!(parse_execute_turn_payload(&p).is_err());
+    }
+
+    #[test]
+    fn parse_optional_fields_default_empty() {
+        // 只有关键字段 → 可选字段兜底(user_input="", summary="", messages=[])
+        let p = json!({ "session_id": "t", "turn_id": 1 });
+        let parsed = parse_execute_turn_payload(&p).expect("关键字段齐全应成功");
+        assert_eq!(parsed.task_id, "t");
+        assert_eq!(parsed.turn_id, 1);
+        assert_eq!(parsed.user_input, "");
+        assert_eq!(parsed.redo_group, "");
+        assert_eq!(parsed.redo_count, 0);
+        assert_eq!(parsed.summary, "");
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_malformed_messages_default_empty() {
+        // context.messages 不是合法 Message 数组 → 兜底空(不 panic)
+        let mut p = full_payload();
+        p["context"]["messages"] = json!("not an array");
+        let parsed = parse_execute_turn_payload(&p).expect("不应因 messages 畸形失败");
+        assert!(parsed.messages.is_empty());
+    }
+
+    // serde_json::Map 没有 pub remove 便利,用 as_object_mut
+    fn p_object_remove(v: &mut serde_json::Value, key: &str) {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove(key);
+        }
+    }
+}

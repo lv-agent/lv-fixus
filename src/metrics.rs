@@ -459,4 +459,38 @@ mod tests {
         }
         report("metrics render (4 types × ~5k obs)", "µs", us);
     }
+
+    #[test]
+    #[ignore]
+    fn perf_record_llm_tokens() {
+        // CR-8:record_llm_tokens 每次 llm_completed 调一次(3 次 with_label_values.inc_by)。
+        // 测真实 label 基数(4 task_type × 5 model)下的单次开销。
+        let m = Metrics::new();
+        let task_types = ["claude", "hermes", "codex", "cursor"];
+        let models = [
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-haiku-4-5",
+            "gpt-5",
+            "gemini-3-pro",
+        ];
+        // warm-up:让 label cur 一次性建好
+        for tt in task_types {
+            for mdl in models {
+                m.record_llm_tokens(tt, mdl, 10, 2, 12);
+            }
+        }
+        const N: usize = 50_000;
+        let mut ns = Vec::with_capacity(N);
+        for i in 0..N {
+            let tt = task_types[i % task_types.len()];
+            let mdl = models[i % models.len()];
+            let t0 = std::time::Instant::now();
+            m.record_llm_tokens(tt, mdl, 100, 20, 120);
+            ns.push(t0.elapsed().as_nanos() as u64);
+        }
+        report("record_llm_tokens (4×5 labels)", "ns", ns);
+        // correctness:总量落账可见
+        assert!(m.render().contains("fixus_token_total_tokens_total"));
+    }
 }
