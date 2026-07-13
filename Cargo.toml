@@ -60,6 +60,9 @@ landlock = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Metrics — 业务 Prometheus 指标(CR-4)
+prometheus = "0.13"
+
 [dev-dependencies]
 tokio-test = "0.4"
 serde_json = "1"

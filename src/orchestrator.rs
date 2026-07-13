@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{AppError, Result};
+use crate::metrics::{Metrics, OUTCOME_FAILED, OUTCOME_SUCCESS};
 use crate::models::{classify_failure, AgentEvent, FailureReason};
 use crate::dispatcher::{Dispatcher, QueuedTurn};
 use crate::retry::{RetryDecision, RetryPolicy};
@@ -48,6 +49,12 @@ pub struct Orchestrator {
     /// **已知局限**:fixus 重启会重置;重启后由 `recovery.rs` 接管(独立有界路径)。
     /// 跨重启持久化预算 = 后续 CR-3c(加 `TurnRetryScheduled` 持久事件)。
     retry_attempts: Arc<tokio::sync::Mutex<HashMap<String, i32>>>,
+    /// 业务指标(CR-4)。进程内默认实例;`server::start` 与 `/metrics` handler 共享同一 `Arc`。
+    metrics: Arc<Metrics>,
+    /// per-turn 首次派发时刻(key = `{task_id}:{turn_id}`),CR-4 turn 执行时长计时。
+    /// 只在首次派发(`dispatch_pending`)写入;turn 级 Retry 不重置 → 终态观察到「首次派发→终态」总壁钟。
+    /// 终态唯一(CR-3 保证),`remove` 恰好一次,无泄漏。跨重启丢失(同 retry_attempts 局限)。
+    dispatch_times: Arc<tokio::sync::Mutex<HashMap<String, std::time::Instant>>>,
     last_dispatch_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     last_result_ok: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
@@ -73,6 +80,8 @@ impl Orchestrator {
             retry_policy: RetryPolicy::default(),
             dispatcher: Arc::new(Dispatcher::new(6)),
             retry_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            metrics: Metrics::new(),
+            dispatch_times: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -88,6 +97,23 @@ impl Orchestrator {
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
         self.dispatcher = Arc::new(Dispatcher::new(max_concurrent));
         self
+    }
+
+    /// 注入共享的业务指标实例(CR-4)。默认 `new()` 自建一个;`server::start` 让
+    /// orchestrator 与 `/metrics` handler 共享同一 `Arc<Metrics>` 时用此注入同一实例。
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// 取业务指标句柄(CR-4),供 `/metrics` handler 渲染。
+    pub fn metrics_handle(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    /// per-type `(task_type, pending, in_flight)` 快照(CR-4),供 Gauge pull。
+    pub fn dispatcher_counts(&self) -> Vec<(String, usize, usize)> {
+        self.dispatcher.snapshot()
     }
 
 
@@ -318,6 +344,8 @@ impl Orchestrator {
             retry_policy: self.retry_policy,
             dispatcher: self.dispatcher.clone(),
             retry_attempts: self.retry_attempts.clone(),
+            metrics: self.metrics.clone(),
+            dispatch_times: self.dispatch_times.clone(),
             last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
             last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
         };
@@ -350,6 +378,8 @@ impl Orchestrator {
         let retry_policy = self.retry_policy;
         let retry_attempts = self.retry_attempts.clone();
         let dispatcher = self.dispatcher.clone();
+        let metrics = self.metrics.clone();
+        let dispatch_times = self.dispatch_times.clone();
 
         tokio::spawn(async move {
             tracing::info!("session {}: background recovery started", task_id);
@@ -376,6 +406,8 @@ impl Orchestrator {
                 retry_policy,
                 dispatcher,
                 retry_attempts,
+                metrics,
+                dispatch_times,
                 last_dispatch_ok: Arc::new(tokio::sync::Mutex::new(None)),
                 last_result_ok: Arc::new(tokio::sync::Mutex::new(None)),
             };
@@ -695,6 +727,10 @@ impl Orchestrator {
             .await
             .remove(&format!("{}:{}", task_id, turn_id));
 
+        // 打点(CR-4):turn 执行时长 + 终态计数(success)
+        self.record_turn_terminal_metric(task_id, turn_id, OUTCOME_SUCCESS)
+            .await;
+
         // turn 终态 → 释放调度器容量槽 + 续派队里下一个(CR-1+2)
         self.release_slot_and_redispatch(task_id).await;
 
@@ -811,6 +847,12 @@ impl Orchestrator {
                     reason,
                     redo_group
                 );
+                // 打点(CR-4):retry 预算消耗计数。
+                let retry_tt = self
+                    .resolve_task_type(task_id)
+                    .await
+                    .unwrap_or_else(|_| "unknown".to_string());
+                self.metrics.record_retry(&retry_tt);
                 let cached = self.get_cached_llm_responses(task_id, turn_id).await;
                 if let Err(e) = self
                     .dispatch_with_retry(
@@ -861,6 +903,27 @@ impl Orchestrator {
 
     // ── 失败终态收口(CR-3)─────────────────────────────────────────────
 
+    /// 打点 turn 终态(CR-4):取首次派发时刻算 `dispatch→terminal` 时长 + resolve task_type +
+    /// 记 `fixus_turn_terminal_total` / `fixus_turn_duration_seconds`。
+    ///
+    /// `dispatch_time` 缺失(跨重启 / 兜底路径无 turn_started)→ duration 记 0.0,**终态计数仍记**
+    /// (计数比精度重要)。终态唯一(CR-3),`remove` 恰好一次。
+    async fn record_turn_terminal_metric(&self, task_id: &str, turn_id: i64, outcome: &str) {
+        let key = format!("{}:{}", task_id, turn_id);
+        let dur = self
+            .dispatch_times
+            .lock()
+            .await
+            .remove(&key)
+            .map(|t0| t0.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let tt = self
+            .resolve_task_type(task_id)
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
+        self.metrics.record_turn_terminal(&tt, outcome, dur);
+    }
+
     /// 终态失败:写 `turn_failed`(带 failure_reason)+ task `Executing→Failed`(带 failure_reason)
     /// + 通知 HTTP handler。修复此前 turn_failed 后 task 永远卡 Executing 的 bug。
     async fn fail_task_with_reason(
@@ -876,6 +939,10 @@ impl Orchestrator {
             .lock()
             .await
             .remove(&format!("{}:{}", task_id, turn_id));
+
+        // 打点(CR-4):turn 执行时长 + 终态计数(failed)。所有失败路径的唯一漏斗。
+        self.record_turn_terminal_metric(task_id, turn_id, OUTCOME_FAILED)
+            .await;
 
         // WAL: turn_failed(带 failure_reason)
         if let Err(e) = service::fail_turn(
@@ -1013,6 +1080,7 @@ impl Orchestrator {
             .await?
             .map(|t| t.priority)
             .unwrap_or(0);
+        self.metrics.record_turn_enqueued(&task_type);
         self.dispatcher.enqueue(QueuedTurn {
             task_type: task_type.clone(),
             task_id: task_id.to_string(),
@@ -1022,6 +1090,7 @@ impl Orchestrator {
             redo_count,
             cached_llm,
             priority,
+            enqueued_at: std::time::Instant::now(),
         });
         self.dispatch_pending(&task_type).await;
         Ok(())
@@ -1038,6 +1107,13 @@ impl Orchestrator {
             let tid = turn.task_id.clone();
             let turn_id = turn.turn_id;
             let tt = turn.task_type.clone();
+            // 打点(CR-4):队列等待时长 + 记首次派发时刻(终态算 duration)。
+            self.metrics
+                .record_turn_dispatched(&tt, turn.enqueued_at.elapsed().as_secs_f64());
+            self.dispatch_times
+                .lock()
+                .await
+                .insert(format!("{}:{}", tid, turn_id), std::time::Instant::now());
             if let Err(e) = self
                 .dispatch_with_retry(&tid, turn_id, &turn.user_input, &turn.redo_group, turn.redo_count, &turn.cached_llm)
                 .await
@@ -1617,6 +1693,111 @@ mod tests {
         assert_eq!(orch.dispatcher.in_flight("default"), 1);
         // 派出去的 turn 是 priority=9(由 task priority 透传;dispatch_pending 已取走,
         // 这里仅断言计数,顺序正确性见 dispatcher §4.1 pop_order_is_priority_desc)
+    }
+
+    // ── CR-4 §4.3 集成测试(业务指标打点)──────────────────────────────────
+
+    /// §4.3:turn 完整生命周期(入队→派发→成功终态)→ render() 含全部 turn 级指标。
+    #[tokio::test]
+    async fn cr4_metrics_record_turn_lifecycle() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp);
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        // 入队 + 派发(LogdbdEventStore publish_turn_begin = no-op Ok)
+        orch.enqueue_and_dispatch(&tid, turn_id, "do work", "rg", 0, vec![])
+            .await
+            .unwrap();
+        // 成功终态
+        orch.handle_turn_execution_done(&tid, turn_id, 0, "ok")
+            .await
+            .unwrap();
+        wait_seq(&*store, &tid, 5).await;
+
+        let out = orch.metrics_handle().render();
+        assert!(
+            out.contains("fixus_turn_enqueued_total{task_type=\"default\"} 1"),
+            "enqueued:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_turn_dispatched_total{task_type=\"default\"} 1"),
+            "dispatched:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_turn_queue_wait_seconds_count{task_type=\"default\"} 1"),
+            "queue_wait:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_turn_terminal_total{outcome=\"success\",task_type=\"default\"} 1"),
+            "terminal success:\n{}", out
+        );
+        assert!(
+            out.contains("fixus_turn_duration_seconds_count{outcome=\"success\",task_type=\"default\"} 1"),
+            "duration:\n{}", out
+        );
+    }
+
+    /// §4.3:application_error(终态原因)→ outcome="failed" 计数。
+    #[tokio::test]
+    async fn cr4_metrics_terminal_failed_on_fail_path() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 5 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        orch.handle_turn_execution_error(&tid, turn_id, "application_error", "bad output")
+            .await
+            .unwrap();
+        wait_seq(&*store, &tid, 6).await;
+
+        let out = orch.metrics_handle().render();
+        assert!(
+            out.contains("fixus_turn_terminal_total{outcome=\"failed\",task_type=\"default\"} 1"),
+            "terminal failed:\n{}", out
+        );
+    }
+
+    /// §4.3:retryable 原因 + 预算内 → Retry → retry_attempts_total 计数(CR-3 可观测)。
+    #[tokio::test]
+    async fn cr4_metrics_retry_counter() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let registry = TaskRegistry::new();
+        let tp = TokenPublisher::new().await;
+        let orch = Orchestrator::new(store.clone(), registry.clone(), tp)
+            .with_retry_policy(RetryPolicy { max_attempts: 2 });
+
+        let (tid, turn_id, rg) = cr3_setup_task_at_executing(&*store).await;
+        let (pending, _rx) = PendingTurn::new(tid.clone(), turn_id, rg);
+        registry.register_pending_turn(&tid, pending).await;
+
+        // agent_process_exited 可重试 + 预算=2 → 第 1 次 Retry
+        orch.handle_turn_execution_error(&tid, turn_id, "agent_process_exited", "boom")
+            .await
+            .unwrap();
+        assert_ne!(
+            store.get_task_state(&tid).await.unwrap(),
+            Some(TaskState::Failed),
+            "预算内不该 Failed"
+        );
+
+        let out = orch.metrics_handle().render();
+        assert!(
+            out.contains("fixus_retry_attempts_total{task_type=\"default\"} 1"),
+            "retry counter:\n{}", out
+        );
     }
 
 }

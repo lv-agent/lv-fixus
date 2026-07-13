@@ -36,6 +36,9 @@ pub struct AppState {
     /// 共享的 Orchestrator 实例 —— 必须全进程唯一,否则 pending_results(oneshot map)
     /// 会因 execute_tool 与 tool_result_handler 拿到不同实例而无法兑现,导致工具结果丢失。
     pub orchestrator: Arc<Orchestrator>,
+    /// 业务指标(CR-4)。与 orchestrator 内部 `metrics` 同一 `Arc`(start 时注入),
+    /// `/metrics` handler 用它 sync Gauge + render。
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 // ── 错误转换 ────────────────────────────────────────────────────────────
@@ -94,10 +97,13 @@ pub async fn start() -> Result<(), AppError> {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(6);
+    // 业务指标(CR-4):orchestrator 与 /metrics handler 共享同一实例。
+    let metrics = crate::metrics::Metrics::new();
     let orchestrator = Arc::new(
         Orchestrator::new(store.clone(), registry.clone(), (*token_publisher).clone())
             .with_retry_policy(crate::retry::RetryPolicy { max_attempts })
-            .with_max_concurrent(max_concurrent),
+            .with_max_concurrent(max_concurrent)
+            .with_metrics(metrics.clone()),
     );
     // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
     let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
@@ -110,6 +116,7 @@ pub async fn start() -> Result<(), AppError> {
         registry,
         token_publisher,
         orchestrator,
+        metrics,
     };
     let app = build_router(state);
 
@@ -218,6 +225,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Health
         .route("/health", get(health_handler))
+        // Metrics — Prometheus 文本格式(CR-4)
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -254,6 +263,8 @@ async fn create_session_handler(
         req.priority,
     )
     .await?;
+    // 打点(CR-4):新 task 计数。
+    state.metrics.record_task_created(task_type);
 
     Ok(Json(ApiResponse::ok(CreateSessionResponse {
         session_id: task_id,
@@ -683,6 +694,30 @@ async fn health_handler(
     Json(ApiResponse::ok(health))
 }
 
+/// Prometheus 指标端点(CR-4)。pull:渲染前 sync dispatcher Gauge + 依赖健康 Gauge。
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let m = state.metrics.clone();
+    // 1. dispatcher 负载 Gauge(per-type in_flight / pending)
+    for (tt, pending, in_flight) in state.orchestrator.dispatcher_counts() {
+        m.set_pending(&tt, pending as i64);
+        m.set_in_flight(&tt, in_flight as i64);
+    }
+    // 2. 依赖健康 Gauge(复用 health();1=ok,0=degraded/unknown)
+    let h = state.orchestrator.health().await;
+    m.set_dependency_up(crate::metrics::DEP_BROKER, h.broker.status == "ok");
+    m.set_dependency_up(crate::metrics::DEP_SANDBOX, h.sandbox.status == "ok");
+    // 3. 渲染
+    let body = m.render();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 // ── 测试 ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -758,6 +793,7 @@ mod tests {
             store,
             registry: registry.clone(),
             token_publisher,
+            metrics: orchestrator.metrics_handle(),
             orchestrator,
         };
         (state, registry, dir)

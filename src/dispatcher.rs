@@ -28,6 +28,8 @@ pub struct QueuedTurn {
     pub redo_count: i32,
     pub cached_llm: Vec<String>,
     pub priority: i32,
+    /// 入队时刻(CR-4):队列等待时长(enqueue→dispatch)计时起点。
+    pub enqueued_at: std::time::Instant,
 }
 
 /// 优先队列条目。`Ord` 使 BinaryHeap 弹出:**priority 大者优先;同 priority 入队早者(seq 小)优先**。
@@ -139,6 +141,18 @@ impl Dispatcher {
             .map(|q| q.pending.len())
             .unwrap_or(0)
     }
+
+    /// per-type `(task_type, pending 深度, in_flight 数)` 快照(CR-4),供 `/metrics` Gauge pull。
+    /// 只含 pending>0 或 in_flight>0 的 type;顺序稳定(按 task_type 字典序)。
+    pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
+        let queues = self.queues.lock().unwrap();
+        let mut out: Vec<(String, usize, usize)> = queues
+            .iter()
+            .map(|(tt, q)| (tt.clone(), q.pending.len(), q.in_flight))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +169,7 @@ mod tests {
             redo_count: 0,
             cached_llm: vec![],
             priority: prio,
+            enqueued_at: std::time::Instant::now(),
         }
     }
 
@@ -257,5 +272,33 @@ mod tests {
         let d = Dispatcher::new(10);
         assert_eq!(d.enqueue(turn("t", "a", 0)), 1);
         assert_eq!(d.enqueue(turn("t", "b", 0)), 2);
+    }
+
+    // ── CR-4:snapshot + enqueued_at ──
+
+    #[test]
+    fn snapshot_reports_pending_and_in_flight() {
+        let d = Dispatcher::new(10);
+        d.enqueue(turn("A", "a1", 0));
+        d.enqueue(turn("A", "a2", 0));
+        d.enqueue(turn("B", "b1", 0));
+        d.try_pop("A"); // A: pending 1, in_flight 1
+        let mut snap = d.snapshot();
+        snap.sort();
+        assert_eq!(
+            snap,
+            vec![("A".to_string(), 1, 1), ("B".to_string(), 1, 0)],
+            "snapshot 应反映 per-type pending/in_flight"
+        );
+    }
+
+    #[test]
+    fn enqueued_at_set_on_enqueue() {
+        let d = Dispatcher::new(10);
+        let before = std::time::Instant::now();
+        d.enqueue(turn("t", "a", 0));
+        let popped = d.try_pop("t").unwrap();
+        // enqueued_at 在 before 之后(elapsed 非负即说明字段真被填了,非默认零值)
+        assert!(popped.enqueued_at >= before, "enqueued_at 应在 enqueue 时写入");
     }
 }

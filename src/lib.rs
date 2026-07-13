@@ -10,6 +10,7 @@ pub mod service;
 pub mod recovery;
 pub mod retry;
 pub mod dispatcher;
+pub mod metrics;
 pub mod context;
 pub mod protocol;
 pub mod server;
