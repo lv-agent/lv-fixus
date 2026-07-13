@@ -329,4 +329,56 @@ mod tests {
             out
         );
     }
+
+    // ── 性能测试(#[ignore],cargo test --lib -- --ignored perf_ --nocapture)──
+    // /metrics scrape 每次调 render()(gather 全部 MetricFamily + TextEncoder 编码)。
+    // 测量多 task_type × 多观测下的 render 成本。不断言阈值,数字供人读。
+
+    fn report(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_metrics_render() {
+        let m = Metrics::new();
+        // 模拟 4 task_type × ~3000 turn 生命周期观测
+        for tt in ["claude", "hermes", "codex", "cursor"] {
+            for _ in 0..1000 {
+                m.record_turn_enqueued(tt);
+                m.record_turn_dispatched(tt, 0.01);
+                m.record_turn_terminal(tt, OUTCOME_SUCCESS, 1.0);
+                m.record_turn_terminal(tt, OUTCOME_FAILED, 2.0);
+                m.record_retry(tt);
+            }
+            m.set_in_flight(tt, 5);
+            m.set_pending(tt, 3);
+        }
+        m.set_dependency_up(DEP_BROKER, true);
+        m.set_dependency_up(DEP_SANDBOX, true);
+        // warm-up
+        for _ in 0..20 {
+            let _ = m.render();
+        }
+        let n = 1000;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let out = m.render();
+            us.push(t0.elapsed().as_micros() as u64);
+            assert!(!out.is_empty());
+        }
+        report("metrics render (4 types × ~5k obs)", "µs", us);
+    }
 }

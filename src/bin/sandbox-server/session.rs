@@ -263,4 +263,52 @@ mod tests {
         assert_eq!(report.evicted_sessions, 0, "get_or_create 刷新后不应被判 idle");
         assert_eq!(mgr.list().len(), 1);
     }
+
+    // ── 性能测试(#[ignore],cargo test --bin sandbox-server -- --ignored perf_ --nocapture)──
+    // 后台 sweep 每 gc_interval_secs(默认 300s)跑一次,持 Mutex + fs read_dir 扫 base_dir。
+    // 测量「无淘汰」扫描成本(最常见周期场景:全新鲜,nothing to evict)。不断言阈值。
+
+    fn report(name: &str, unit: &str, mut samples: Vec<u64>) {
+        samples.sort_unstable();
+        let n = samples.len();
+        if n == 0 {
+            println!("[perf] {}: no samples", name);
+            return;
+        }
+        let p = |q: usize| samples[(q * n / 100).min(n.saturating_sub(1))];
+        let sum: u64 = samples.iter().sum();
+        println!(
+            "[perf] {:<34} n={:>6}  p50={:>7}{}  p95={:>7}{}  p99={:>7}{}  avg={:>7}{}",
+            name, n, p(50), unit, p(95), unit, p(99), unit, sum / n as u64, unit
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_sweep_scan_at_scale() {
+        let (mgr, dir) = tmp_mgr();
+        // 1000 活跃 session + 1000 orphan 目录(全新鲜,不触发淘汰)
+        for i in 0..1000u32 {
+            mgr.get_or_create(&format!("sess_{i}"));
+            let _ = fs::create_dir(dir.path().join(format!("orph_{i}")));
+        }
+        let policy = GcPolicy {
+            max_idle: Duration::from_secs(3600),
+            max_sessions: 10_000,
+        };
+        // warm-up
+        for _ in 0..5 {
+            let _ = mgr.sweep(&policy);
+        }
+        let n = 50;
+        let mut us = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            let r = mgr.sweep(&policy);
+            us.push(t0.elapsed().as_micros() as u64);
+            assert_eq!(r.evicted_sessions, 0, "新鲜 session 不该被淘汰");
+            assert_eq!(r.removed_orphans, 0, "新鲜 orphan 不该被删");
+        }
+        report("sweep scan (1000 sess + 1000 orphan)", "µs", us);
+    }
 }
