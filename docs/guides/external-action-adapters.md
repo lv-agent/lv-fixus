@@ -9,7 +9,7 @@ fixus 自带 6 个**本地沙箱工具**(`fixus_bash/read/write/edit/glob/grep`)
 
 **外部 Action Adapter** 解决这个问题:你写一个(或部署一个)HTTP webhook 桥接到目标服务,在 tools-bank 注册一行配置,agent 就能像调 `fixus_bash` 一样调你的外部工具。**tools-bank 不需要改一行代码**。
 
-本文以一个**真实可跑的 GitHub issue 工具**为例(代码见 [`examples/external-adapters/github_webhook.py`](../../examples/external-adapters/github_webhook.py)),讲清楚从启动到 agent 调用的全链路。
+本文以一个**真实可跑的 GitHub 工具集**(issue / PR / 搜索 / 文件,共 11 个工具)为例(代码见 [`examples/external-adapters/github_webhook.py`](../../examples/external-adapters/github_webhook.py)),讲清楚从启动到 agent 调用的全链路。
 
 ## 2. 工作原理
 
@@ -85,15 +85,17 @@ curl -s http://127.0.0.1:9000/gh_list_issues \
 ```bash
 # 先起 broker(memory dev-stack-startup 有全栈启动方法)
 # 然后:
-TOOLS_BANK_HTTP_ADAPTERS="github|http://127.0.0.1:9000|gh_create_issue,gh_list_issues,gh_get_issue,gh_add_comment|timeout=20" \
+TOOLS_BANK_HTTP_ADAPTERS="github|http://127.0.0.1:9000|gh_create_issue,gh_list_issues,gh_get_issue,gh_add_comment,gh_list_prs,gh_get_pr,gh_create_pr,gh_merge_pr,gh_search_issues,gh_search_code,gh_get_file|timeout=20" \
   ./target/release/tools-bank
 ```
+
+> 工具列表很长?可只列你需要的子集(env 的工具列表决定 agent 能看到哪些)。全列则 agent 获得 11 个 GitHub 工具。
 
 启动日志确认注册:
 
 ```
-registered http adapter `github`: 4 tool(s), timeout=20s
-registry: 2 adapter(s), 10 tool(s)    # 6 sandbox + 4 github
+registered http adapter `github`: 11 tool(s), timeout=20s
+registry: 2 adapter(s), 17 tool(s)    # 6 sandbox + 11 github
 ```
 
 ### 3.4 验证 MCP 端点(不依赖 agent)
@@ -105,7 +107,9 @@ curl -s localhost:3001/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   | python3 -c "import sys,json;print([t['name'] for t in json.load(sys.stdin)['result']['tools']])"
 # ['fixus_bash', 'fixus_read', 'fixus_write', 'fixus_edit', 'fixus_glob', 'fixus_grep',
-#  'gh_create_issue', 'gh_list_issues', 'gh_get_issue', 'gh_add_comment']
+#  'gh_create_issue', 'gh_list_issues', 'gh_get_issue', 'gh_add_comment',
+#  'gh_list_prs', 'gh_get_pr', 'gh_create_pr', 'gh_merge_pr',
+#  'gh_search_issues', 'gh_search_code', 'gh_get_file']
 
 # 2. 通过 tools-bank 真实创建一个 issue
 curl -s localhost:3001/mcp \
@@ -122,6 +126,28 @@ curl -s localhost:3001/mcp \
 tools-bank 本来就是 agent 的 MCP 工具源(fixlet 在 ACP `session/new` 的 `mcpServers` 里声明它 —— 这部分**已经在用**,6 个 sandbox 工具就这么暴露的)。**新加的 `gh_*` 工具自动一起出现**,agent 无需任何额外配置。
 
 agent 侧的体验:它看到一个叫 `gh_create_issue` 的工具,schema 是 `{"type":"object"}`(见 §6 说明),会按描述尝试调用。为了让 agent 更准地用,建议在 prompt 或工具描述里告诉它参数格式(见 §6 改进)。
+
+### 3.6 GitHub 工具全集(11 个)
+
+`github_webhook.py` 实现的全部工具(`repo` 统一为 `owner/repo` 形式):
+
+| 工具 | 参数 | GitHub API | 说明 |
+|------|------|------------|------|
+| `gh_create_issue` | `repo, title, body?, labels?` | POST `/repos/{r}/issues` | 建 issue |
+| `gh_list_issues` | `repo, state?=open, limit?=30` | GET `/repos/{r}/issues` | 列 issue(按创建倒序) |
+| `gh_get_issue` | `repo, issue_number` | GET `/repos/{r}/issues/{n}` | 查单个 issue |
+| `gh_add_comment` | `repo, issue_number, body` | POST `/repos/{r}/issues/{n}/comments` | 加评论 |
+| `gh_list_prs` | `repo, state?=open, limit?=30` | GET `/repos/{r}/pulls` | 列 PR(按更新倒序) |
+| `gh_get_pr` | `repo, pr_number` | GET `/repos/{r}/pulls/{n}` | 查单个 PR |
+| `gh_create_pr` | `repo, title, head, base, body?` | POST `/repos/{r}/pulls` | 建 PR(head=源分支, base=目标分支) |
+| `gh_merge_pr` | `repo, pr_number, commit_message?` | PUT `/repos/{r}/pulls/{n}/merge` | 合并 PR |
+| `gh_search_issues` | `query, limit?=20` | GET `/search/issues?q=` | 全局搜 issue/PR(GitHub search 语法) |
+| `gh_search_code` | `query, limit?=20` | GET `/search/code?q=` | 搜代码(**需 classic PAT**,见下) |
+| `gh_get_file` | `repo, path, ref?` | GET `/repos/{r}/contents/{path}` | 读文件,base64 自动解码为可读文本 |
+
+**token 权限提示**:
+- issue / PR / file 工具:fine-grained PAT 即可(给目标仓库的 `Issues` + `Pull requests` + `Contents` 读写权限)。
+- `gh_search_code`:GitHub code search **不支持 fine-grained PAT**,需 classic PAT。无权限时该工具返 403/422,其余工具不受影响。
 
 ## 4. 配置参考
 

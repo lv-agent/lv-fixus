@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""github_webhook.py — tools-bank 外部 action adapter 样例:GitHub issue 工具。
+"""github_webhook.py — tools-bank 外部 action adapter 样例:GitHub 工具集。
 
 把 agent 的工具调用桥接到 GitHub REST API。tools-bank 用 HttpActionAdapter
 POST 到本服务,本服务按工具名分发到对应 GitHub 端点。
 
-工具(在 tools-bank 配置里声明,见 README/指南):
-  gh_create_issue    arguments: {repo, title, body?, labels?}
-  gh_list_issues     arguments: {repo, state?, limit?}
-  gh_get_issue       arguments: {repo, issue_number}
-  gh_add_comment     arguments: {repo, issue_number, body}
+工具(11 个,覆盖 issue / PR / 搜索 / 文件日常操作):
+  Issues
+    gh_create_issue    {repo, title, body?, labels?}
+    gh_list_issues     {repo, state?, limit?}
+    gh_get_issue       {repo, issue_number}
+    gh_add_comment     {repo, issue_number, body}
+  Pull Requests
+    gh_list_prs        {repo, state?, limit?}
+    gh_get_pr          {repo, pr_number}
+    gh_create_pr       {repo, title, head, base, body?}   head=源分支 base=目标分支
+    gh_merge_pr        {repo, pr_number, commit_message?}
+  Search(全局,无需 repo)
+    gh_search_issues   {query, limit?}   搜 issue 和 PR(GitHub search 语法)
+    gh_search_code     {query, limit?}   搜代码(需 classic PAT,见下)
+  Files
+    gh_get_file        {repo, path, ref?}   读文件,base64 自动解码为可读文本
 
 契约(tools-bank → webhook):
   POST /<tool_name>
@@ -16,8 +27,10 @@ POST 到本服务,本服务按工具名分发到对应 GitHub 端点。
   可选 Authorization 头(若 tools-bank 配了 auth=)
 
 环境变量:
-  GITHUB_TOKEN         必填,GitHub Personal Access Token(仅在此服务内持有,
-                       agent 永不经手 —— 这是安全关键)。
+  GITHUB_TOKEN         必填,GitHub PAT(仅在此服务内持有,agent 永不经手)。
+                       issue/PR 用 fine-grained PAT(给 Issues+Pull requests 读写)即可;
+                       gh_search_code 需要 classic PAT(copilot/code-search 权限),
+                       fine-grained 不支持 code search,无权限时该工具返 403/422。
   GITHUB_API_BASE      可选,默认 https://api.github.com(GitHub Enterprise 改这里)。
   PORT                 可选,默认 9000。
 
@@ -27,18 +40,25 @@ POST 到本服务,本服务按工具名分发到对应 GitHub 端点。
                   tools-bank 把 "http <code>" + body 拼进 text,agent 看到详情
   本地异常       → 500 + {"error": "..."}               → agent isError
 """
+import base64
 import json
 import os
 import sys
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_BASE = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 PORT = int(os.environ.get("PORT", "9000"))
 
-TOOLS = ["gh_create_issue", "gh_list_issues", "gh_get_issue", "gh_add_comment"]
+TOOLS = [
+    "gh_create_issue", "gh_list_issues", "gh_get_issue", "gh_add_comment",
+    "gh_list_prs", "gh_get_pr", "gh_create_pr", "gh_merge_pr",
+    "gh_search_issues", "gh_search_code",
+    "gh_get_file",
+]
 
 
 def gh(method, path, body=None):
@@ -64,19 +84,40 @@ def gh(method, path, body=None):
             return e.code, {"error": raw}
 
 
+def _need(args, *keys):
+    """返回第一个缺失的参数名(用于 400 校验),都齐则 None。"""
+    for k in keys:
+        if not args.get(k):
+            return k
+    return None
+
+
 def dispatch(tool, args):
     """按工具名分发到 GitHub 端点。返回 (status, body)。"""
+
+    # ── Search(全局,不需要 repo)──────────────────────────────────────
+    if tool in ("gh_search_issues", "gh_search_code"):
+        missing = _need(args, "query")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        q = quote(str(args["query"]))
+        limit = int(args.get("limit", 20))
+        scope = "issues" if tool == "gh_search_issues" else "code"
+        return gh("GET", f"/search/{scope}?q={q}&per_page={limit}")
+
+    # ── 其余工具需要 repo ──────────────────────────────────────────────
     repo = args.get("repo")
     if not repo or "/" not in str(repo):
         return 400, {"error": "arguments.repo 必须为 'owner/repo' 形式"}
     base = f"/repos/{repo}"
 
+    # Issues
     if tool == "gh_create_issue":
-        title = args.get("title")
-        if not title:
-            return 400, {"error": "arguments.title 必填"}
+        missing = _need(args, "title")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
         payload = {
-            "title": title,
+            "title": args["title"],
             "body": args.get("body", ""),
             "labels": args.get("labels", []) or [],
         }
@@ -89,19 +130,66 @@ def dispatch(tool, args):
                          "&sort=created&direction=desc")
 
     if tool == "gh_get_issue":
-        n = args.get("issue_number")
-        if not n:
-            return 400, {"error": "arguments.issue_number 必填"}
-        return gh("GET", f"{base}/issues/{n}")
+        missing = _need(args, "issue_number")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        return gh("GET", f"{base}/issues/{args['issue_number']}")
 
     if tool == "gh_add_comment":
-        n = args.get("issue_number")
-        text = args.get("body")
-        if not n:
-            return 400, {"error": "arguments.issue_number 必填"}
-        if not text:
-            return 400, {"error": "arguments.body 必填"}
-        return gh("POST", f"{base}/issues/{n}/comments", {"body": text})
+        missing = _need(args, "issue_number", "body")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        return gh("POST", f"{base}/issues/{args['issue_number']}/comments",
+                  {"body": args["body"]})
+
+    # Pull Requests
+    if tool == "gh_list_prs":
+        state = args.get("state", "open")
+        limit = int(args.get("limit", 30))
+        return gh("GET", f"{base}/pulls?state={state}&per_page={limit}"
+                         "&sort=updated&direction=desc")
+
+    if tool == "gh_get_pr":
+        missing = _need(args, "pr_number")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        return gh("GET", f"{base}/pulls/{args['pr_number']}")
+
+    if tool == "gh_create_pr":
+        missing = _need(args, "title", "head", "base")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填(head=源分支, base=目标分支)"}
+        payload = {
+            "title": args["title"],
+            "head": args["head"],
+            "base": args["base"],
+            "body": args.get("body", ""),
+        }
+        return gh("POST", f"{base}/pulls", payload)
+
+    if tool == "gh_merge_pr":
+        missing = _need(args, "pr_number")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        return gh("PUT", f"{base}/pulls/{args['pr_number']}/merge",
+                  {"commit_message": args.get("commit_message", "")})
+
+    # Files
+    if tool == "gh_get_file":
+        missing = _need(args, "path")
+        if missing:
+            return 400, {"error": f"arguments.{missing} 必填"}
+        path = quote(str(args["path"]).lstrip("/"))
+        ref_q = f"?ref={quote(str(args['ref']))}" if args.get("ref") else ""
+        status, body = gh("GET", f"{base}/contents/{path}{ref_q}")
+        # contents API 返 base64 content;解码让 agent 可读
+        if status == 200 and isinstance(body, dict) and body.get("encoding") == "base64":
+            try:
+                body["content"] = base64.b64decode(body["content"]).decode("utf-8", "replace")
+                body["encoding"] = "utf-8-decoded"
+            except Exception:
+                pass
+        return status, body
 
     return 404, {"error": f"unknown tool: {tool}"}
 
@@ -154,6 +242,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not GITHUB_TOKEN:
         print("WARN: GITHUB_TOKEN 未设置 —— GitHub 调用将返回 401", file=sys.stderr)
-    print(f"github-webhook on 127.0.0.1:{PORT}  api={GITHUB_API_BASE}  tools={TOOLS}",
+    print(f"github-webhook on 127.0.0.1:{PORT}  api={GITHUB_API_BASE}  tools={len(TOOLS)} tools",
           file=sys.stderr)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
