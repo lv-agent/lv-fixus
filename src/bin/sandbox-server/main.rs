@@ -9,6 +9,7 @@
 
 mod executor;
 mod landlock;
+mod policy;
 mod sandbox_core;
 mod session;
 mod tools;
@@ -88,7 +89,12 @@ impl IdempotentCache {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "sandbox_server=info".into()),
+        )
+        .init();
     let cli = Cli::parse();
     let session_mgr = Arc::new(session::SessionManager::new(cli.session_dir.clone()));
     let cache = Arc::new(IdempotentCache::new());
@@ -212,6 +218,21 @@ async fn run_consumer(
                 let shard_id = rec.shard_id;
                 let seq = rec.seq;
 
+                // Phase 1 沙箱边界:从 event metadata 提取 effective_policy(tools-bank 写入)。
+                // 缺 → unwrap_or_default() 严默认(仅 work_dir,net off,Reader)。work_dir-only 仍是
+                // 安全可用态,故缺 policy 不硬失败,只 warn(对齐"缺配置不阻断、但隔离到底")。
+                let effective_policy: crate::policy::EffectivePolicy = rec
+                    .metadata
+                    .get("effective_policy")
+                    .and_then(|v| serde_json::from_str(v).ok())
+                    .unwrap_or_default();
+                if rec.metadata.get("effective_policy").is_none() {
+                    tracing::warn!(
+                        "tool_invoked missing effective_policy for task={} → fail-closed strict",
+                        task_id
+                    );
+                }
+
                 // Idempotency check
                 if let Some(cached) = cache.get(&idempotency_key).await {
                     tracing::info!("cache hit: {}", idempotency_key);
@@ -251,11 +272,12 @@ async fn run_consumer(
                 let tool_name_fix = tool_name.strip_prefix("fixus_").unwrap_or(&tool_name).to_string();
 
                 in_flight += 1;
+                let eff = effective_policy.clone();
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("semaphore closed");
                     let t0 = std::time::Instant::now();
 
-                    let (success, output, error) = match execute_tool(&tool_name_fix, &payload, &work_dir).await {
+                    let (success, output, error) = match execute_tool(&tool_name_fix, &payload, &work_dir, &eff).await {
                         Ok(o) => (true, o, None),
                         Err(e) => (false, serde_json::Value::Null, Some(e)),
                     };
@@ -315,6 +337,7 @@ async fn execute_tool(
     tool_name: &str,
     payload: &serde_json::Value,
     work_dir: &Path,
+    eff: &crate::policy::EffectivePolicy,
 ) -> Result<serde_json::Value, String> {
     let input = payload.get("input").cloned().unwrap_or(serde_json::Value::Null);
     let timeout_ms = payload.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(120_000);
@@ -324,7 +347,7 @@ async fn execute_tool(
     // fixus_ 前缀由 sandbox-server 统一 strip
     let name = tool_name.strip_prefix("fixus_").unwrap_or(tool_name);
     match name {
-        // Bash 走 executor(Landlock 子进程 + ulimit)
+        // Bash 走 executor(Landlock 子进程 + ulimit)。eff 在 D-b 由 Landlock/seccomp 消费。
         "Bash" | "bash" => {
             let code = input
                 .get("command")
@@ -339,12 +362,13 @@ async fn execute_tool(
                 "stdout": exec_result.stdout, "stderr": exec_result.stderr, "exit_code": exec_result.exit_code,
             }))
         }
-        // 文件工具(sandbox-server 进程内,路径校验限定 work_dir)
-        "Read" | "read" => crate::tools::execute_read(&input, work_dir).await,
+        // 文件工具(sandbox-server 进程内)。D1: eff 已就位但 tools.rs 仍用旧签名 → 暂传空白名单
+        // (=work_dir 严隔离);D2 把 file tools 切到 EffectivePolicy 校验。
+        "Read" | "read" => crate::tools::execute_read(&input, work_dir, &[]).await,
         "Write" | "write" => crate::tools::execute_write(&input, work_dir).await,
         "Edit" | "edit" => crate::tools::execute_edit(&input, work_dir).await,
-        "Glob" | "glob" => crate::tools::execute_glob(&input, work_dir).await,
-        "Grep" | "grep" => crate::tools::execute_grep(&input, work_dir, timeout_dur).await,
+        "Glob" | "glob" => crate::tools::execute_glob(&input, work_dir, &[]).await,
+        "Grep" | "grep" => crate::tools::execute_grep(&input, work_dir, &[], timeout_dur).await,
         _ => Err(format!("unknown tool {}", name)),
     }
 }

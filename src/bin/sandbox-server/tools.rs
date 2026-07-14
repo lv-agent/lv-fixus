@@ -36,6 +36,62 @@ fn validate_path_in_workspace(file_path: &str, work_dir: &Path) -> Result<PathBu
     Ok(normalized)
 }
 
+/// 解析 `SANDBOX_READ_ALLOWED_HOST_PATHS` env 值（逗号分隔绝对路径）为 normalize 后的 PathBuf Vec。
+/// 空 / 全空白 → 空 Vec（不放宽任何路径）。**相对路径 entry 被忽略**（白名单语义要求绝对路径）。
+/// 入口归一化一次（main.rs 启动时调一次）。
+pub fn parse_allowed_read_paths(env_value: &str) -> Vec<PathBuf> {
+    env_value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let p = PathBuf::from(s);
+            if p.is_absolute() {
+                Some(normalize_path(&p))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 校验读类工具（R/Glob/Grep）的路径，允许两类位置：
+/// 1. 在 work_dir 内（原行为）
+/// 2. 绝对路径，且规范化后落在任一 `allowed_read_paths[i]` 前缀下（白名单）
+///
+/// 返回规范化后的绝对路径。**白名单只对绝对路径生效**；相对路径一律相对 work_dir。
+/// W/E 仍用 `validate_path_in_workspace`（写类不允许白名单放宽，保 work_dir 隔离严格）。
+fn validate_read_path(
+    file_path: &str,
+    work_dir: &Path,
+    allowed_read_paths: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let path = Path::new(file_path);
+    let canonical = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        work_dir.join(path)
+    };
+    let normalized = normalize_path(&canonical);
+    // 1) 白名单分支（仅绝对路径）
+    if canonical.is_absolute() {
+        for allowed in allowed_read_paths {
+            if normalized.starts_with(allowed) {
+                return Ok(normalized);
+            }
+        }
+    }
+    // 2) 原 work_dir 检查
+    if !normalized.starts_with(work_dir) {
+        return Err(format!(
+            "Path '{}' is outside work_dir '{}'. Access denied.",
+            file_path,
+            work_dir.display()
+        ));
+    }
+    Ok(normalized)
+}
+
 /// 路径规范化(不要求文件存在):处理 `.`、`..`、多余分隔符。
 fn normalize_path(path: &Path) -> PathBuf {
     let mut parts = Vec::new();
@@ -68,12 +124,12 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// 读取文件
-pub async fn execute_read(input: &serde_json::Value, work_dir: &Path) -> Result<serde_json::Value, String> {
+pub async fn execute_read(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf]) -> Result<serde_json::Value, String> {
     let file_path = input
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Read requires 'file_path' field".to_string())?;
-    let abs = validate_path_in_workspace(file_path, work_dir)?;
+    let abs = validate_read_path(file_path, work_dir, allowed_read_paths)?;
 
     let offset = input.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
     let limit = input.get("limit").and_then(|v| v.as_i64());
@@ -160,13 +216,13 @@ pub async fn execute_edit(input: &serde_json::Value, work_dir: &Path) -> Result<
 }
 
 /// Glob 模式匹配文件
-pub async fn execute_glob(input: &serde_json::Value, work_dir: &Path) -> Result<serde_json::Value, String> {
+pub async fn execute_glob(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf]) -> Result<serde_json::Value, String> {
     let pattern = input
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Glob requires 'pattern' field".to_string())?;
     let raw_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let abs = validate_path_in_workspace(raw_path, work_dir)?;
+    let abs = validate_read_path(raw_path, work_dir, allowed_read_paths)?;
 
     let output = Command::new("find")
         .arg(&abs)
@@ -189,13 +245,13 @@ pub async fn execute_glob(input: &serde_json::Value, work_dir: &Path) -> Result<
 }
 
 /// Grep 搜索文件内容
-pub async fn execute_grep(input: &serde_json::Value, work_dir: &Path, timeout_dur: Duration) -> Result<serde_json::Value, String> {
+pub async fn execute_grep(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf], timeout_dur: Duration) -> Result<serde_json::Value, String> {
     let pattern = input
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Grep requires 'pattern' field".to_string())?;
     let raw_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let abs = validate_path_in_workspace(raw_path, work_dir)?;
+    let abs = validate_read_path(raw_path, work_dir, allowed_read_paths)?;
 
     let output_future = Command::new("grep")
         .arg("-rn")
@@ -281,7 +337,7 @@ mod tests {
         std::fs::write(&file_path, "line1\nline2\nline3").unwrap();
 
         let input = serde_json::json!({"file_path": file_path.to_string_lossy()});
-        let result = execute_read(&input, dir.path()).await.unwrap();
+        let result = execute_read(&input, dir.path(), &[]).await.unwrap();
 
         assert_eq!(result["content"].as_str().unwrap(), "line1\nline2\nline3");
         assert_eq!(result["total_lines"].as_u64().unwrap(), 3);
@@ -295,7 +351,7 @@ mod tests {
         std::fs::write(&file_path, "a\nb\nc\nd\ne").unwrap();
 
         let input = serde_json::json!({"file_path": file_path.to_string_lossy(), "offset": 1, "limit": 2});
-        let result = execute_read(&input, dir.path()).await.unwrap();
+        let result = execute_read(&input, dir.path(), &[]).await.unwrap();
 
         assert_eq!(result["content"].as_str().unwrap(), "b\nc");
         assert_eq!(result["lines_returned"].as_u64().unwrap(), 2);
@@ -305,7 +361,7 @@ mod tests {
     async fn execute_read_rejects_path_outside_work_dir() {
         let dir = tmp_dir();
         let input = serde_json::json!({"file_path": "/etc/hosts"});
-        assert!(execute_read(&input, dir.path()).await.is_err());
+        assert!(execute_read(&input, dir.path(), &[]).await.is_err());
     }
 
     #[tokio::test]
@@ -342,6 +398,57 @@ mod tests {
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "hello rust");
+    }
+
+    #[test]
+    fn parse_allowed_read_paths_empty_and_whitespace() {
+        assert_eq!(parse_allowed_read_paths(""), Vec::<PathBuf>::new());
+        assert_eq!(parse_allowed_read_paths(",,"), Vec::<PathBuf>::new());
+        assert_eq!(parse_allowed_read_paths("   "), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn parse_allowed_read_paths_skips_relative() {
+        let r = parse_allowed_read_paths("/abs,relative,./foo,/another");
+        assert_eq!(r, vec![PathBuf::from("/abs"), PathBuf::from("/another")]);
+    }
+
+    #[test]
+    fn parse_allowed_read_paths_normalizes() {
+        let r = parse_allowed_read_paths("/a/./b/../c");
+        assert_eq!(r, vec![PathBuf::from("/a/c")]);
+    }
+
+    #[test]
+    fn validate_read_path_allows_workdir_when_no_whitelist() {
+        let work_dir = Path::new("/tmp/work");
+        let allowed: Vec<PathBuf> = vec![];
+        assert!(validate_read_path("/tmp/work/file.txt", work_dir, &allowed).is_ok());
+        assert!(validate_read_path("subdir/file.txt", work_dir, &allowed).is_ok());
+    }
+
+    #[test]
+    fn validate_read_path_allows_whitelisted_absolute_path() {
+        let work_dir = Path::new("/tmp/work");
+        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
+        assert!(validate_read_path("/home/lvtao/codeagent/multica/go.mod", work_dir, &allowed).is_ok());
+        assert!(validate_read_path("/home/lvtao/codeagent/foo/bar.go", work_dir, &allowed).is_ok());
+    }
+
+    #[test]
+    fn validate_read_path_rejects_outside_both() {
+        let work_dir = Path::new("/tmp/work");
+        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
+        assert!(validate_read_path("/etc/passwd", work_dir, &allowed).is_err());
+        assert!(validate_read_path("/home/lvtao/other/foo.go", work_dir, &allowed).is_err());
+    }
+
+    #[test]
+    fn validate_read_path_rejects_relative_path_escape_attempt() {
+        let work_dir = Path::new("/tmp/work");
+        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
+        // 相对路径 "../etc/passwd" 不走白名单分支(只在绝对路径生效),落 work_dir 校验被拒
+        assert!(validate_read_path("../etc/passwd", work_dir, &allowed).is_err());
     }
 
     #[tokio::test]
