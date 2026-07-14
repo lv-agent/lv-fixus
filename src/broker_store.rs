@@ -261,6 +261,7 @@ impl EventStore for BrokerEventStore {
             created_at: p.provenance.created_at,
             metadata: None,
             priority: p.priority,
+            effective_policy: None,
         })).await
     }
 

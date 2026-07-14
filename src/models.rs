@@ -846,6 +846,10 @@ pub struct Task {
     /// 优先级(CR-1):大者优先派发。默认 0。
     #[serde(default)]
     pub priority: i32,
+    /// 解析后的有效策略(fixus resolver 算,随 turn 派发透传给 sandbox)。Phase 1 沙箱边界。
+    /// task 创建时 resolve_and_validate 算出并写入 task_created event payload;get_task 回放析出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_policy: Option<crate::policy::EffectivePolicy>,
 }
 
 impl Task {
@@ -869,6 +873,7 @@ impl Task {
             created_at: Utc::now(),
             metadata: None,
             priority: 0,
+            effective_policy: None,
         }
     }
 }
@@ -1563,5 +1568,29 @@ mod tests {
         assert_eq!(task.state, TaskState::Created);
         assert_eq!(task.provenance.source_channel, "nuntius-chat");
         assert!(task.body.is_none());
+    }
+
+    #[test]
+    fn task_carries_effective_policy() {
+        let eff = crate::policy::EffectivePolicy::default();
+        let mut task = Task::new(
+            "t1".into(), "ten".into(), "u".into(), "ty".into(),
+            TaskState::Created, Provenance {
+                source_channel: "api".into(), source_session_id: None, source_user_id: None,
+                source_tenant_id: None, source_message_id: None, created_at: Utc::now(), created_by: "x".into(),
+            }, None,
+        );
+        // 默认 None(Task::new 不算 policy;由 task 创建路径 resolve 后写入)
+        assert!(task.effective_policy.is_none());
+        task.effective_policy = Some(eff);
+        assert!(task.effective_policy.is_some());
+    }
+
+    #[test]
+    fn task_effective_policy_serde_backward_compat() {
+        // 旧数据(无 effective_policy 字段)反序列化 → None(#[serde(default)])
+        let legacy = r#"{"task_id":"t","tenant_id":"t","user_id":"u","task_type":"ty","state":"created","provenance":{"source_channel":"api","created_at":"2026-01-01T00:00:00Z","created_by":"x"},"created_at":"2026-01-01T00:00:00Z"}"#;
+        let task: Task = serde_json::from_str(legacy).unwrap();
+        assert!(task.effective_policy.is_none());
     }
 }

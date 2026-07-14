@@ -536,6 +536,7 @@ impl EventStore for LogdbdEventStore {
             created_at: Utc::now(),
             metadata: None,
             priority: payload["priority"].as_i64().unwrap_or(0) as i32,
+            effective_policy: None,
         }))
     }
 
