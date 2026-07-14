@@ -386,6 +386,151 @@ fn is_ident(s: &str) -> bool {
     }
 }
 
+// ── extras catalog parsing (spec §9) — operator TOML → Vec<ToolSpec> ──────
+
+/// Serde shape of the extras file. `[[tool]]` is an array of tables; absent →
+/// empty (a file with no `[[tool]]` entries yields an empty catalog).
+#[derive(Deserialize)]
+struct ExtraFile {
+    #[serde(default)]
+    tool: Vec<ExtraToolRaw>,
+}
+
+/// One `[[tool]]` entry. Required: name / description / binary / argv /
+/// input_schema (serde errors on missing → caller maps to `Malformed`).
+/// Optional: io (default "none"), path_args (default []), timeout_secs
+/// (default 30). `input_schema` deserializes as `toml::Value` and is converted
+/// to JSON via [`toml_to_json`] (the TOML→JSON edge cases — no null, int/float
+/// distinction — are handled explicitly there).
+#[derive(Deserialize)]
+struct ExtraToolRaw {
+    name: String,
+    description: String,
+    binary: String,
+    argv: Vec<String>,
+    #[serde(default = "default_io")]
+    io: String,
+    #[serde(default)]
+    path_args: Vec<String>,
+    #[serde(default = "default_timeout")]
+    timeout_secs: u64,
+    input_schema: toml::Value,
+}
+
+fn default_io() -> String {
+    "none".into()
+}
+
+fn default_timeout() -> u64 {
+    30
+}
+
+/// Parse an operator-provided TOML extras file into a `Vec<ToolSpec>` (spec §9).
+///
+/// Extras are always external-binary tools (`ExecutorKind::Bin(BinSpec)`); they
+/// merge with [`builtins()`] into the same `Vec<ToolSpec>`. This is the only
+/// "Ok(empty)" case is empty/whitespace input (no extras configured). Every
+/// other malformation fails loud: missing required fields, unknown `io` value,
+/// malformed argv placeholder, in-file duplicate name, and unparseable TOML all
+/// return `Err` (the catalog must not silently drop a tool).
+///
+/// See [`parse_argv_element`] for the argv-element syntax and the
+/// injection-safety model that underpins it.
+pub fn parse_extra_catalog(toml_str: &str) -> Result<Vec<ToolSpec>, CatalogError> {
+    // Empty / whitespace-only → no extras configured. Short-circuit before
+    // invoking the TOML parser (an empty string is valid but pointless).
+    if toml_str.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file: ExtraFile = toml::from_str(toml_str)
+        .map_err(|e| CatalogError::Malformed(e.to_string()))?;
+
+    let mut specs: Vec<ToolSpec> = Vec::with_capacity(file.tool.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in file.tool {
+        // In-file duplicate name → fail loud. (Cross-source dups, e.g. an extra
+        // shadowing a builtin, are the caller's concern — this fn only sees the
+        // extras file.)
+        if !seen.insert(raw.name.clone()) {
+            return Err(CatalogError::DuplicateName(raw.name));
+        }
+
+        // argv: each element parsed via parse_argv_element. A malformed
+        // placeholder (e.g. "{1bad}") propagates UnknownPlaceholder — the
+        // catalog fails to load.
+        let mut argv: Vec<ArgvPart> = Vec::with_capacity(raw.argv.len());
+        for elem in &raw.argv {
+            argv.push(parse_argv_element(elem)?);
+        }
+
+        let io = parse_bin_io(&raw.io)?;
+        let input_schema = toml_to_json(raw.input_schema);
+
+        specs.push(ToolSpec {
+            name: raw.name,
+            description: raw.description,
+            input_schema,
+            default_timeout_secs: raw.timeout_secs,
+            executor: ExecutorKind::Bin(BinSpec {
+                binary: raw.binary,
+                argv,
+                io,
+                path_args: raw.path_args,
+            }),
+        });
+    }
+    Ok(specs)
+}
+
+/// Map the `io` string to [`BinIo`]. Unknown value → `Malformed` (fail loud).
+fn parse_bin_io(s: &str) -> Result<BinIo, CatalogError> {
+    match s {
+        "read" => Ok(BinIo::Read),
+        "write" => Ok(BinIo::Write),
+        "none" => Ok(BinIo::None),
+        other => Err(CatalogError::Malformed(format!(
+            "unknown io value: {other:?} (expected \"read\" | \"write\" | \"none\")"
+        ))),
+    }
+}
+
+/// Convert a `toml::Value` to `serde_json::Value`. This is the bridge for
+/// `input_schema` (a JSON schema that lives in a TOML file as an inline table).
+///
+/// Deserializing a TOML table directly into `serde_json::Value` usually works
+/// but has known edge cases (TOML has no null; its integer/float distinction
+/// differs from JSON's). Converting variant-by-variant is explicit and robust:
+///
+/// - `String` → JSON string.
+/// - `Integer(i64)` → JSON number.
+/// - `Float(f64)` → JSON number (or Null if NaN/∞, which JSON cannot represent).
+/// - `Boolean` → JSON bool.
+/// - `Array` → JSON array (recurse).
+/// - `Table` → JSON object (recurse).
+/// - `Datetime` → JSON string (ISO-8601-ish; JSON has no datetime type).
+fn toml_to_json(v: toml::Value) -> serde_json::Value {
+    match v {
+        toml::Value::String(s) => serde_json::Value::String(s),
+        toml::Value::Integer(i) => serde_json::Value::Number(i.into()),
+        toml::Value::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(b),
+        toml::Value::Array(a) => {
+            serde_json::Value::Array(a.into_iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(t) => {
+            let mut obj = serde_json::Map::with_capacity(t.len());
+            for (k, v) in t.into_iter() {
+                obj.insert(k, toml_to_json(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+        toml::Value::Datetime(d) => serde_json::Value::String(d.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +754,163 @@ mod tests {
     #[test]
     fn render_empty_template_yields_empty() {
         assert_eq!(render_argv(&[], &serde_json::json!({})).unwrap(), Vec::<String>::new());
+    }
+
+    // ── parse_extra_catalog (spec §9) — operator extras TOML → Vec<ToolSpec> ──
+
+    #[test]
+    fn parse_extra_valid_single_tool() {
+        let toml = r#"
+[[tool]]
+name = "fixus_gh"
+description = "GitHub CLI"
+binary = "gh"
+argv = ["search", "repos", "{query}"]
+io = "none"
+path_args = []
+timeout_secs = 20
+[tool.input_schema]
+type = "object"
+required = ["query"]
+[tool.input_schema.properties.query]
+type = "string"
+"#;
+        let specs = parse_extra_catalog(toml).unwrap();
+        assert_eq!(specs.len(), 1);
+        let s = &specs[0];
+        assert_eq!(s.name, "fixus_gh");
+        assert_eq!(s.description, "GitHub CLI");
+        assert_eq!(s.default_timeout_secs, 20);
+        assert_eq!(s.input_schema["type"], "object");
+        assert_eq!(s.input_schema["required"], serde_json::json!(["query"]));
+        assert_eq!(s.input_schema["properties"]["query"]["type"], "string");
+        match &s.executor {
+            ExecutorKind::Bin(b) => {
+                assert_eq!(b.binary, "gh");
+                assert_eq!(b.argv.len(), 3);
+                assert_eq!(b.argv[0], ArgvPart::Literal("search".into()));
+                assert_eq!(b.argv[1], ArgvPart::Literal("repos".into()));
+                assert_eq!(b.argv[2], ArgvPart::Arg("query".into()));
+                assert!(matches!(b.io, BinIo::None));
+                assert!(b.path_args.is_empty());
+            }
+            other => panic!("expected Bin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_extra_defaults_when_optional_omitted() {
+        // omit io, path_args, timeout_secs → defaults (none, [], 30)
+        let toml = r#"
+[[tool]]
+name = "fixus_echo"
+description = "echo"
+binary = "echo"
+argv = ["hi"]
+[tool.input_schema]
+type = "object"
+"#;
+        let s = &parse_extra_catalog(toml).unwrap()[0];
+        assert_eq!(s.default_timeout_secs, 30);
+        match &s.executor {
+            ExecutorKind::Bin(b) => {
+                assert!(matches!(b.io, BinIo::None));
+                assert!(b.path_args.is_empty());
+            }
+            _ => panic!("Bin"),
+        }
+    }
+
+    #[test]
+    fn parse_extra_multiple_and_io_read() {
+        let toml = r#"
+[[tool]]
+name = "fixus_a"
+description = "a"
+binary = "cat"
+argv = ["{file}"]
+io = "read"
+path_args = ["file"]
+[tool.input_schema]
+type = "object"
+
+[[tool]]
+name = "fixus_b"
+description = "b"
+binary = "tee"
+argv = ["{file}"]
+io = "write"
+path_args = ["file"]
+[tool.input_schema]
+type = "object"
+"#;
+        let specs = parse_extra_catalog(toml).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert!(matches!(specs[0].executor, ExecutorKind::Bin(_)));
+        if let ExecutorKind::Bin(b) = &specs[0].executor { assert!(matches!(b.io, BinIo::Read)); }
+        if let ExecutorKind::Bin(b) = &specs[1].executor { assert!(matches!(b.io, BinIo::Write)); }
+    }
+
+    #[test]
+    fn parse_extra_dup_name_errors() {
+        let toml = r#"
+[[tool]]
+name = "fixus_x"
+description = "d"
+binary = "x"
+argv = []
+[tool.input_schema]
+type = "object"
+[[tool]]
+name = "fixus_x"
+description = "d2"
+binary = "y"
+argv = []
+[tool.input_schema]
+type = "object"
+"#;
+        assert!(matches!(parse_extra_catalog(toml), Err(CatalogError::DuplicateName(_))));
+    }
+
+    #[test]
+    fn parse_extra_empty_yields_empty() {
+        assert!(parse_extra_catalog("").unwrap().is_empty());
+        assert!(parse_extra_catalog("   \n  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_extra_malformed_toml_errors() {
+        // not valid TOML
+        assert!(parse_extra_catalog("this is = not = valid = toml = =").is_err());
+    }
+
+    #[test]
+    fn parse_extra_unknown_argv_placeholder_errors() {
+        // argv with a malformed placeholder → fail loud (propagate UnknownPlaceholder)
+        let toml = r#"
+[[tool]]
+name = "fixus_z"
+description = "d"
+binary = "z"
+argv = ["{1bad}"]
+[tool.input_schema]
+type = "object"
+"#;
+        let err = parse_extra_catalog(toml);
+        assert!(matches!(err, Err(CatalogError::UnknownPlaceholder(_))), "got {:?}", err);
+    }
+
+    #[test]
+    fn parse_extra_missing_required_field_errors() {
+        // missing binary
+        let toml = r#"
+[[tool]]
+name = "fixus_m"
+description = "d"
+argv = []
+[tool.input_schema]
+type = "object"
+"#;
+        assert!(parse_extra_catalog(toml).is_err());
     }
 }
