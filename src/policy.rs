@@ -166,6 +166,24 @@ pub fn role_narrow(mut eff: EffectivePolicy, role: AgentRole) -> EffectivePolicy
     eff
 }
 
+/// effective = Operator ∩ Tenant ∩ Task(fs + net),再 role 收窄。
+/// 永远安全(只收窄,不放权)。越权检测在信任边界由 `validate_subset` 显式做。
+pub fn resolve_effective(
+    operator: &CapabilityPolicy,
+    tenant: &CapabilityPolicy,
+    task: &CapabilityPolicy,
+    role: AgentRole,
+) -> EffectivePolicy {
+    let fs = intersect_fs(&operator.fs, &tenant.fs);
+    let fs = intersect_fs(&fs, &task.fs);
+    let net = intersect_net(&operator.net, &tenant.net);
+    let net = intersect_net(&net, &task.net);
+    role_narrow(
+        EffectivePolicy { fs, net, agent_role: role },
+        role,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +194,16 @@ mod tests {
 
     fn rule(h: &str) -> EgressRule {
         EgressRule { host: h.into(), ports: vec![], category: None }
+    }
+
+    fn policy(read: &[&str], write: &[&str], egress: &[&str]) -> CapabilityPolicy {
+        CapabilityPolicy {
+            fs: FsPolicy {
+                read_paths: read.iter().map(|p| scope(p)).collect(),
+                write_paths: write.iter().map(|p| scope(p)).collect(),
+            },
+            net: NetPolicy { egress: egress.iter().map(|h| rule(h)).collect() },
+        }
     }
 
     #[test]
@@ -298,5 +326,31 @@ mod tests {
         };
         let r = role_narrow(eff.clone(), AgentRole::Operator);
         assert_eq!(r, eff);
+    }
+
+    #[test]
+    fn resolve_effective_intersects_three_scopes() {
+        let op = policy(&["/home"], &[], &[]);
+        let tenant = policy(&["/home/x/proj"], &[], &[]);
+        let task = policy(&["/home/x/proj/src"], &[], &[]);
+        let eff = resolve_effective(&op, &tenant, &task, AgentRole::Operator);
+        assert_eq!(eff.fs.read_paths, vec![scope("/home/x/proj/src")]);
+        assert!(eff.net.egress.is_empty());
+    }
+
+    #[test]
+    fn resolve_effective_empty_all_yields_strict() {
+        let eff = resolve_effective(&CapabilityPolicy::default(), &CapabilityPolicy::default(), &CapabilityPolicy::default(), AgentRole::Operator);
+        assert!(eff.fs.read_paths.is_empty());
+        assert!(eff.fs.write_paths.is_empty());
+        assert!(eff.net.egress.is_empty(), "空 = deny-all");
+    }
+
+    #[test]
+    fn resolve_effective_applies_role() {
+        let op = policy(&[], &["/host"], &["pypi.org"]);
+        let eff = resolve_effective(&op, &CapabilityPolicy::default(), &CapabilityPolicy::default(), AgentRole::Reader);
+        assert!(eff.net.egress.is_empty());
+        assert!(eff.fs.write_paths.is_empty());
     }
 }
