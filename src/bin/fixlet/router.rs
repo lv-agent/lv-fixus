@@ -432,7 +432,7 @@ async fn handle_execute_turn_from_broker(
     lifecycle_namespace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_execute_turn_payload(payload)?;
-    let ParsedExecuteTurn { task_id, turn_id, user_input, redo_group, redo_count, summary, messages, .. } = parsed;
+    let ParsedExecuteTurn { task_id, turn_id, user_input, redo_group, redo_count, summary, messages, effective_policy } = parsed;
     // 影子绑定为 &str —— 保持下游用法(Some(task_id)、build_acp_prompt(summary,…))类型不变,
     // 底层 String 由上面的解构绑定持有,活到函数末尾。
     let task_id = task_id.as_str();
@@ -501,11 +501,13 @@ async fn handle_execute_turn_from_broker(
 
     let session_new_id = acp.next_req_id();
     let cwd = config.agent_cwd.clone().unwrap_or_else(|| "/tmp".into());
+    let policy_str = effective_policy.as_ref().map(|v| v.to_string());
     let params = backend::build_session_new_params(
         config.backend.as_ref(),
         task_id,
         &cwd,
         &tools_bank_url,
+        policy_str,
     );
     acp.send_raw(
         &backend::build_session_new_request(session_new_id, params).to_string(),

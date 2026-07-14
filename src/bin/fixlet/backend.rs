@@ -143,14 +143,21 @@ pub fn build_session_new_params(
     task_id: &str,
     cwd: &str,
     tools_bank_url: &str,
+    effective_policy: Option<String>,
 ) -> Value {
+    // headers 动态构造:X-Fixus-Session-Id(per-task 路由)恒在;
+    // X-Fixus-Policy(effective policy JSON 字符串)仅当 policy 存在时注入。
+    let mut headers = vec![serde_json::json!({"name": "X-Fixus-Session-Id", "value": task_id})];
+    if let Some(p) = effective_policy {
+        headers.push(serde_json::json!({"name": "X-Fixus-Policy", "value": p}));
+    }
     let mut params = serde_json::json!({
         "cwd": cwd,
         "mcpServers": [{
             "type": "http",
             "name": "fixus",
             "url": tools_bank_url,
-            "headers": [{"name": "X-Fixus-Session-Id", "value": task_id}]
+            "headers": headers
         }]
     });
     let extra = backend.session_new_extra();
@@ -277,7 +284,7 @@ mod tests {
         // warm-up
         for _ in 0..1000 {
             let _ = b.spawn_spec();
-            let p = build_session_new_params(&b, "t", "/tmp", "http://tb/mcp");
+            let p = build_session_new_params(&b, "t", "/tmp", "http://tb/mcp", None);
             let _ = build_session_new_request(1, p);
             let _ = b.extract_model(&result);
         }
@@ -286,7 +293,7 @@ mod tests {
         for i in 0..n {
             let t0 = std::time::Instant::now();
             let _ = b.spawn_spec();
-            let p = build_session_new_params(&b, &format!("t{i}"), "/tmp", "http://tb/mcp");
+            let p = build_session_new_params(&b, &format!("t{i}"), "/tmp", "http://tb/mcp", None);
             let _ = build_session_new_request(i as i64, p);
             let m = b.extract_model(&result);
             ns.push(t0.elapsed().as_nanos() as u64);
@@ -320,7 +327,7 @@ mod tests {
     #[test]
     fn build_session_new_params_matches_legacy_claude() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
-        let got = build_session_new_params(&b, "task_abc", "/tmp/work", "http://127.0.0.1:3001/mcp");
+        let got = build_session_new_params(&b, "task_abc", "/tmp/work", "http://127.0.0.1:3001/mcp", None);
 
         // 重构前 router.rs:440 硬编码的等价 params(legacy oracle)
         let legacy = serde_json::json!({
@@ -340,7 +347,7 @@ mod tests {
     #[test]
     fn build_session_new_request_matches_legacy_envelope() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
-        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp");
+        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", None);
         let got = build_session_new_request(7, params);
 
         let legacy = serde_json::json!({
@@ -366,9 +373,45 @@ mod tests {
             fn session_new_extra(&self) -> Value { serde_json::json!({"model": "gpt-5", "mode": "plan"}) }
             fn extract_model(&self, _: &Value) -> Option<String> { None }
         }
-        let got = build_session_new_params(&WithExtra, "t", "/tmp", "http://tb");
+        let got = build_session_new_params(&WithExtra, "t", "/tmp", "http://tb", None);
         assert_eq!(got["model"], "gpt-5");
         assert_eq!(got["mode"], "plan");
         assert_eq!(got["mcpServers"][0]["headers"][0]["value"], "t"); // 外壳仍在
+    }
+
+    // ── X-Fixus-Policy header 注入(Part C2)──
+
+    #[test]
+    fn session_new_params_include_policy_header_when_present() {
+        let b = ClaudeCodeBackend::new("claude-agent-acp".into());
+        let policy = serde_json::json!({
+            "fs": {"read_paths": [], "write_paths": []},
+            "net": {"egress": []},
+            "agent_role": "reader"
+        });
+        let params = build_session_new_params(
+            &b,
+            "task_x",
+            "/tmp",
+            "http://tb/mcp",
+            Some(policy.to_string()),
+        );
+        let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
+        // X-Fixus-Session-Id 仍在
+        assert!(headers.iter().any(|h| h["name"] == "X-Fixus-Session-Id"));
+        // X-Fixus-Policy 注入,值 = policy 序列化字符串
+        let policy_hdr = headers
+            .iter()
+            .find(|h| h["name"] == "X-Fixus-Policy")
+            .expect("X-Fixus-Policy header 应存在");
+        assert_eq!(policy_hdr["value"], policy.to_string());
+    }
+
+    #[test]
+    fn session_new_params_omit_policy_header_when_absent() {
+        let b = ClaudeCodeBackend::new("claude-agent-acp".into());
+        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", None);
+        let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
+        assert!(!headers.iter().any(|h| h["name"] == "X-Fixus-Policy"));
     }
 }
