@@ -141,12 +141,28 @@ pub fn intersect_fs(a: &FsPolicy, b: &FsPolicy) -> FsPolicy {
     }
 }
 
+/// Phase 1:精确匹配(host+ports+category 全等)交集。
+/// host 重叠/glob 合并留 Phase 2(net 本就只开关级强制)。
+pub fn intersect_net(a: &NetPolicy, b: &NetPolicy) -> NetPolicy {
+    let egress = a
+        .egress
+        .iter()
+        .filter(|ra| b.egress.iter().any(|rb| rb == *ra))
+        .cloned()
+        .collect();
+    NetPolicy { egress }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn scope(p: &str) -> PathScope {
         PathScope { path: PathBuf::from(p), trust: TrustLevel::Host }
+    }
+
+    fn rule(h: &str) -> EgressRule {
+        EgressRule { host: h.into(), ports: vec![], category: None }
     }
 
     #[test]
@@ -224,5 +240,19 @@ mod tests {
         let a = FsPolicy { read_paths: vec![scope("/x")], write_paths: vec![] };
         let b = FsPolicy { read_paths: vec![scope("/x")], write_paths: vec![] };
         assert_eq!(intersect_fs(&a, &b).read_paths.len(), 1);
+    }
+
+    #[test]
+    fn intersect_net_keeps_rules_in_both() {
+        let a = NetPolicy { egress: vec![rule("pypi.org"), rule("github.com")] };
+        let b = NetPolicy { egress: vec![rule("github.com"), rule("npm.org")] };
+        let r = intersect_net(&a, &b);
+        assert_eq!(r.egress, vec![rule("github.com")]);
+    }
+
+    #[test]
+    fn intersect_net_empty_if_either_empty() {
+        let a = NetPolicy { egress: vec![rule("x")] };
+        assert!(intersect_net(&a, &NetPolicy::default()).egress.is_empty());
     }
 }
