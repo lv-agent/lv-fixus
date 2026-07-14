@@ -30,10 +30,11 @@ pub struct PathScope {
 }
 
 /// trust 分层(dim 2):影响审计 + agent_role 门槛。work_dir 隐式 WorkDir。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
     WorkDir,
+    #[default] // 严默认:PathScope 缺省 trust
     Host,
     Remote,
 }
@@ -65,9 +66,10 @@ pub enum NetCategory {
 }
 
 /// agent 信任级(dim 5)。task 携带,在 effective 内再收窄。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
+    #[default] // 严默认
     Reader,
     Operator,
 }
@@ -78,18 +80,6 @@ pub struct EffectivePolicy {
     pub fs: FsPolicy,
     pub net: NetPolicy,
     pub agent_role: AgentRole,
-}
-
-impl Default for AgentRole {
-    fn default() -> Self {
-        AgentRole::Reader // 严默认
-    }
-}
-
-impl Default for TrustLevel {
-    fn default() -> Self {
-        TrustLevel::Host
-    }
 }
 
 /// 路径规范化(不要求存在):处理 `.`、`..`、多余分隔符。
