@@ -45,6 +45,10 @@ pub struct ToolResult {
 pub struct CallCtx {
     pub task_id: String,
     pub idempotency_key: String,
+    /// 透传的 effective policy(opaque JSON,tools-bank 不解析)。
+    /// 来自 HTTP `X-Fixus-Policy` header,由 SandboxAdapter 写入 tool-invoke event
+    /// metadata 供 sandbox-server 消费(CallCtx 本身不序列化,故无需 serde 属性)。
+    pub effective_policy: Option<serde_json::Value>,
 }
 
 /// Adapter 级 infra 故障(无法到达执行器:broker down / 连接拒绝 / 超时)。
@@ -645,6 +649,27 @@ mod tests {
         )
     }
 
+    // ── CallCtx(Part C3)──
+
+    #[test]
+    fn call_ctx_carries_effective_policy() {
+        // effective_policy 为 Some 时携带(opaque JSON,tools-bank 不解析)
+        let ctx = CallCtx {
+            task_id: "t".into(),
+            idempotency_key: "k".into(),
+            effective_policy: Some(serde_json::json!({"agent_role": "reader"})),
+        };
+        assert!(ctx.effective_policy.is_some());
+        assert_eq!(ctx.effective_policy.as_ref().unwrap()["agent_role"], "reader");
+        // None 也合法(缺 policy header 的旧路径)
+        let ctx_none = CallCtx {
+            task_id: "t".into(),
+            idempotency_key: "k".into(),
+            effective_policy: None,
+        };
+        assert!(ctx_none.effective_policy.is_none());
+    }
+
     // ── §4.1 registry ──────────────────────────────────────────────────
 
     #[test]
@@ -691,6 +716,7 @@ mod tests {
             .invoke("ghost", &serde_json::Value::Null, &CallCtx {
                 task_id: "t".into(),
                 idempotency_key: "k".into(),
+                effective_policy: None,
             })
             .await
             .expect_err("unknown tool");
@@ -708,6 +734,7 @@ mod tests {
             .invoke("t_b", &serde_json::Value::Null, &CallCtx {
                 task_id: "t".into(),
                 idempotency_key: "k".into(),
+                effective_policy: None,
             })
             .await
             .unwrap();
@@ -872,6 +899,7 @@ mod tests {
                 &CallCtx {
                     task_id: "t1".into(),
                     idempotency_key: "k1".into(),
+                    effective_policy: None,
                 },
             )
             .await
@@ -913,6 +941,7 @@ mod tests {
                 &CallCtx {
                     task_id: "t".into(),
                     idempotency_key: "k".into(),
+                    effective_policy: None,
                 },
             )
             .await
@@ -958,6 +987,7 @@ mod tests {
                 &CallCtx {
                     task_id: "t".into(),
                     idempotency_key: "k".into(),
+                    effective_policy: None,
                 },
             )
             .await

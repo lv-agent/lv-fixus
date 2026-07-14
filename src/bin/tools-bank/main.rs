@@ -99,12 +99,14 @@ async fn tools_call(
     task_id: &str,
     tool_name: &str,
     args: &serde_json::Value,
+    effective_policy: Option<serde_json::Value>,
     id: Option<i64>,
 ) -> McpResponse {
     let idempotency_key = build_key(task_id, tool_name, args);
     let ctx = CallCtx {
         task_id: task_id.to_string(),
         idempotency_key,
+        effective_policy,
     };
 
     tracing::info!("tools-bank: tools/call task={} tool={}", task_id, tool_name);
@@ -164,9 +166,14 @@ async fn handle_mcp(
             let task_id = headers.get("X-Fixus-Session-Id")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
+            // X-Fixus-Policy:fixlet 注入的 effective policy JSON 字符串 → opaque Value。
+            // 缺 header 或非法 JSON → None(sandbox 侧 fail-closed 严默认)。
+            let effective_policy = headers.get("X-Fixus-Policy")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(serde_json::Value::Null);
 
-            Ok(Json(tools_call(&state, task_id, tool_name, &args, body.id).await))
+            Ok(Json(tools_call(&state, task_id, tool_name, &args, effective_policy, body.id).await))
         }
         _ => {
             Ok(Json(mcp_err(body.id, -32601, &format!("unknown method: {}", body.method))))
