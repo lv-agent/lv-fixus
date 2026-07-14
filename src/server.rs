@@ -125,8 +125,12 @@ pub async fn start() -> Result<(), AppError> {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(6);
-    // turn_timeout(step 1, env `FIXUS_TURN_TIMEOUT_SECS`,默认 600)统一给 turn 本身 + watchdog lease 用。
-    // 老 env `FIXUS_TURN_LEASE_SECS` 已并到这里(语义统一,默认值改 600 跟随)。
+    // turn_timeout(env `FIXUS_TURN_TIMEOUT_SECS`,默认 600)统一给 turn 本身 + watchdog lease 用。
+    //
+    // ⚠️ DEPRECATED:旧 `FIXUS_TURN_LEASE_SECS` 已并入此项 —— 语义统一(turn 本身与
+    //    watchdog lease 共用一个 wall-clock 上限),默认值由 300 提到 600 跟随。
+    //    旧 env 名不再读取(此处无 var("FIXUS_TURN_LEASE_SECS") 调用);迁移请改用
+    //    FIXUS_TURN_TIMEOUT_SECS。
     let turn_timeout = Duration::from_secs(
         std::env::var("FIXUS_TURN_TIMEOUT_SECS")
             .ok()
