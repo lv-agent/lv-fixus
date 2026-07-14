@@ -366,6 +366,9 @@ struct ParsedExecuteTurn {
     redo_count: i32,
     summary: String,
     messages: Vec<fixus::Message>,
+    /// 透传的 effective policy(opaque JSON,fixlet 不解析)。fixus 经
+    /// turn-begin payload 下发,fixlet 注入 `X-Fixus-Policy` header 给 tools-bank。
+    effective_policy: Option<serde_json::Value>,
 }
 
 /// 解析 execute_turn payload(fixus → fixlet 的 turn.begin 契约)。
@@ -411,6 +414,7 @@ fn parse_execute_turn_payload(
             payload.get("context").and_then(|v| v.get("messages")).cloned().unwrap_or_default(),
         )
         .unwrap_or_default(),
+        effective_policy: payload.get("effective_policy").cloned(),
     })
 }
 
@@ -428,7 +432,7 @@ async fn handle_execute_turn_from_broker(
     lifecycle_namespace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_execute_turn_payload(payload)?;
-    let ParsedExecuteTurn { task_id, turn_id, user_input, redo_group, redo_count, summary, messages } = parsed;
+    let ParsedExecuteTurn { task_id, turn_id, user_input, redo_group, redo_count, summary, messages, .. } = parsed;
     // 影子绑定为 &str —— 保持下游用法(Some(task_id)、build_acp_prompt(summary,…))类型不变,
     // 底层 String 由上面的解构绑定持有,活到函数末尾。
     let task_id = task_id.as_str();
@@ -834,6 +838,33 @@ mod tests {
         p["context"]["messages"] = json!("not an array");
         let parsed = parse_execute_turn_payload(&p).expect("不应因 messages 畸形失败");
         assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_extracts_effective_policy() {
+        // turn-begin payload 带 effective_policy → 解析为 Some(opaque JSON)
+        let p = json!({
+            "session_id": "task-1",
+            "turn_id": 1,
+            "input": {"user_input": ""},
+            "effective_policy": {
+                "fs": {"read_paths": [], "write_paths": []},
+                "net": {"egress": []},
+                "agent_role": "reader"
+            }
+        });
+        let parsed = parse_execute_turn_payload(&p).unwrap();
+        let eff = parsed.effective_policy.expect("effective_policy 应解析为 Some");
+        assert_eq!(eff["agent_role"], "reader");
+        assert!(eff["net"]["egress"].is_array());
+    }
+
+    #[test]
+    fn parse_effective_policy_absent_is_none() {
+        // 无 effective_policy 字段 → None(向后兼容旧 payload)
+        let p = json!({ "session_id": "t", "turn_id": 1 });
+        let parsed = parse_execute_turn_payload(&p).unwrap();
+        assert!(parsed.effective_policy.is_none());
     }
 
     // serde_json::Map 没有 pub remove 便利,用 as_object_mut
