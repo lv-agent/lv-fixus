@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use serde::Serialize;
@@ -277,6 +277,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         // Metrics — Prometheus 文本格式(CR-4)
         .route("/metrics", get(metrics_handler))
+        // Tenant policy(Phase 1 沙箱边界):PUT 设置 tenant policy(校验 tenant ⊆ operator)。
+        .route("/api/v1/tenants/{tenant_id}/policy", put(set_tenant_policy_handler))
         .with_state(state)
 }
 
@@ -762,6 +764,30 @@ async fn get_token_usage_handler(
     Ok(Json(ApiResponse::ok(crate::models::TokenUsageResponse::from_by_model(by_model))))
 }
 
+// ── Tenant Policy Handler(Phase 1 沙箱边界)──────────────────────────────
+
+/// PUT /api/v1/tenants/{tenant_id}/policy — 设置 tenant policy(覆盖)。
+///
+/// 校验 `tenant ⊆ operator`(防 tenant 自提权到 operator 上限外);越权 → 400。
+/// 通过则持久化(storage::set_tenant_policy;BrokerEventStore 走专用 stream)。
+async fn set_tenant_policy_handler(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    Json(policy): Json<crate::policy::CapabilityPolicy>,
+) -> Result<StatusCode, AppError> {
+    crate::policy::validate_subset(&policy, &state.operator_policy).map_err(|v| {
+        AppError::PolicyViolation(format!(
+            "tenant policy exceeds operator ceiling: {} fs_read_violation(s), {} fs_write_violation(s), {} net_violation(s)",
+            v.fs_read_violations.len(),
+            v.fs_write_violations.len(),
+            v.net_violations.len()
+        ))
+    })?;
+    state.store.set_tenant_policy(&tenant_id, &policy).await?;
+    tracing::info!("tenant policy set: tenant={}", tenant_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Health Handler ──────────────────────────────────────────────────────
 
 async fn health_handler(
@@ -1009,5 +1035,51 @@ egress = []
         assert_eq!(p.fs.read_paths.len(), 1);
         assert!(p.net.egress.is_empty());
         std::env::remove_var("FIXUS_OPERATOR_POLICY_FILE");
+    }
+}
+
+#[cfg(test)]
+mod tenant_policy_tests {
+    use crate::policy::{
+        validate_subset, CapabilityPolicy, EgressRule, FsPolicy, NetPolicy, PathScope, TrustLevel,
+    };
+
+    fn scope(p: &str) -> PathScope {
+        PathScope { path: p.into(), trust: TrustLevel::Host }
+    }
+    fn policy(read: &[&str], write: &[&str], egress: &[&str]) -> CapabilityPolicy {
+        CapabilityPolicy {
+            fs: FsPolicy {
+                read_paths: read.iter().map(|p| scope(p)).collect(),
+                write_paths: write.iter().map(|p| scope(p)).collect(),
+            },
+            net: NetPolicy {
+                egress: egress.iter().map(|h| EgressRule { host: (*h).into(), ports: vec![], category: None }).collect(),
+            },
+        }
+    }
+
+    /// PUT handler 契约:tenant ⊆ operator 通过;越权 → PolicyViolation(由 handler 映射 400)。
+    #[test]
+    fn tenant_within_operator_ceiling_passes() {
+        let operator = policy(&["/home/lvtao/codeagent"], &["/tmp/work"], &["pypi.org"]);
+        let tenant = policy(&["/home/lvtao/codeagent/proj"], &["/tmp/work/sub"], &["pypi.org"]);
+        assert!(validate_subset(&tenant, &operator).is_ok());
+    }
+
+    #[test]
+    fn tenant_exceeds_operator_ceiling_rejected() {
+        let operator = policy(&["/home/lvtao/codeagent"], &[], &[]);
+        // tenant 读了 operator 未授权的路径 → 越权
+        let tenant = policy(&["/etc"], &[], &[]);
+        assert!(validate_subset(&tenant, &operator).is_err());
+    }
+
+    #[test]
+    fn tenant_net_rule_not_in_operator_rejected() {
+        let operator = policy(&[], &[], &["pypi.org"]);
+        let tenant = policy(&[], &[], &["pypi.org", "evil.com"]);
+        let err = validate_subset(&tenant, &operator).unwrap_err();
+        assert_eq!(err.net_violations, vec!["evil.com".to_string()]);
     }
 }

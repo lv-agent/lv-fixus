@@ -128,6 +128,16 @@ pub struct BrokerEventStore {
     broker_addr: String,
 }
 
+/// tenant policy 专用 stream 名(logdbd stream = 任意字符串;tenant policy 非 task-scoped)。
+/// tenant_id 中的 '/' 等不安全字符替换为 '-'(与 task-begin sanitizing 同策略)。
+fn tenant_policy_stream(tenant_id: &str) -> String {
+    let sanitized: String = tenant_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    format!("tenant-policy-{}", sanitized)
+}
+
 impl BrokerEventStore {
     pub async fn connect(broker_addr: &str, namespace: &str) -> std::result::Result<Self, logdb_client::broker::BrokerError> {
         let writer = BrokerWriter::connect(broker_addr, namespace).await?;
@@ -157,6 +167,61 @@ impl BrokerEventStore {
         let proj = self.cache.get(task_id).await.unwrap();
         let p = proj.read().await;
         Ok(f(&p))
+    }
+
+    /// 读任意 stream 的最新(seq 最大)记录 content。一次性 GroupConsumer:
+    /// join → consume 到 caught_up → 取最大 seq 记录 → leave。
+    /// 用于 tenant policy(latest wins)等非 task 投影的小流。Phase 1 线性扫,配置低基数可接受。
+    async fn read_latest_stream_content(&self, stream: &str) -> Result<Option<Vec<u8>>> {
+        use logdb_client::broker::GroupConsumer;
+        use logdb_broker_proto::pb::consume_response::Payload;
+        use tokio_stream::StreamExt;
+
+        let addr = format!("http://{}", self.broker_addr);
+        // 每次读用独立 group(从 earliest 起读,确保 latest 不被 offset 跳过)。
+        let group = format!("fixus-cfg-read-{}", stream);
+        let mut consumer = GroupConsumer::join(addr, &self.namespace, stream, &group, "singleton")
+            .await
+            .map_err(|e| AppError::Internal(format!("broker consumer join: {}", e)))?;
+        let all_shards: std::collections::HashSet<u32> =
+            consumer.assigned_shards().iter().copied().collect();
+        let mut frames = consumer
+            .consume_frames()
+            .await
+            .map_err(|e| AppError::Internal(format!("broker consume: {}", e)))?;
+
+        let mut latest: Option<(u64, Vec<u8>)> = None;
+        let mut caught_up: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, frames.next()).await {
+                Ok(Some(Ok(frame))) => match frame.payload {
+                    Some(Payload::Record(rec)) => {
+                        let is_newer = latest.as_ref().map(|(s, _)| rec.seq > *s).unwrap_or(true);
+                        if is_newer {
+                            latest = Some((rec.seq, rec.content));
+                        }
+                    }
+                    Some(Payload::CaughtUp(c)) => {
+                        caught_up.insert(c.shard_id);
+                    }
+                    _ => {}
+                },
+                _ => break,
+            }
+            if !all_shards.is_empty() && caught_up == all_shards {
+                break;
+            }
+            if all_shards.is_empty() {
+                break; // 无 shard 分配(空流)
+            }
+        }
+        let _ = consumer.leave().await;
+        Ok(latest.map(|(_, c)| c))
     }
 }
 
@@ -365,6 +430,47 @@ impl EventStore for BrokerEventStore {
     /// 失效 task 投影缓存——下次 get_task 会重新 catch_up。
     async fn invalidate_projection(&self, task_id: &str) {
         self.cache.invalidate(task_id).await;
+    }
+
+    /// 存 tenant policy(覆盖)到专用 stream `tenant-policy-{tenant_id}`(append-only,latest wins)。
+    /// tenant policy 非 task-scoped,logdbd 无独立 KV,故借用专用 stream(每 set 一条 event,
+    /// get 取最大 seq 的 content)。Phase 1 沙箱边界。
+    async fn set_tenant_policy(
+        &self,
+        tenant_id: &str,
+        policy: &crate::policy::CapabilityPolicy,
+    ) -> Result<()> {
+        let stream = tenant_policy_stream(tenant_id);
+        let content = serde_json::to_vec(policy)
+            .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let mut meta = HashMap::new();
+        meta.insert("tenant_id".into(), tenant_id.to_string());
+        let ts_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        let mut w = self.writer.lock().await;
+        w.produce(&stream, "tenant_policy", &content, Some(tenant_id), ts_ns, "application/json", &meta)
+            .await
+            .map(|(gid, seq)| {
+                tracing::info!("set_tenant_policy: tenant={} stream={} gid={} seq={}", tenant_id, stream, gid, seq);
+            })
+            .map_err(|e| AppError::Internal(format!("set_tenant_policy produce: {}", e)))?;
+        Ok(())
+    }
+
+    /// 取 tenant policy:扫专用 stream,返回最大 seq 记录反序列化;空 → None(继承 Operator 严默认)。
+    async fn get_tenant_policy(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::policy::CapabilityPolicy>> {
+        let stream = tenant_policy_stream(tenant_id);
+        let latest = self.read_latest_stream_content(&stream).await?;
+        match latest {
+            None => Ok(None),
+            Some(bytes) => {
+                let policy: crate::policy::CapabilityPolicy = serde_json::from_slice(&bytes)
+                    .map_err(|e| AppError::Internal(format!("tenant policy decode: {}", e)))?;
+                Ok(Some(policy))
+            }
+        }
     }
 
     /// 把工具事件发到 sandbox dispatch stream `tool-invoke-<SANDBOX_REGION>`。
