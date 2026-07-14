@@ -59,6 +59,7 @@ tokio-stream = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.4"  # bash net-off kernel filter (Phase 1 sandbox boundary)
+libc = "0.2"         # syscall/errno/AF_* 常量(seccomp net-off filter)
 
 # Logging
 tracing = "0.1"

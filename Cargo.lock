@@ -660,6 +660,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "landlock",
+ "libc",
  "logdb",
  "logdb-broker",
  "logdb-broker-proto",

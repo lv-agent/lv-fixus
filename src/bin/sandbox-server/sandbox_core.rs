@@ -131,6 +131,80 @@ fn apply_impl(_work_dir: &Path, _eff: &EffectivePolicy) -> Result<(), String> {
     Err("landlock unavailable on non-linux".into())
 }
 
+// ── D4:seccomp net-off(Phase 1 开关级)──────────────────────────────────
+
+/// net-off 时返回 true(应套 seccomp 拒网络)。Phase 1:仅 on/off 开关级。
+pub fn should_block_net(eff: &EffectivePolicy) -> bool {
+    eff.net_off()
+}
+
+/// 在 pre_exec 上下文(已 fork)装 seccomp filter。
+///
+/// 拒 `socket(AF_INET/AF_INET6)` → `EACCES`;其余 syscall(含 `AF_UNIX` socket、
+/// `connect`、文件 I/O、`socket(AF_UNIX)`)默认 `Allow`。
+///
+/// 设计:阻塞 inet 套接字创建本身——fd 永不产生,`connect()` 无 inet fd 可用,故无需
+/// blanket-block `connect`(那会误伤 `AF_UNIX`)。等效"网络全断,本地 IPC 不受影响",
+/// 严格匹配 spec §9 net Phase 1 开关级语义。
+///
+/// **fail-closed**:filter 构造/编译/apply 任一失败 → `Err`(调用方拒 exec,绝不放行
+/// 一个本应 net-off 却未强制的进程)。
+#[cfg(target_os = "linux")]
+pub fn apply_net_filter_block() -> Result<(), String> {
+    use std::convert::TryInto;
+
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
+
+    // AF_INET=2, AF_INET6=10(Linux ABI);EACCES=13。
+    const AF_INET: u64 = libc::AF_INET as u64;
+    const AF_INET6: u64 = libc::AF_INET6 as u64;
+    const EACCES_ERRNO: u32 = libc::EACCES as u32;
+
+    // 两条 OR-bound 规则(seccompiler:同一 syscall 的多条 rule 为 OR):任一命中 → match_action。
+    // 条件:arg0(domain)== AF_INET 或 == AF_INET6。
+    let rule_inet = SeccompRule::new(vec![SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        AF_INET,
+    )
+    .map_err(|e| format!("seccomp cond AF_INET: {}", e))?])
+    .map_err(|e| format!("seccomp rule AF_INET: {}", e))?;
+
+    let rule_inet6 = SeccompRule::new(vec![SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        AF_INET6,
+    )
+    .map_err(|e| format!("seccomp cond AF_INET6: {}", e))?])
+    .map_err(|e| format!("seccomp rule AF_INET6: {}", e))?;
+
+    let filter = SeccompFilter::new(
+        vec![(libc::SYS_socket as i64, vec![rule_inet, rule_inet6])]
+            .into_iter()
+            .collect(),
+        // mismatch_action:不命中任何规则的 syscall(AF_UNIX socket、connect、文件 I/O …)→ Allow
+        SeccompAction::Allow,
+        // match_action:命中 socket(AF_INET/AF_INET6)→ Errno(EACCES)
+        SeccompAction::Errno(EACCES_ERRNO),
+        std::env::consts::ARCH
+            .try_into()
+            .map_err(|e| format!("seccomp target arch: {}", e))?,
+    )
+    .map_err(|e| format!("seccomp filter new: {}", e))?;
+
+    // SeccompFilter 无 apply() 方法:编译成 BpfProgram 后用 seccompiler::apply_filter 安装。
+    let bpf: seccompiler::BpfProgram = filter
+        .try_into()
+        .map_err(|e| format!("seccomp compile: {}", e))?;
+
+    seccompiler::apply_filter(&bpf).map_err(|e| format!("seccomp apply: {}", e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +275,24 @@ mod tests {
             !r.infra_ro.is_empty(),
             "infra 始终在(二进制执行所需)"
         );
+    }
+
+    #[test]
+    fn should_block_net_when_off() {
+        // 严默认:egress 空 → net off → 应套 seccomp。
+        let eff = EffectivePolicy::default();
+        assert!(should_block_net(&eff), "空 egress => net off => block");
+    }
+
+    #[test]
+    fn should_not_block_net_when_egress_present() {
+        // egress 非空 → net on → Phase 1 不强制(放行)。
+        let eff = EffectivePolicy {
+            net: crate::policy::NetPolicy {
+                egress: vec![serde_json::json!({"host": "example.com"})],
+            },
+            ..Default::default()
+        };
+        assert!(!should_block_net(&eff), "非空 egress => net on => 不套 seccomp");
     }
 }

@@ -64,6 +64,20 @@ pub async fn execute(
                             ));
                         }
                     }
+                    // ── seccomp net-off(linux only)── fail-closed ──
+                    // net_off(egress 空)→ 拒 socket(AF_INET/AF_INET6)。filter apply 失败 → 拒 exec
+                    // (绝不放行一个本应 net-off 却未强制的进程)。
+                    #[cfg(target_os = "linux")]
+                    {
+                        if crate::sandbox_core::should_block_net(&eff_clone) {
+                            if let Err(e) = crate::sandbox_core::apply_net_filter_block() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("seccomp net filter failed (fail-closed): {}", e),
+                                ));
+                            }
+                        }
+                    }
                     Ok(())
                 });
             }
