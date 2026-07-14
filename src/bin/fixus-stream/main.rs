@@ -313,7 +313,14 @@ async fn health() -> &'static str {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // 与 sandbox-server / fixlet 一致:builder + EnvFilter(RUST_LOG 优先,缺省
+    // fixus_stream=info)。原裸 fmt::init() 默认 ERROR 级别,会吞掉本 bin 的 info 日志。
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "fixus_stream=info".into()),
+        )
+        .init();
 
     let addr = std::env::var("LOGDBD_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".into());
     let namespace = std::env::var("LOGDBD_NAMESPACE").unwrap_or_else(|_| "default".into());
