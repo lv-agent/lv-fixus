@@ -153,6 +153,19 @@ pub fn intersect_net(a: &NetPolicy, b: &NetPolicy) -> NetPolicy {
     NetPolicy { egress }
 }
 
+/// agent_role 再收窄:Reader → 砍 net + Host-trust write(保 WorkDir write + 所有 read)。
+pub fn role_narrow(mut eff: EffectivePolicy, role: AgentRole) -> EffectivePolicy {
+    eff.agent_role = role;
+    match role {
+        AgentRole::Operator => {}
+        AgentRole::Reader => {
+            eff.net.egress.clear();
+            eff.fs.write_paths.retain(|s| s.trust == TrustLevel::WorkDir);
+        }
+    }
+    eff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +267,36 @@ mod tests {
     fn intersect_net_empty_if_either_empty() {
         let a = NetPolicy { egress: vec![rule("x")] };
         assert!(intersect_net(&a, &NetPolicy::default()).egress.is_empty());
+    }
+
+    #[test]
+    fn role_narrow_reader_kills_net_and_host_write() {
+        let mut eff = EffectivePolicy {
+            fs: FsPolicy {
+                read_paths: vec![scope("/host/read")],
+                write_paths: vec![
+                    PathScope { path: "/host/write".into(), trust: TrustLevel::Host },
+                    PathScope { path: "/tmp/wd".into(), trust: TrustLevel::WorkDir },
+                ],
+            },
+            net: NetPolicy { egress: vec![rule("pypi.org")] },
+            agent_role: AgentRole::Operator,
+        };
+        eff = role_narrow(eff, AgentRole::Reader);
+        assert!(eff.net.egress.is_empty(), "Reader 无外网");
+        assert_eq!(eff.fs.write_paths.len(), 1);
+        assert_eq!(eff.fs.write_paths[0].trust, TrustLevel::WorkDir);
+        assert_eq!(eff.fs.read_paths.len(), 1);
+    }
+
+    #[test]
+    fn role_narrow_operator_keeps_all() {
+        let eff = EffectivePolicy {
+            fs: FsPolicy { read_paths: vec![scope("/h")], write_paths: vec![scope("/h")] },
+            net: NetPolicy { egress: vec![rule("x")] },
+            agent_role: AgentRole::Operator,
+        };
+        let r = role_narrow(eff.clone(), AgentRole::Operator);
+        assert_eq!(r, eff);
     }
 }
