@@ -456,6 +456,15 @@ pub fn parse_extra_catalog(toml_str: &str) -> Result<Vec<ToolSpec>, CatalogError
             return Err(CatalogError::DuplicateName(raw.name));
         }
 
+        // Empty argv template → nothing to spawn (argv[0] would be missing).
+        // Fail loud; the operator must declare at least the binary name.
+        if raw.argv.is_empty() {
+            return Err(CatalogError::Malformed(format!(
+                "tool {} has empty argv (need at least the binary name as argv[0])",
+                raw.name
+            )));
+        }
+
         // argv: each element parsed via parse_argv_element. A malformed
         // placeholder (e.g. "{1bad}") propagates UnknownPlaceholder — the
         // catalog fails to load.
@@ -481,6 +490,26 @@ pub fn parse_extra_catalog(toml_str: &str) -> Result<Vec<ToolSpec>, CatalogError
         });
     }
     Ok(specs)
+}
+
+/// Drop extras whose name collides with a reserved tool set (typically
+/// [`builtins()`]). Returns the kept extras in original order. Pure — no
+/// logging (the crate stays dependency-light); the caller warns about the
+/// skipped count.
+///
+/// This realizes spec §6.3's "builtin/extra name collision → warn + skip the
+/// extra (keep builtins + other extras)" at LOAD time. The `ToolRegistry`
+/// cross-adapter dup-check can't see an intra-batch duplicate (builtins ∪ extras
+/// arrive as one `SandboxAdapter::tools()` batch), so the collision must be
+/// filtered before the extras enter the adapter.
+pub fn filter_collisions(extras: &[ToolSpec], reserved: &[ToolSpec]) -> Vec<ToolSpec> {
+    let reserved_names: std::collections::HashSet<&str> =
+        reserved.iter().map(|s| s.name.as_str()).collect();
+    extras
+        .iter()
+        .filter(|e| !reserved_names.contains(e.name.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Map the `io` string to [`BinIo`]. Unknown value → `Malformed` (fail loud).
@@ -853,19 +882,21 @@ type = "object"
 
     #[test]
     fn parse_extra_dup_name_errors() {
+        // argv non-empty so the empty-argv guard doesn't fire first; the dup
+        // (same name "fixus_x" twice) is what we're testing.
         let toml = r#"
 [[tool]]
 name = "fixus_x"
 description = "d"
 binary = "x"
-argv = []
+argv = ["x"]
 [tool.input_schema]
 type = "object"
 [[tool]]
 name = "fixus_x"
 description = "d2"
 binary = "y"
-argv = []
+argv = ["y"]
 [tool.input_schema]
 type = "object"
 "#;
@@ -912,5 +943,45 @@ argv = []
 type = "object"
 "#;
         assert!(parse_extra_catalog(toml).is_err());
+    }
+
+    #[test]
+    fn parse_extra_rejects_empty_argv() {
+        // all required fields present (incl. binary), but argv=[] → Malformed
+        // (nothing to spawn; argv[0] missing).
+        let toml = r#"
+[[tool]]
+name = "fixus_x"
+description = "d"
+binary = "x"
+argv = []
+[tool.input_schema]
+type = "object"
+"#;
+        let err = parse_extra_catalog(toml);
+        assert!(matches!(err, Err(CatalogError::Malformed(_))), "got {:?}", err);
+    }
+
+    #[test]
+    fn filter_collisions_drops_reserved_names() {
+        // An extra whose name matches a reserved (builtin) name is dropped;
+        // distinct extras are kept. Order preserved.
+        let mk = |name: &str| ToolSpec {
+            name: name.into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            default_timeout_secs: 15,
+            executor: ExecutorKind::Bin(BinSpec {
+                binary: "x".into(),
+                argv: vec![ArgvPart::Literal("x".into())],
+                io: BinIo::None,
+                path_args: vec![],
+            }),
+        };
+        let reserved = vec![mk("fixus_bash"), mk("fixus_jq")];
+        let extras = vec![mk("fixus_bash"), mk("fixus_custom"), mk("fixus_jq")];
+        let kept = filter_collisions(&extras, &reserved);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "fixus_custom");
     }
 }

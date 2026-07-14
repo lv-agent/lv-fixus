@@ -364,6 +364,17 @@ async fn main() {
         },
         None => vec![],
     };
+    // Drop extras colliding with a builtin name (spec §6.3: warn + skip the extra,
+    // keep builtins + other extras). ToolRegistry's cross-adapter dup-check can't
+    // see an intra-batch duplicate (builtins ∪ extras arrive as one adapter batch).
+    let before = extras.len();
+    let extras = fixus_tool_catalog::filter_collisions(&extras, fixus_tool_catalog::builtins());
+    if extras.len() < before {
+        tracing::warn!(
+            "skipped {} extra tool(s) whose name collides with a builtin",
+            before - extras.len()
+        );
+    }
     tracing::info!(
         "tool catalog for sandbox adapter: {} total ({} builtins + {} extras)",
         fixus_tool_catalog::builtins().len() + extras.len(),

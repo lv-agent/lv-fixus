@@ -116,6 +116,16 @@ async fn main() {
         },
         None => vec![],
     };
+    // Drop extras colliding with a builtin name (spec §6.3: warn + skip). Mirrors
+    // tools-bank's load-time filter so both bins agree on the tool set.
+    let before = extras.len();
+    let extras = fixus_tool_catalog::filter_collisions(&extras, fixus_tool_catalog::builtins());
+    if extras.len() < before {
+        tracing::warn!(
+            "skipped {} extra tool(s) whose name collides with a builtin",
+            before - extras.len()
+        );
+    }
     let all_tools: Arc<Vec<fixus_tool_catalog::ToolSpec>> = Arc::new(
         fixus_tool_catalog::builtins().iter().chain(extras.iter()).cloned().collect()
     );

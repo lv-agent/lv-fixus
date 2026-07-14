@@ -102,6 +102,12 @@ pub async fn execute_argv(
     eff: &EffectivePolicy,
     timeout_secs: u64,
 ) -> Result<ExecOutput, ExecError> {
+    // Defense-in-depth: an empty argv has no argv[0] to spawn. parse_extra_catalog
+    // rejects empty argv at load, but guard here too (e.g. an all-optional-Flag
+    // builtin template is theoretically possible).
+    if argv.is_empty() {
+        return Err(ExecError::Spawn("empty argv (no binary to exec)".into()));
+    }
     let work_dir = work_dir.to_path_buf();
     let eff = eff.clone();
     let argv: Vec<String> = argv.to_vec();
