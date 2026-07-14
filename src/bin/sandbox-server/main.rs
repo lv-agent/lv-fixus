@@ -362,13 +362,12 @@ async fn execute_tool(
                 "stdout": exec_result.stdout, "stderr": exec_result.stderr, "exit_code": exec_result.exit_code,
             }))
         }
-        // 文件工具(sandbox-server 进程内)。D1: eff 已就位但 tools.rs 仍用旧签名 → 暂传空白名单
-        // (=work_dir 严隔离);D2 把 file tools 切到 EffectivePolicy 校验。
-        "Read" | "read" => crate::tools::execute_read(&input, work_dir, &[]).await,
-        "Write" | "write" => crate::tools::execute_write(&input, work_dir).await,
-        "Edit" | "edit" => crate::tools::execute_edit(&input, work_dir).await,
-        "Glob" | "glob" => crate::tools::execute_glob(&input, work_dir, &[]).await,
-        "Grep" | "grep" => crate::tools::execute_grep(&input, work_dir, &[], timeout_dur).await,
+        // 文件工具(sandbox-server 进程内):路径校验走 EffectivePolicy。
+        "Read" | "read" => crate::tools::execute_read(&input, work_dir, eff).await,
+        "Write" | "write" => crate::tools::execute_write(&input, work_dir, eff).await,
+        "Edit" | "edit" => crate::tools::execute_edit(&input, work_dir, eff).await,
+        "Glob" | "glob" => crate::tools::execute_glob(&input, work_dir, eff).await,
+        "Grep" | "grep" => crate::tools::execute_grep(&input, work_dir, eff, timeout_dur).await,
         _ => Err(format!("unknown tool {}", name)),
     }
 }

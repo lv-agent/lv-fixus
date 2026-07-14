@@ -1,70 +1,28 @@
-//! 文件工具(Read/Write/Edit/Glob/Grep)—— 从 fixus 进程内沙箱移植而来。
+//! 文件工具(Read/Write/Edit/Glob/Grep)—— sandbox-server 进程内执行。
 //!
-//! 这些工具在 sandbox-server 进程内执行,路径校验限定在当次调用的 `work_dir`
-//! (`base_dir/<step_id>`)内。Bash 仍由 `executor::execute` 经 Landlock 子进程执行,
-//! 这里只处理文件类工具。
+//! 路径校验走声明式 `EffectivePolicy`(随 tool-invoke event metadata 透传):
+//!   - read 类(R/Glob/Grep):work_dir 内 OR effective.fs.read_paths 某 scope 下。
+//!   - write 类(W/E):work_dir 内 OR effective.fs.write_paths 某 scope 下。
+//! 缺 policy → 严默认(仅 work_dir)。Bash 由 `executor::execute` 经 Landlock 子进程执行(D-b)。
 //!
 //! 注:文件工具目前仅应用层路径校验(与原进程内沙箱平级),未套 Landlock;
-//! 给文件工具也加内核级隔离是后续加固项。
+//! 给文件工具加内核级隔离是后续加固项。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::policy::EffectivePolicy;
+
 const MAX_OUTPUT_SIZE: usize = 1024 * 1024; // 1MB
 
-/// 校验路径在 work_dir 内,返回规范化后的绝对路径。
-///
-/// 防止路径遍历(如 `../../etc/shadow`)。相对路径相对 work_dir 解析。
-fn validate_path_in_workspace(file_path: &str, work_dir: &Path) -> Result<PathBuf, String> {
-    let path = Path::new(file_path);
-    let canonical = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        work_dir.join(path)
-    };
-    // 不要求目标必须存在(Write 场景),只检查解析后的路径前缀
-    let normalized = normalize_path(&canonical);
-    if !normalized.starts_with(work_dir) {
-        return Err(format!(
-            "Path '{}' is outside work_dir '{}'. Access denied.",
-            file_path,
-            work_dir.display()
-        ));
-    }
-    Ok(normalized)
-}
-
-/// 解析 `SANDBOX_READ_ALLOWED_HOST_PATHS` env 值（逗号分隔绝对路径）为 normalize 后的 PathBuf Vec。
-/// 空 / 全空白 → 空 Vec（不放宽任何路径）。**相对路径 entry 被忽略**（白名单语义要求绝对路径）。
-/// 入口归一化一次（main.rs 启动时调一次）。
-pub fn parse_allowed_read_paths(env_value: &str) -> Vec<PathBuf> {
-    env_value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| {
-            let p = PathBuf::from(s);
-            if p.is_absolute() {
-                Some(normalize_path(&p))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// 校验读类工具（R/Glob/Grep）的路径，允许两类位置：
-/// 1. 在 work_dir 内（原行为）
-/// 2. 绝对路径，且规范化后落在任一 `allowed_read_paths[i]` 前缀下（白名单）
-///
-/// 返回规范化后的绝对路径。**白名单只对绝对路径生效**；相对路径一律相对 work_dir。
-/// W/E 仍用 `validate_path_in_workspace`（写类不允许白名单放宽，保 work_dir 隔离严格）。
-fn validate_read_path(
+/// read 类(R/Glob/Grep):work_dir 内 OR 在 effective.fs.read_paths 某 scope 下。
+/// 双方按路径段前缀匹配(先 normalize)。返回规范化后的绝对路径。
+pub fn validate_read_policy(
     file_path: &str,
     work_dir: &Path,
-    allowed_read_paths: &[PathBuf],
+    eff: &EffectivePolicy,
 ) -> Result<PathBuf, String> {
     let path = Path::new(file_path);
     let canonical = if path.is_absolute() {
@@ -73,23 +31,50 @@ fn validate_read_path(
         work_dir.join(path)
     };
     let normalized = normalize_path(&canonical);
-    // 1) 白名单分支（仅绝对路径）
-    if canonical.is_absolute() {
-        for allowed in allowed_read_paths {
-            if normalized.starts_with(allowed) {
-                return Ok(normalized);
-            }
+    if normalized.starts_with(work_dir) {
+        return Ok(normalized);
+    }
+    for scope in &eff.fs.read_paths {
+        let s = normalize_path(&scope.path);
+        if normalized == s || normalized.starts_with(&s) {
+            return Ok(normalized);
         }
     }
-    // 2) 原 work_dir 检查
-    if !normalized.starts_with(work_dir) {
-        return Err(format!(
-            "Path '{}' is outside work_dir '{}'. Access denied.",
-            file_path,
-            work_dir.display()
-        ));
+    Err(format!(
+        "Path '{}' outside read policy (work_dir + {} read scope(s))",
+        file_path,
+        eff.fs.read_paths.len()
+    ))
+}
+
+/// write 类(W/E):work_dir 内 OR 在 effective.fs.write_paths 某 Host/WorkDir scope 下。
+/// 双方按路径段前缀匹配(先 normalize)。返回规范化后的绝对路径。
+pub fn validate_write_policy(
+    file_path: &str,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<PathBuf, String> {
+    let path = Path::new(file_path);
+    let canonical = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        work_dir.join(path)
+    };
+    let normalized = normalize_path(&canonical);
+    if normalized.starts_with(work_dir) {
+        return Ok(normalized);
     }
-    Ok(normalized)
+    for scope in &eff.fs.write_paths {
+        let s = normalize_path(&scope.path);
+        if normalized == s || normalized.starts_with(&s) {
+            return Ok(normalized);
+        }
+    }
+    Err(format!(
+        "Path '{}' outside write policy (work_dir + {} write scope(s))",
+        file_path,
+        eff.fs.write_paths.len()
+    ))
 }
 
 /// 路径规范化(不要求文件存在):处理 `.`、`..`、多余分隔符。
@@ -124,12 +109,16 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// 读取文件
-pub async fn execute_read(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf]) -> Result<serde_json::Value, String> {
+pub async fn execute_read(
+    input: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<serde_json::Value, String> {
     let file_path = input
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Read requires 'file_path' field".to_string())?;
-    let abs = validate_read_path(file_path, work_dir, allowed_read_paths)?;
+    let abs = validate_read_policy(file_path, work_dir, eff)?;
 
     let offset = input.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
     let limit = input.get("limit").and_then(|v| v.as_i64());
@@ -155,12 +144,16 @@ pub async fn execute_read(input: &serde_json::Value, work_dir: &Path, allowed_re
 }
 
 /// 写入文件
-pub async fn execute_write(input: &serde_json::Value, work_dir: &Path) -> Result<serde_json::Value, String> {
+pub async fn execute_write(
+    input: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<serde_json::Value, String> {
     let file_path = input
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Write requires 'file_path' field".to_string())?;
-    let abs = validate_path_in_workspace(file_path, work_dir)?;
+    let abs = validate_write_policy(file_path, work_dir, eff)?;
 
     let content = input
         .get("content")
@@ -182,12 +175,16 @@ pub async fn execute_write(input: &serde_json::Value, work_dir: &Path) -> Result
 }
 
 /// 编辑文件(字符串替换)
-pub async fn execute_edit(input: &serde_json::Value, work_dir: &Path) -> Result<serde_json::Value, String> {
+pub async fn execute_edit(
+    input: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<serde_json::Value, String> {
     let file_path = input
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Edit requires 'file_path' field".to_string())?;
-    let abs = validate_path_in_workspace(file_path, work_dir)?;
+    let abs = validate_write_policy(file_path, work_dir, eff)?;
 
     let old_string = input
         .get("old_string")
@@ -216,13 +213,17 @@ pub async fn execute_edit(input: &serde_json::Value, work_dir: &Path) -> Result<
 }
 
 /// Glob 模式匹配文件
-pub async fn execute_glob(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf]) -> Result<serde_json::Value, String> {
+pub async fn execute_glob(
+    input: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<serde_json::Value, String> {
     let pattern = input
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Glob requires 'pattern' field".to_string())?;
     let raw_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let abs = validate_read_path(raw_path, work_dir, allowed_read_paths)?;
+    let abs = validate_read_policy(raw_path, work_dir, eff)?;
 
     let output = Command::new("find")
         .arg(&abs)
@@ -245,13 +246,18 @@ pub async fn execute_glob(input: &serde_json::Value, work_dir: &Path, allowed_re
 }
 
 /// Grep 搜索文件内容
-pub async fn execute_grep(input: &serde_json::Value, work_dir: &Path, allowed_read_paths: &[PathBuf], timeout_dur: Duration) -> Result<serde_json::Value, String> {
+pub async fn execute_grep(
+    input: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+    timeout_dur: Duration,
+) -> Result<serde_json::Value, String> {
     let pattern = input
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Grep requires 'pattern' field".to_string())?;
     let raw_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let abs = validate_read_path(raw_path, work_dir, allowed_read_paths)?;
+    let abs = validate_read_policy(raw_path, work_dir, eff)?;
 
     let output_future = Command::new("grep")
         .arg("-rn")
@@ -281,10 +287,28 @@ pub async fn execute_grep(input: &serde_json::Value, work_dir: &Path, allowed_re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::policy::{AgentRole, FsPolicy, PathScope, TrustLevel};
 
     fn tmp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("create temp dir")
+    }
+
+    /// 测试用 EffectivePolicy:host-trust scope。
+    fn eff(read: &[&str], write: &[&str]) -> EffectivePolicy {
+        EffectivePolicy {
+            fs: FsPolicy {
+                read_paths: read
+                    .iter()
+                    .map(|p| PathScope { path: PathBuf::from(p), trust: TrustLevel::Host })
+                    .collect(),
+                write_paths: write
+                    .iter()
+                    .map(|p| PathScope { path: PathBuf::from(p), trust: TrustLevel::Host })
+                    .collect(),
+            },
+            net: Default::default(),
+            agent_role: AgentRole::Operator,
+        }
     }
 
     #[test]
@@ -316,19 +340,47 @@ mod tests {
         assert!(result.contains("truncated"));
     }
 
+    // ── policy 校验(D2)──
+
     #[test]
-    fn validate_path_in_workspace_rejects_outside() {
-        let work_dir = Path::new("/tmp/work");
-        assert!(validate_path_in_workspace("/etc/passwd", work_dir).is_err());
-        assert!(validate_path_in_workspace("../../etc/passwd", work_dir).is_err());
+    fn read_allowed_within_policy() {
+        let e = eff(&["/home/x/proj"], &[]);
+        assert!(validate_read_policy("/home/x/proj/a.go", Path::new("/tmp/wd"), &e).is_ok());
+        assert!(validate_read_policy("/home/x/proj", Path::new("/tmp/wd"), &e).is_ok(), "scope 根本身允许");
     }
 
     #[test]
-    fn validate_path_in_workspace_allows_inside() {
-        let work_dir = Path::new("/tmp/work");
-        assert!(validate_path_in_workspace("/tmp/work/file.txt", work_dir).is_ok());
-        assert!(validate_path_in_workspace("subdir/file.txt", work_dir).is_ok());
+    fn read_denied_outside_policy_and_workdir() {
+        let e = eff(&["/home/x/proj"], &[]);
+        assert!(validate_read_policy("/etc/passwd", Path::new("/tmp/wd"), &e).is_err());
+        assert!(validate_read_policy("/home/x/other", Path::new("/tmp/wd"), &e).is_err());
+        // work_dir 内仍允许(无需 policy 放宽)
+        assert!(validate_read_policy("/tmp/wd/sub/f.txt", Path::new("/tmp/wd"), &e).is_ok());
     }
+
+    #[test]
+    fn write_allowed_in_workdir_and_policy_write() {
+        let e = eff(&[], &["/repo"]);
+        assert!(validate_write_policy("sub/f.txt", Path::new("/tmp/wd"), &e).is_ok(), "work_dir 内写");
+        assert!(validate_write_policy("/repo/f.txt", Path::new("/tmp/wd"), &e).is_ok(), "policy write scope");
+        assert!(validate_write_policy("/home/x/proj/f", Path::new("/tmp/wd"), &e).is_err(), "越界写被拒");
+    }
+
+    #[test]
+    fn read_path_traversal_blocked_when_no_scope() {
+        // 严默认:相对 ../ 逃逸 work_dir 且无 read scope → 拒
+        let e = eff(&[], &[]);
+        assert!(validate_read_policy("../../etc/passwd", Path::new("/tmp/wd"), &e).is_err());
+    }
+
+    #[test]
+    fn read_prefix_segment_not_string_prefix() {
+        // /home/x/proj-evil 不应在 /home/x/proj scope 下(按路径段,非字符串前缀)
+        let e = eff(&["/home/x/proj"], &[]);
+        assert!(validate_read_policy("/home/x/proj-evil/f", Path::new("/tmp/wd"), &e).is_err());
+    }
+
+    // ── execute_* 集成(用 default policy = 仅 work_dir)──
 
     #[tokio::test]
     async fn execute_read_reads_file() {
@@ -337,7 +389,7 @@ mod tests {
         std::fs::write(&file_path, "line1\nline2\nline3").unwrap();
 
         let input = serde_json::json!({"file_path": file_path.to_string_lossy()});
-        let result = execute_read(&input, dir.path(), &[]).await.unwrap();
+        let result = execute_read(&input, dir.path(), &EffectivePolicy::default()).await.unwrap();
 
         assert_eq!(result["content"].as_str().unwrap(), "line1\nline2\nline3");
         assert_eq!(result["total_lines"].as_u64().unwrap(), 3);
@@ -351,7 +403,7 @@ mod tests {
         std::fs::write(&file_path, "a\nb\nc\nd\ne").unwrap();
 
         let input = serde_json::json!({"file_path": file_path.to_string_lossy(), "offset": 1, "limit": 2});
-        let result = execute_read(&input, dir.path(), &[]).await.unwrap();
+        let result = execute_read(&input, dir.path(), &EffectivePolicy::default()).await.unwrap();
 
         assert_eq!(result["content"].as_str().unwrap(), "b\nc");
         assert_eq!(result["lines_returned"].as_u64().unwrap(), 2);
@@ -361,14 +413,28 @@ mod tests {
     async fn execute_read_rejects_path_outside_work_dir() {
         let dir = tmp_dir();
         let input = serde_json::json!({"file_path": "/etc/hosts"});
-        assert!(execute_read(&input, dir.path(), &[]).await.is_err());
+        assert!(execute_read(&input, dir.path(), &EffectivePolicy::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_read_allows_policy_scope() {
+        let dir = tmp_dir();
+        // 在 policy read scope 下放文件,work_dir 外
+        let scope = tempfile::tempdir().expect("scope dir");
+        let file_path = scope.path().join("host.txt");
+        std::fs::write(&file_path, "host-content").unwrap();
+        let e = eff(&[scope.path().to_str().unwrap()], &[]);
+
+        let input = serde_json::json!({"file_path": file_path.to_string_lossy()});
+        let result = execute_read(&input, dir.path(), &e).await.unwrap();
+        assert_eq!(result["content"].as_str().unwrap(), "host-content");
     }
 
     #[tokio::test]
     async fn execute_write_creates_and_writes_file() {
         let dir = tmp_dir();
         let input = serde_json::json!({"file_path": "out.txt", "content": "test content"});
-        let result = execute_write(&input, dir.path()).await.unwrap();
+        let result = execute_write(&input, dir.path(), &EffectivePolicy::default()).await.unwrap();
 
         assert_eq!(result["bytes_written"].as_u64().unwrap(), 12);
         let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
@@ -378,8 +444,8 @@ mod tests {
     #[tokio::test]
     async fn execute_write_rejects_path_outside_work_dir() {
         let dir = tmp_dir();
-        let input = serde_json::json!({"file_path": "/tmp/evil.txt", "content": "bad"});
-        assert!(execute_write(&input, dir.path()).await.is_err());
+        let input = serde_json::json!({"file_path": "/tmp/evil_sandbox_write.txt", "content": "bad"});
+        assert!(execute_write(&input, dir.path(), &EffectivePolicy::default()).await.is_err());
     }
 
     #[tokio::test]
@@ -393,62 +459,11 @@ mod tests {
             "old_string": "world",
             "new_string": "rust"
         });
-        let result = execute_edit(&input, dir.path()).await.unwrap();
+        let result = execute_edit(&input, dir.path(), &EffectivePolicy::default()).await.unwrap();
         assert_eq!(result["replaced"].as_bool().unwrap(), true);
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "hello rust");
-    }
-
-    #[test]
-    fn parse_allowed_read_paths_empty_and_whitespace() {
-        assert_eq!(parse_allowed_read_paths(""), Vec::<PathBuf>::new());
-        assert_eq!(parse_allowed_read_paths(",,"), Vec::<PathBuf>::new());
-        assert_eq!(parse_allowed_read_paths("   "), Vec::<PathBuf>::new());
-    }
-
-    #[test]
-    fn parse_allowed_read_paths_skips_relative() {
-        let r = parse_allowed_read_paths("/abs,relative,./foo,/another");
-        assert_eq!(r, vec![PathBuf::from("/abs"), PathBuf::from("/another")]);
-    }
-
-    #[test]
-    fn parse_allowed_read_paths_normalizes() {
-        let r = parse_allowed_read_paths("/a/./b/../c");
-        assert_eq!(r, vec![PathBuf::from("/a/c")]);
-    }
-
-    #[test]
-    fn validate_read_path_allows_workdir_when_no_whitelist() {
-        let work_dir = Path::new("/tmp/work");
-        let allowed: Vec<PathBuf> = vec![];
-        assert!(validate_read_path("/tmp/work/file.txt", work_dir, &allowed).is_ok());
-        assert!(validate_read_path("subdir/file.txt", work_dir, &allowed).is_ok());
-    }
-
-    #[test]
-    fn validate_read_path_allows_whitelisted_absolute_path() {
-        let work_dir = Path::new("/tmp/work");
-        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
-        assert!(validate_read_path("/home/lvtao/codeagent/multica/go.mod", work_dir, &allowed).is_ok());
-        assert!(validate_read_path("/home/lvtao/codeagent/foo/bar.go", work_dir, &allowed).is_ok());
-    }
-
-    #[test]
-    fn validate_read_path_rejects_outside_both() {
-        let work_dir = Path::new("/tmp/work");
-        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
-        assert!(validate_read_path("/etc/passwd", work_dir, &allowed).is_err());
-        assert!(validate_read_path("/home/lvtao/other/foo.go", work_dir, &allowed).is_err());
-    }
-
-    #[test]
-    fn validate_read_path_rejects_relative_path_escape_attempt() {
-        let work_dir = Path::new("/tmp/work");
-        let allowed = vec![PathBuf::from("/home/lvtao/codeagent")];
-        // 相对路径 "../etc/passwd" 不走白名单分支(只在绝对路径生效),落 work_dir 校验被拒
-        assert!(validate_read_path("../etc/passwd", work_dir, &allowed).is_err());
     }
 
     #[tokio::test]
@@ -462,6 +477,6 @@ mod tests {
             "old_string": "nonexistent",
             "new_string": "rust"
         });
-        assert!(execute_edit(&input, dir.path()).await.is_err());
+        assert!(execute_edit(&input, dir.path(), &EffectivePolicy::default()).await.is_err());
     }
 }
