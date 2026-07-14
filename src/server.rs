@@ -98,12 +98,22 @@ pub async fn start() -> Result<(), AppError> {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(6);
+    // turn_timeout(step 1, env `FIXUS_TURN_TIMEOUT_SECS`,默认 600)统一给 turn 本身 + watchdog lease 用。
+    // 老 env `FIXUS_TURN_LEASE_SECS` 已并到这里(语义统一,默认值改 600 跟随)。
+    let turn_timeout = Duration::from_secs(
+        std::env::var("FIXUS_TURN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(600),
+    );
     // 业务指标(CR-4):orchestrator 与 /metrics handler 共享同一实例。
     let metrics = crate::metrics::Metrics::new();
     let orchestrator = Arc::new(
         Orchestrator::new(store.clone(), registry.clone(), (*token_publisher).clone())
             .with_retry_policy(crate::retry::RetryPolicy { max_attempts })
             .with_max_concurrent(max_concurrent)
+            .with_turn_timeout(turn_timeout)
             .with_metrics(metrics.clone()),
     );
     // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
@@ -112,14 +122,8 @@ pub async fn start() -> Result<(), AppError> {
     // 启动 broker lifecycle consumer(fixlet turn_execution_done → broker → fixus)
     orchestrator.spawn_lifecycle_consumer(&broker_addr, &namespace);
     // turn 看门狗(CR-6):回收派发后无终态的 turn(治 background recovery 等路径的卡死)。
-    // env:FIXUS_TURN_LEASE_SECS(默认 300,同 turn_timeout)/ FIXUS_WATCHDOG_INTERVAL_SECS(默认 60)
-    let turn_lease = Duration::from_secs(
-        std::env::var("FIXUS_TURN_LEASE_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(300),
-    );
+    // env:FIXUS_TURN_TIMEOUT_SECS(默认 600,同 turn_timeout)/ FIXUS_WATCHDOG_INTERVAL_SECS(默认 60)
+    let turn_lease = turn_timeout;
     let watchdog_interval = Duration::from_secs(
         std::env::var("FIXUS_WATCHDOG_INTERVAL_SECS")
             .ok()

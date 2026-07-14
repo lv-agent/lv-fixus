@@ -39,6 +39,11 @@ pub struct Orchestrator {
     store: Arc<dyn EventStore>,
     registry: Arc<TaskRegistry>,
     turn_timeout: Duration,
+    /// Timeout 自动延长次数(step 1,本轮改):每个 turn 最多延长 N 次再走 fail_turn_and_respond("timeout")。
+    /// 总 wall clock 上限 = `initial * (1 + f + f² + ... + f^N)`(累计 deadline)。
+    turn_max_extensions: u32,
+    /// Timeout 延长因子(默认 1.5 = 50%)。`compute_extension_deadlines` 用它推导每次延长的 deadline。
+    turn_extension_factor: f64,
     token_publisher: crate::stream::TokenPublisher,
     /// 失败重试预算(CR-3)
     retry_policy: RetryPolicy,
@@ -73,6 +78,25 @@ fn parse_turn_key(key: &str) -> Option<(String, i64)> {
     Some((tid.to_string(), turn.parse().ok()?))
 }
 
+/// 推导 cumulative wall-clock deadline 表(step 1 turn_timeout 延长机制)。
+///
+/// 返回从 turn 派发起算的累计 deadline 列表:`[initial, initial*f, initial*f², ...]`。
+/// 共 `max_extensions + 1` 个 deadline。例:`(600s, 3, 1.5)` = `[600s, 900s, 1350s, 2025s]`,
+/// total wall-clock ≈ 33.75 min。`run_turn_to_completion` 用此表做"到点延长"循环。
+pub fn compute_extension_deadlines(
+    initial: Duration,
+    max_extensions: u32,
+    factor: f64,
+) -> Vec<Duration> {
+    let mut deadlines = vec![initial];
+    let mut current = initial;
+    for _ in 0..max_extensions {
+        current = Duration::from_secs_f64(current.as_secs_f64() * factor);
+        deadlines.push(current);
+    }
+    deadlines
+}
+
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
@@ -82,7 +106,10 @@ impl Orchestrator {
         Self {
             store,
             registry,
-            turn_timeout: Duration::from_secs(300),
+            // 默认 600s + 延长 3 次(1.5x),total wall clock ≈ 33.75min;env FIXUS_TURN_TIMEOUT_SECS 可配。
+            turn_timeout: Duration::from_secs(600),
+            turn_max_extensions: 3,
+            turn_extension_factor: 1.5,
             token_publisher,
             retry_policy: RetryPolicy::default(),
             dispatcher: Arc::new(Dispatcher::new(6)),
@@ -103,6 +130,20 @@ impl Orchestrator {
     /// 覆盖默认 per-type 并发上限(CR-1+2)。默认 6。
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
         self.dispatcher = Arc::new(Dispatcher::new(max_concurrent));
+        self
+    }
+
+    /// 覆盖默认 turn wall-clock 超时(step 1)。默认 600s;server.rs 用 env 注入。
+    pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
+        self.turn_timeout = timeout;
+        self
+    }
+
+    /// 覆盖默认 turn timeout 延长策略(step 1)。`max=0` 退化为原一刀切;`factor > 1.0`。
+    pub fn with_turn_extensions(mut self, max: u32, factor: f64) -> Self {
+        assert!(factor > 1.0, "turn_extension_factor must be > 1.0");
+        self.turn_max_extensions = max;
+        self.turn_extension_factor = factor;
         self
     }
 
@@ -268,7 +309,7 @@ impl Orchestrator {
         self.resolve_task_type(task_id).await?;
 
         // 4. 创建 PendingTurn(含 oneshot channel,等待 broker task-end 兑现完成通知)
-        let (pending, result_rx) = PendingTurn::new(
+        let (pending, mut result_rx) = PendingTurn::new(
             task_id.to_string(),
             turn_id,
             redo_group.to_string(),
@@ -282,33 +323,84 @@ impl Orchestrator {
         self.enqueue_and_dispatch(task_id, turn_id, user_input, redo_group, 0, vec![])
             .await?;
 
-        // 7. 等待 Turn 完成（超时保护）
-        match tokio::time::timeout(self.turn_timeout, result_rx).await {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(_recv_err)) => {
-                // oneshot sender 被 dropped（fixlet 断开等）
-                tracing::error!(
-                    "session {}: pending turn channel closed unexpectedly",
-                    task_id
-                );
-                self.fail_turn_and_respond(
-                    task_id,
-                    turn_id,
-                    "channel_closed",
-                    "fixlet connection lost",
-                )
-                .await
-            }
-            Err(_elapsed) => {
-                // Turn 超时
-                tracing::warn!("session {}: turn {} timed out", task_id, turn_id);
-                self.fail_turn_and_respond(
-                    task_id,
-                    turn_id,
-                    "timeout",
-                    &format!("Turn timed out after {}s", self.turn_timeout.as_secs()),
-                )
-                .await
+        // 7. 等待 Turn 完成（带"到点延长"超时保护，step 1）
+        //    一刀切 wall-clock 对长任务误杀，本轮改为累计 deadline 表 + N 次延长。
+        //    max_extensions=0 时退化为原行为（单次 deadline = turn_timeout）。
+        let deadlines = compute_extension_deadlines(
+            self.turn_timeout,
+            self.turn_max_extensions,
+            self.turn_extension_factor,
+        );
+        let turn_start = std::time::Instant::now();
+        let total_attempts = deadlines.len();
+        let mut attempt = 0;
+
+        loop {
+            // deadlines[attempt] 是从 turn_start 起算的累计 wall-clock 截止时间
+            // (因 timeout() 接受"剩余时长"，这里用累计差值等价表达)。
+            let elapsed = turn_start.elapsed();
+            let remaining = deadlines[attempt].saturating_sub(elapsed);
+            tracing::info!(
+                "session {}: turn {} waiting (attempt {}/{}, elapsed={}s, next deadline=+{}s)",
+                task_id,
+                turn_id,
+                attempt + 1,
+                total_attempts,
+                elapsed.as_secs(),
+                deadlines[attempt].as_secs()
+            );
+
+            match tokio::time::timeout(remaining, &mut result_rx).await {
+                Ok(Ok(outcome)) => return Ok(outcome),
+                Ok(Err(_recv_err)) => {
+                    // oneshot sender 被 dropped（fixlet 断开等）
+                    tracing::error!(
+                        "session {}: pending turn channel closed unexpectedly",
+                        task_id
+                    );
+                    return self
+                        .fail_turn_and_respond(
+                            task_id,
+                            turn_id,
+                            "channel_closed",
+                            "fixlet connection lost",
+                        )
+                        .await;
+                }
+                Err(_elapsed) => {
+                    attempt += 1;
+                    if attempt >= total_attempts {
+                        // 最后一次延长也已耗尽 → kill
+                        tracing::warn!(
+                            "session {}: turn {} timed out after {} attempts (total {}s)",
+                            task_id,
+                            turn_id,
+                            total_attempts,
+                            turn_start.elapsed().as_secs()
+                        );
+                        return self
+                            .fail_turn_and_respond(
+                                task_id,
+                                turn_id,
+                                "timeout",
+                                &format!(
+                                    "Turn timed out after {} attempts ({}s total)",
+                                    total_attempts,
+                                    turn_start.elapsed().as_secs()
+                                ),
+                            )
+                            .await;
+                    }
+                    tracing::info!(
+                        "session {}: turn {} extending timeout (attempt {}/{}, next deadline=+{}s)",
+                        task_id,
+                        turn_id,
+                        attempt + 1,
+                        total_attempts,
+                        deadlines[attempt].as_secs()
+                    );
+                    // 继续循环，下一次用 deadlines[attempt]（已是累计新 deadline）
+                }
             }
         }
     }
@@ -347,6 +439,8 @@ impl Orchestrator {
             store: self.store.clone(),
             registry: self.registry.clone(),
             turn_timeout: self.turn_timeout,
+            turn_max_extensions: self.turn_max_extensions,
+            turn_extension_factor: self.turn_extension_factor,
             token_publisher: self.token_publisher.clone(),
             retry_policy: self.retry_policy,
             dispatcher: self.dispatcher.clone(),
@@ -381,6 +475,8 @@ impl Orchestrator {
         let store = self.store.clone();
         let registry = self.registry.clone();
         let turn_timeout = self.turn_timeout;
+        let turn_max_extensions = self.turn_max_extensions;
+        let turn_extension_factor = self.turn_extension_factor;
         let token_publisher = self.token_publisher.clone();
         let retry_policy = self.retry_policy;
         let retry_attempts = self.retry_attempts.clone();
@@ -409,6 +505,8 @@ impl Orchestrator {
                 store: store.clone(),
                 registry: registry.clone(),
                 turn_timeout,
+                turn_max_extensions,
+                turn_extension_factor,
                 token_publisher,
                 retry_policy,
                 dispatcher,
@@ -441,7 +539,7 @@ impl Orchestrator {
                     redo_ctx.redo_group
                 );
 
-                let (pending, result_rx) = PendingTurn::new(
+                let (pending, mut result_rx) = PendingTurn::new(
                     task_id.clone(),
                     redo_ctx.turn_id,
                     redo_ctx.redo_group.clone(),
@@ -482,54 +580,86 @@ impl Orchestrator {
                     continue;
                 }
 
-                match tokio::time::timeout(turn_timeout, result_rx).await {
-                    Ok(Ok(TurnOutcome::Completed { turn_id, .. })) => {
-                        tracing::info!(
-                            "session {}: redo turn {} succeeded",
-                            task_id,
-                            turn_id
-                        );
-                        redo_success += 1;
-                    }
-                    Ok(Ok(TurnOutcome::Failed {
-                        turn_id,
-                        error_type,
-                        ..
-                    })) => {
-                        tracing::error!(
-                            "session {}: redo turn {} failed: {}",
-                            task_id,
+                // 延长式 wall-clock 超时(同 run_turn_to_completion,step 1)
+                let deadlines = compute_extension_deadlines(
+                    turn_timeout,
+                    turn_max_extensions,
+                    turn_extension_factor,
+                );
+                let redo_start = std::time::Instant::now();
+                let total_attempts = deadlines.len();
+                let mut attempt = 0;
+
+                loop {
+                    let elapsed = redo_start.elapsed();
+                    let remaining = deadlines[attempt].saturating_sub(elapsed);
+                    match tokio::time::timeout(remaining, &mut result_rx).await {
+                        Ok(Ok(TurnOutcome::Completed { turn_id, .. })) => {
+                            tracing::info!(
+                                "session {}: redo turn {} succeeded",
+                                task_id,
+                                turn_id
+                            );
+                            redo_success += 1;
+                            break;
+                        }
+                        Ok(Ok(TurnOutcome::Failed {
                             turn_id,
-                            error_type
-                        );
-                        redo_failed += 1;
-                    }
-                    Ok(Ok(TurnOutcome::Timeout { .. })) | Err(_) => {
-                        tracing::error!(
-                            "session {}: redo turn {} timed out",
-                            task_id,
-                            redo_ctx.turn_id
-                        );
-                        let _ = orch
-                            .fail_turn_and_respond(
-                                &task_id,
+                            error_type,
+                            ..
+                        })) => {
+                            tracing::error!(
+                                "session {}: redo turn {} failed: {}",
+                                task_id,
+                                turn_id,
+                                error_type
+                            );
+                            redo_failed += 1;
+                            break;
+                        }
+                        Ok(Ok(TurnOutcome::Timeout { .. })) | Err(_) => {
+                            attempt += 1;
+                            if attempt >= total_attempts {
+                                tracing::error!(
+                                    "session {}: redo turn {} timed out after {} attempts (total {}s)",
+                                    task_id,
+                                    redo_ctx.turn_id,
+                                    total_attempts,
+                                    redo_start.elapsed().as_secs()
+                                );
+                                let _ = orch
+                                    .fail_turn_and_respond(
+                                        &task_id,
+                                        redo_ctx.turn_id,
+                                        "redo_timeout",
+                                        "Redo timed out",
+                                    )
+                                    .await;
+                                redo_failed += 1;
+                                break;
+                            }
+                            tracing::info!(
+                                "session {}: redo turn {} extending timeout (attempt {}/{}, next deadline=+{}s)",
+                                task_id,
                                 redo_ctx.turn_id,
-                                "redo_timeout",
-                                "Redo timed out",
-                            )
-                            .await;
-                        redo_failed += 1;
-                    }
-                    Ok(Err(_)) => {
-                        let _ = orch
-                            .fail_turn_and_respond(
-                                &task_id,
-                                redo_ctx.turn_id,
-                                "channel_closed",
-                                "fixlet connection lost during redo",
-                            )
-                            .await;
-                        redo_failed += 1;
+                                attempt + 1,
+                                total_attempts,
+                                deadlines[attempt].as_secs()
+                            );
+                            // 继续循环
+                        }
+                        Ok(Err(_)) => {
+                            let _ = orch
+                                .fail_turn_and_respond(
+                                    &task_id,
+                                    redo_ctx.turn_id,
+                                    "channel_closed",
+                                    "fixlet connection lost during redo",
+                                )
+                                .await;
+                            redo_failed += 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -2082,6 +2212,66 @@ mod tests {
             assert_eq!(r, 0, "fresh 不该回收");
         }
         report_perf("watchdog scan (5000 in-flight)", "µs", us);
+    }
+
+    // ── compute_extension_deadlines (step 1,turn_timeout 延长机制) ──
+
+    #[test]
+    fn deadlines_zero_extensions_is_initial_only() {
+        assert_eq!(
+            compute_extension_deadlines(Duration::from_secs(300), 0, 1.5),
+            vec![Duration::from_secs(300)],
+            "max_extensions=0 退化为原一刀切"
+        );
+    }
+
+    #[test]
+    fn deadlines_three_extensions_compound_cumulative() {
+        // 300 → 450 → 675 → 1012.5(300 * 1.5³ = 1012.5,保留小数)
+        assert_eq!(
+            compute_extension_deadlines(Duration::from_secs(300), 3, 1.5),
+            vec![
+                Duration::from_secs(300),
+                Duration::from_secs(450),
+                Duration::from_secs(675),
+                Duration::from_secs_f64(1012.5),
+            ],
+            "300s 起步 + 3 次延长累计 deadline 表"
+        );
+    }
+
+    #[test]
+    fn deadlines_default_600s_three_extensions_total_33min() {
+        // 用户拍板的默认值:600s + 3 次 1.5x → cumulative = [600, 900, 1350, 2025]
+        // 最后 deadline 2025s ≈ 33.75min(从这里开始 fail)。
+        let deadlines = compute_extension_deadlines(Duration::from_secs(600), 3, 1.5);
+        assert_eq!(
+            deadlines,
+            vec![
+                Duration::from_secs(600),
+                Duration::from_secs(900),
+                Duration::from_secs(1350),
+                Duration::from_secs(2025),
+            ]
+        );
+        assert_eq!(deadlines.last().unwrap().as_secs(), 2025);
+    }
+
+    #[test]
+    fn deadlines_one_extension_compounds_by_factor() {
+        assert_eq!(
+            compute_extension_deadlines(Duration::from_secs(100), 1, 1.5),
+            vec![Duration::from_secs(100), Duration::from_secs(150)],
+            "单次延长 = 100 * 1.5 = 150"
+        );
+    }
+
+    #[test]
+    fn deadlines_len_equals_max_extensions_plus_one() {
+        for max in 0..=5 {
+            let d = compute_extension_deadlines(Duration::from_secs(60), max, 1.5);
+            assert_eq!(d.len(), (max + 1) as usize, "max={}", max);
+        }
     }
 
 }
