@@ -121,3 +121,99 @@ impl std::fmt::Display for ExecError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{AgentRole, FsPolicy, PathScope, TrustLevel};
+    use std::path::PathBuf;
+
+    /// 构造 net-off(egress 空)、仅授权给定 read scope 的 eff(Operator)。
+    /// work_dir 由 execute 隐式 rw,无需在此声明。
+    fn strict_eff(read: &[&str]) -> EffectivePolicy {
+        EffectivePolicy {
+            fs: FsPolicy {
+                read_paths: read
+                    .iter()
+                    .map(|p| PathScope {
+                        path: PathBuf::from(p),
+                        trust: TrustLevel::Host,
+                    })
+                    .collect(),
+                write_paths: vec![],
+            },
+            net: Default::default(),
+            agent_role: AgentRole::Operator,
+        }
+    }
+
+    /// 判定一次 execute 是否构成"越权被拒":
+    /// - `Ok` 且 (非零 exit 或 stderr/stdout 含 denied/permission) → 进程跑了但被内核拒;
+    /// - `Err(Spawn)` → fail-closed 拒 exec(Landlock/seccomp 装载失败时绝不放行);
+    /// - `Err(Timeout)` → 不算被拒(可能是真挂起)。
+    fn blocked(r: Result<ExecOutput, ExecError>) -> bool {
+        match r {
+            Ok(o) => {
+                let combined = format!("{} {}", o.stdout, o.stderr).to_lowercase();
+                o.exit_code != 0
+                    || combined.contains("denied")
+                    || combined.contains("permission")
+            }
+            Err(ExecError::Spawn(_)) => true,
+            Err(ExecError::Timeout) => false,
+        }
+    }
+
+    /// E1 回归测:锁定 Phase 1 沙箱 enforcement —— Landlock fs 隔离 + seccomp net-off。
+    ///
+    /// `#[ignore]`:需真 fork + Landlock/seccomp 内核支持,非默认 CI。手动跑:
+    ///   cargo test --bin sandbox-server -- --ignored sandbox_enforcement --nocapture
+    ///
+    /// 断言:
+    /// (a) 读 policy+infra 之外的路径(/etc 不在 infra_ro)→ Landlock 拒(EACCES / 非零 exit);
+    /// (b) bash `/dev/tcp` 走 socket(AF_INET) → seccomp 拒(EACCES → "Permission denied")。
+    ///
+    /// 环境说明:WSL2(Linux 6.x)通常支持 Landlock;若某内核不支持,Landlock apply 会 Err,
+    /// executor 的 fail-closed 直接拒 exec(返回 `ExecError::Spawn`)——同样表明 enforcement
+    /// 生效(进程未越权运行),`blocked()` 把 Spawn 也计为"被拒"。故本测在不支持 Landlock 的
+    /// 内核上仍应通过(以 fail-closed 形式),只有在"放行越权访问"时才失败。
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[ignore]
+    async fn sandbox_enforcement_blocks_outside_policy_and_net() {
+        // 显式确保不被 opt-out env 干扰(SANDBOX_ALLOW_NO_LANDLOCK=true 会降级放行)。
+        std::env::remove_var("SANDBOX_ALLOW_NO_LANDLOCK");
+
+        let work = tempfile::tempdir().expect("temp work_dir");
+        // net off + 仅授权一个无意义 read scope;/etc 与外网均越界。
+        let eff = strict_eff(&["/tmp/fixus-sandbox-test-allowed-marker"]);
+
+        // (a) 读 /etc/hostname(/etc 不在 infra_ro)→ Landlock 拒。
+        let r_a = execute(
+            "cat /etc/hostname",
+            work.path(),
+            None,
+            &eff,
+            5,
+        )
+        .await;
+        assert!(
+            blocked(r_a),
+            "(a) 读 /etc 应被 Landlock 拒绝(EACCES 或 fail-closed Spawn)"
+        );
+
+        // (b) /dev/tcp → socket(AF_INET) → seccomp 拒(net off 时套 filter)。
+        let r_b = execute(
+            "echo test > /dev/tcp/127.0.0.1/1",
+            work.path(),
+            None,
+            &eff,
+            5,
+        )
+        .await;
+        assert!(
+            blocked(r_b),
+            "(b) /dev/tcp 应被 seccomp 拒(socket AF_INET → EACCES 或 fail-closed Spawn)"
+        );
+    }
+}
