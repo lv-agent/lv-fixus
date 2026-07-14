@@ -266,6 +266,57 @@ impl From<&ToolSpec> for ToolDef {
     }
 }
 
+// ── argv element parsing (spec §5.2) ────────────────────────────────────
+
+/// Parse one argv element string into an [`ArgvPart`] (spec §5.2).
+///
+/// Brace-wrapped elements (`{...}`) are placeholders: `{name}`→`Arg`,
+/// `{?name:value}`→`Flag`. Malformed brace-wrapped elements →
+/// [`CatalogError::UnknownPlaceholder`] (fail loud at catalog load). Everything
+/// else → `Literal` verbatim, including mid-string braces (e.g. `--out={f}`).
+///
+/// This is security-adjacent: the brace-wrapped discriminator + fail-loud rule
+/// underpins the injection-safety model, so the matching must stay exact.
+pub fn parse_argv_element(s: &str) -> Result<ArgvPart, CatalogError> {
+    // Brace-wrapped iff it starts with `{` AND ends with `}`. By construction
+    // that requires ≥2 bytes; both delimiters are ASCII so byte-index slicing
+    // at 1 and len-1 is always on UTF-8 char boundaries (safe for any content).
+    if s.starts_with('{') && s.ends_with('}') {
+        let inner = &s[1..s.len() - 1];
+        if let Some(rest) = inner.strip_prefix('?') {
+            // Flag candidate: {?name:value}. Split at the FIRST ':'; the value
+            // is everything after it (≥1 char; may contain '=' or further ':').
+            match rest.split_once(':') {
+                Some((name, value)) if is_ident(name) && !value.is_empty() => {
+                    Ok(ArgvPart::Flag(name.into(), value.into()))
+                }
+                _ => Err(CatalogError::UnknownPlaceholder(s.into())),
+            }
+        } else {
+            // Arg candidate: {name}. Must be a valid identifier.
+            if is_ident(inner) {
+                Ok(ArgvPart::Arg(inner.into()))
+            } else {
+                Err(CatalogError::UnknownPlaceholder(s.into()))
+            }
+        }
+    } else {
+        // Not brace-wrapped → whole string literal verbatim.
+        Ok(ArgvPart::Literal(s.into()))
+    }
+}
+
+/// Identifier predicate matching `[A-Za-z_][A-Za-z0-9_]*` (non-empty).
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false, // empty or invalid first char
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +426,44 @@ mod tests {
         assert_eq!(d.name, "fixus_bash");
         assert_eq!(d.description, s.description);
         assert_eq!(d.input_schema, s.input_schema);
+    }
+
+    #[test]
+    fn parse_argv_literal_bare() {
+        assert_eq!(parse_argv_element("jq").unwrap(), ArgvPart::Literal("jq".into()));
+        assert_eq!(parse_argv_element("--color").unwrap(), ArgvPart::Literal("--color".into()));
+        assert_eq!(parse_argv_element("repos").unwrap(), ArgvPart::Literal("repos".into()));
+    }
+
+    #[test]
+    fn parse_argv_arg_placeholder() {
+        assert_eq!(parse_argv_element("{filter}").unwrap(), ArgvPart::Arg("filter".into()));
+        assert_eq!(parse_argv_element("{file}").unwrap(), ArgvPart::Arg("file".into()));
+        assert_eq!(parse_argv_element("{_under}").unwrap(), ArgvPart::Arg("_under".into()));
+        assert_eq!(parse_argv_element("{a1b2}").unwrap(), ArgvPart::Arg("a1b2".into()));
+    }
+
+    #[test]
+    fn parse_argv_flag_placeholder() {
+        assert_eq!(parse_argv_element("{?raw:-r}").unwrap(), ArgvPart::Flag("raw".into(), "-r".into()));
+        // value may contain '='
+        assert_eq!(parse_argv_element("{?color:--color=always}").unwrap(),
+                   ArgvPart::Flag("color".into(), "--color=always".into()));
+    }
+
+    #[test]
+    fn parse_argv_rejects_malformed_placeholder() {
+        assert!(parse_argv_element("{}").is_err());          // empty
+        assert!(parse_argv_element("{1bad}").is_err());      // name starts with digit
+        assert!(parse_argv_element("{?n}").is_err());        // flag missing value
+        assert!(parse_argv_element("{?n:}").is_err());       // flag empty value
+        assert!(parse_argv_element("{ bad }").is_err());     // spaces not valid identifier
+    }
+
+    #[test]
+    fn parse_argv_mid_brace_is_literal() {
+        // NOT brace-wrapped (doesn't start with {) → whole string literal, braces preserved
+        assert_eq!(parse_argv_element("--out={f}").unwrap(), ArgvPart::Literal("--out={f}".into()));
+        assert_eq!(parse_argv_element("a{b}c").unwrap(), ArgvPart::Literal("a{b}c".into()));
     }
 }
