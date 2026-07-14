@@ -97,6 +97,44 @@ pub fn compute_extension_deadlines(
     deadlines
 }
 
+/// 构造 turn-begin 派发 payload(fixus → fixlet,发布到 `task-begin-{task_type}`)。
+///
+/// Phase 1 沙箱边界:带上 `effective_policy`(task 创建时 resolve 出,经 broker event
+/// 透传给 sandbox enforcer)。保留全部既有字段(type/session_id/turn_id/input/context/
+/// tools/redo_group/redo_count),仅新增 effective_policy。纯函数,便于单测。
+pub fn build_turn_begin_payload(
+    task_id: &str,
+    turn_id: i64,
+    user_input: &str,
+    summary: &str,
+    messages: &[crate::models::Message],
+    redo_group: &str,
+    redo_count: i32,
+    effective_policy: Option<&crate::policy::EffectivePolicy>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "execute_turn",
+        "session_id": task_id,
+        "turn_id": turn_id,
+        "input": {"user_input": user_input},
+        "context": {
+            "summary": summary,
+            "messages": messages,
+        },
+        "tools": [
+            {"name":"fixus_Bash","description":"Execute a shell command (via fixus sandbox)","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"description":{"type":"string","description":"Brief description"}},"required":["command"]}},
+            {"name":"fixus_Read","description":"Read a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"]}},
+            {"name":"fixus_Write","description":"Write to a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}},
+            {"name":"fixus_Edit","description":"Edit a file by replacing a string","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["file_path","old_string","new_string"]}},
+            {"name":"fixus_Glob","description":"Find files matching a pattern","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
+            {"name":"fixus_Grep","description":"Search for a pattern in files","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}
+        ],
+        "redo_group": redo_group,
+        "redo_count": redo_count,
+        "effective_policy": effective_policy,
+    })
+}
+
 impl Orchestrator {
     pub fn new(
         store: Arc<dyn EventStore>,
@@ -725,26 +763,23 @@ impl Orchestrator {
             cached_input
         };
 
-        let msg = serde_json::json!({
-            "type": "execute_turn",
-            "session_id": task_id,
-            "turn_id": turn_id,
-            "input": {"user_input": &user_input_with_cache},
-            "context": {
-                "summary": ctx.summary,
-                "messages": ctx.messages,
-            },
-            "tools": [
-                {"name":"fixus_Bash","description":"Execute a shell command (via fixus sandbox)","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to execute"},"description":{"type":"string","description":"Brief description"}},"required":["command"]}},
-                {"name":"fixus_Read","description":"Read a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["file_path"]}},
-                {"name":"fixus_Write","description":"Write to a file (via fixus sandbox)","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}},
-                {"name":"fixus_Edit","description":"Edit a file by replacing a string","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["file_path","old_string","new_string"]}},
-                {"name":"fixus_Glob","description":"Find files matching a pattern","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
-                {"name":"fixus_Grep","description":"Search for a pattern in files","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}}
-            ],
-            "redo_group": redo_group,
-            "redo_count": redo_count,
-        });
+        // Phase 1 沙箱边界:取 task 的 effective_policy(task 创建时 resolve 出,投影缓存已 warm)。
+        // 投影 lag/未找到 → None(fail-closed:sandbox 收 null → 严默认 work_dir-only)。
+        let effective_policy = match self.store.get_task(task_id).await {
+            Ok(Some(t)) => t.effective_policy,
+            _ => None,
+        };
+
+        let msg = build_turn_begin_payload(
+            task_id,
+            turn_id,
+            &user_input_with_cache,
+            &ctx.summary,
+            &ctx.messages,
+            redo_group,
+            redo_count,
+            effective_policy.as_ref(),
+        );
 
         // publish turn.begin(execute_turn) 到 `task-begin-{task_type}`
         // pull-based: fixlet 竞争消费该 stream 认领 turn,消费后启动 agent。
@@ -1598,6 +1633,31 @@ mod tests {
             created_at: chrono::Utc::now(),
             created_by: "test".into(),
         }
+    }
+
+    #[test]
+    fn turn_begin_payload_carries_effective_policy() {
+        let eff = crate::policy::EffectivePolicy::default();
+        let p = build_turn_begin_payload("t1", 7, "hi", "sum", &[], "rg1", 2, Some(&eff));
+        // 既有字段保留
+        assert_eq!(p["type"], "execute_turn");
+        assert_eq!(p["session_id"], "t1");
+        assert_eq!(p["turn_id"], 7);
+        assert_eq!(p["input"]["user_input"], "hi");
+        assert_eq!(p["context"]["summary"], "sum");
+        assert_eq!(p["redo_group"], "rg1");
+        assert_eq!(p["redo_count"], 2);
+        assert_eq!(p["tools"].as_array().unwrap().len(), 6, "tools 数组完整保留");
+        // Phase 1 新增:effective_policy 在场(agent_role 默认 reader)
+        assert!(p.get("effective_policy").is_some());
+        assert_eq!(p["effective_policy"]["agent_role"], "reader");
+    }
+
+    #[test]
+    fn turn_begin_payload_null_policy_when_absent() {
+        // effective_policy 缺省 → null(sandbox fail-closed 严默认)
+        let p = build_turn_begin_payload("t1", 1, "hi", "", &[], "rg1", 0, None);
+        assert!(p["effective_policy"].is_null());
     }
 
     async fn setup() -> (LogdbdEventStore, tempfile::TempDir) {
