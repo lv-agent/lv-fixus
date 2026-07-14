@@ -122,7 +122,7 @@ pub fn path_within(p: &std::path::Path, scope: &PathScope) -> bool {
 pub fn intersect_fs(a: &FsPolicy, b: &FsPolicy) -> FsPolicy {
     fn intersect_set(a: &[PathScope], b: &[PathScope]) -> Vec<PathScope> {
         let mut out: Vec<PathScope> = Vec::new();
-        let mut push_if_new = |out: &mut Vec<PathScope>, s: PathScope| {
+        let push_if_new = |out: &mut Vec<PathScope>, s: PathScope| {
             if !out.iter().any(|e| e.path == s.path) {
                 out.push(s);
             }
@@ -223,6 +223,22 @@ pub fn validate_subset(child: &CapabilityPolicy, parent: &CapabilityPolicy) -> R
             .collect(),
     };
     if v.is_empty() { Ok(()) } else { Err(v) }
+}
+
+/// 解析 Operator policy TOML(部署期 fixus host 文件)。
+/// 空/缺字段 → 默认(严:仅 work_dir,无外网)。非法 TOML → Err(fixus 启动 fail-closed)。
+pub fn parse_operator_toml(s: &str) -> Result<CapabilityPolicy, String> {
+    if s.trim().is_empty() {
+        return Ok(CapabilityPolicy::default());
+    }
+    let policy: CapabilityPolicy = toml::from_str(s).map_err(|e| format!("operator policy TOML: {}", e))?;
+    let norm = |scopes: Vec<PathScope>| -> Vec<PathScope> {
+        scopes.into_iter().map(|mut s| { s.path = normalize_path(&s.path); s }).collect()
+    };
+    Ok(CapabilityPolicy {
+        fs: FsPolicy { read_paths: norm(policy.fs.read_paths), write_paths: norm(policy.fs.write_paths) },
+        net: policy.net,
+    })
 }
 
 #[cfg(test)]
@@ -416,5 +432,34 @@ mod tests {
         let child = policy(&[], &[], &["pypi.org", "evil.com"]);
         let err = validate_subset(&child, &parent).unwrap_err();
         assert_eq!(err.net_violations, vec!["evil.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_operator_toml_basic() {
+        let toml = r#"
+[fs]
+[[fs.read_paths]]
+path = "/home/lvtao/codeagent"
+trust = "host"
+
+[net]
+egress = []
+"#;
+        let p = parse_operator_toml(toml).unwrap();
+        assert_eq!(p.fs.read_paths[0].path, PathBuf::from("/home/lvtao/codeagent"));
+        assert_eq!(p.fs.read_paths[0].trust, TrustLevel::Host);
+        assert!(p.net.egress.is_empty());
+    }
+
+    #[test]
+    fn parse_operator_toml_empty_is_strict() {
+        let p = parse_operator_toml("").unwrap();
+        assert!(p.fs.read_paths.is_empty());
+        assert!(p.net.egress.is_empty());
+    }
+
+    #[test]
+    fn parse_operator_toml_malformed_err() {
+        assert!(parse_operator_toml("not = valid = toml = {{{").is_err());
     }
 }
