@@ -97,6 +97,20 @@ pub fn compute_extension_deadlines(
     deadlines
 }
 
+/// 计算"到点延长"循环的下一次等待参数(step 1,纯函数,便于单测 + 去重两处循环)。
+///
+/// - `remaining` = `deadlines[attempt]` 减去已 `elapsed`(超出则 saturating 归零)。
+///   `attempt` 越界时 clamp 到末位 deadline —— 但此时 `exhausted=true`,调用方应已
+///   走终态失败分支,`remaining` 不会被使用(行为等价于旧的 `deadlines[attempt]` 下标取值)。
+/// - `exhausted` = `attempt >= deadlines.len()`(即所有延长已耗尽,该 fail 了)。
+///
+/// `run_turn_to_completion` 与 background-recovery redo 循环共享此逻辑,避免两份手写
+/// 的 `deadlines[attempt].saturating_sub(elapsed)` + `attempt >= total_attempts`。
+pub fn next_remaining(deadlines: &[Duration], attempt: usize, elapsed: Duration) -> (Duration, bool) {
+    let idx = attempt.min(deadlines.len().saturating_sub(1));
+    (deadlines[idx].saturating_sub(elapsed), attempt >= deadlines.len())
+}
+
 /// 构造 turn-begin 派发 payload(fixus → fixlet,发布到 `task-begin-{task_type}`)。
 ///
 /// Phase 1 沙箱边界:带上 `effective_policy`(task 创建时 resolve 出,经 broker event
@@ -377,7 +391,10 @@ impl Orchestrator {
             // deadlines[attempt] 是从 turn_start 起算的累计 wall-clock 截止时间
             // (因 timeout() 接受"剩余时长"，这里用累计差值等价表达)。
             let elapsed = turn_start.elapsed();
-            let remaining = deadlines[attempt].saturating_sub(elapsed);
+            // attempt < total_attempts 始终成立(耗尽会在上一轮 Err 分支 return),故
+            // next_remaining 在此返回的 exhausted 恒为 false;remaining 等价旧的
+            // deadlines[attempt].saturating_sub(elapsed)。经 helper 去重两处循环。
+            let (remaining, _already_exhausted) = next_remaining(&deadlines, attempt, elapsed);
             tracing::info!(
                 "session {}: turn {} waiting (attempt {}/{}, elapsed={}s, next deadline=+{}s)",
                 task_id,
@@ -407,7 +424,8 @@ impl Orchestrator {
                 }
                 Err(_elapsed) => {
                     attempt += 1;
-                    if attempt >= total_attempts {
+                    let (_, exhausted) = next_remaining(&deadlines, attempt, elapsed);
+                    if exhausted {
                         // 最后一次延长也已耗尽 → kill
                         tracing::warn!(
                             "session {}: turn {} timed out after {} attempts (total {}s)",
@@ -630,7 +648,8 @@ impl Orchestrator {
 
                 loop {
                     let elapsed = redo_start.elapsed();
-                    let remaining = deadlines[attempt].saturating_sub(elapsed);
+                    // 同 run_turn_to_completion:经 next_remaining 去重 remaining/exhausted 计算。
+                    let (remaining, _already_exhausted) = next_remaining(&deadlines, attempt, elapsed);
                     match tokio::time::timeout(remaining, &mut result_rx).await {
                         Ok(Ok(TurnOutcome::Completed { turn_id, .. })) => {
                             tracing::info!(
@@ -657,7 +676,8 @@ impl Orchestrator {
                         }
                         Ok(Ok(TurnOutcome::Timeout { .. })) | Err(_) => {
                             attempt += 1;
-                            if attempt >= total_attempts {
+                            let (_, exhausted) = next_remaining(&deadlines, attempt, elapsed);
+                            if exhausted {
                                 tracing::error!(
                                     "session {}: redo turn {} timed out after {} attempts (total {}s)",
                                     task_id,
@@ -2332,6 +2352,23 @@ mod tests {
             let d = compute_extension_deadlines(Duration::from_secs(60), max, 1.5);
             assert_eq!(d.len(), (max + 1) as usize, "max={}", max);
         }
+    }
+
+    // ── next_remaining (step 1,延长循环去重纯函数) ──
+
+    #[test]
+    fn next_remaining_not_exhausted() {
+        let d = vec![Duration::from_secs(100), Duration::from_secs(150)];
+        let (rem, ex) = next_remaining(&d, 0, Duration::from_secs(30));
+        assert!(!ex);
+        assert_eq!(rem, Duration::from_secs(70));
+    }
+
+    #[test]
+    fn next_remaining_exhausted_after_last() {
+        let d = vec![Duration::from_secs(100)];
+        let (_, ex) = next_remaining(&d, 1, Duration::from_secs(100));
+        assert!(ex);
     }
 
 }

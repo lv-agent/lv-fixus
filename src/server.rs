@@ -134,6 +134,18 @@ pub async fn start() -> Result<(), AppError> {
             .filter(|&n| n >= 1)
             .unwrap_or(600),
     );
+    // turn timeout 延长策略(step 1):到点延长 N 次(每次 ×factor),总 wall clock 上限 =
+    // initial * (1 + f + f² + … + f^N)。env `FIXUS_TURN_MAX_EXTENSIONS`(默认 3)/
+    // `FIXUS_TURN_EXTENSION_FACTOR`(默认 1.5,须 >1.0,否则回落默认)。
+    let turn_max_extensions = std::env::var("FIXUS_TURN_MAX_EXTENSIONS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+    let turn_extension_factor = std::env::var("FIXUS_TURN_EXTENSION_FACTOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&f| f > 1.0)
+        .unwrap_or(1.5);
     // 业务指标(CR-4):orchestrator 与 /metrics handler 共享同一实例。
     let metrics = crate::metrics::Metrics::new();
     let orchestrator = Arc::new(
@@ -141,6 +153,7 @@ pub async fn start() -> Result<(), AppError> {
             .with_retry_policy(crate::retry::RetryPolicy { max_attempts })
             .with_max_concurrent(max_concurrent)
             .with_turn_timeout(turn_timeout)
+            .with_turn_extensions(turn_max_extensions, turn_extension_factor)
             .with_metrics(metrics.clone()),
     );
     // 启动 broker result consumer(对称架构:sandbox→broker→fixus,无 HTTP 直连)
