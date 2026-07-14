@@ -184,6 +184,47 @@ pub fn resolve_effective(
     )
 }
 
+/// 越权检测结果:列出 child 中不被 parent 覆盖的 scope / egress host。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubsetViolation {
+    pub fs_read_violations: Vec<PathBuf>,
+    pub fs_write_violations: Vec<PathBuf>,
+    pub net_violations: Vec<String>,
+}
+
+impl SubsetViolation {
+    pub fn is_empty(&self) -> bool {
+        self.fs_read_violations.is_empty()
+            && self.fs_write_violations.is_empty()
+            && self.net_violations.is_empty()
+    }
+}
+
+/// 校验 `child ⊆ parent`(fs read/write 路径段前缀 + net host 精确)。
+/// 用于信任边界:task⊆tenant(创建时)、tenant⊆operator(API 设置时)。
+/// 越权 → Err(列出违规项),由调用方硬失败(400)。
+pub fn validate_subset(child: &CapabilityPolicy, parent: &CapabilityPolicy) -> Result<(), SubsetViolation> {
+    let check_paths = |child_scopes: &[PathScope], parent_scopes: &[PathScope]| -> Vec<PathBuf> {
+        child_scopes
+            .iter()
+            .filter(|c| !parent_scopes.iter().any(|p| path_within(&c.path, p)))
+            .map(|c| normalize_path(&c.path))
+            .collect()
+    };
+    let v = SubsetViolation {
+        fs_read_violations: check_paths(&child.fs.read_paths, &parent.fs.read_paths),
+        fs_write_violations: check_paths(&child.fs.write_paths, &parent.fs.write_paths),
+        net_violations: child
+            .net
+            .egress
+            .iter()
+            .filter(|cr| !parent.net.egress.iter().any(|pr| pr == *cr))
+            .map(|r| r.host.clone())
+            .collect(),
+    };
+    if v.is_empty() { Ok(()) } else { Err(v) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +393,28 @@ mod tests {
         let eff = resolve_effective(&op, &CapabilityPolicy::default(), &CapabilityPolicy::default(), AgentRole::Reader);
         assert!(eff.net.egress.is_empty());
         assert!(eff.fs.write_paths.is_empty());
+    }
+
+    #[test]
+    fn validate_subset_child_within_parent_ok() {
+        let parent = policy(&["/home/x"], &[], &[]);
+        let child = policy(&["/home/x/proj"], &[], &[]);
+        assert!(validate_subset(&child, &parent).is_ok());
+    }
+
+    #[test]
+    fn validate_subset_child_exceeds_parent_err() {
+        let parent = policy(&["/home/x/proj"], &[], &[]);
+        let child = policy(&["/home/x/other"], &[], &[]); // ⊄ parent
+        let err = validate_subset(&child, &parent).unwrap_err();
+        assert!(err.fs_read_violations.iter().any(|p| p == &PathBuf::from("/home/x/other")));
+    }
+
+    #[test]
+    fn validate_subset_net_rule_not_in_parent_err() {
+        let parent = policy(&[], &[], &["pypi.org"]);
+        let child = policy(&[], &[], &["pypi.org", "evil.com"]);
+        let err = validate_subset(&child, &parent).unwrap_err();
+        assert_eq!(err.net_violations, vec!["evil.com".to_string()]);
     }
 }
