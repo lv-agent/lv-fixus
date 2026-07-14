@@ -109,6 +109,14 @@ pub fn normalize_path(path: &std::path::Path) -> PathBuf {
     parts.iter().collect()
 }
 
+/// `p` 是否落在 `scope` 的递归 beneath 内(按路径段前缀匹配)。
+/// 双方先 normalize,再用 `starts_with`(Path starts_with 按段匹配,非字符串前缀)。
+pub fn path_within(p: &std::path::Path, scope: &PathScope) -> bool {
+    let norm_p = normalize_path(p);
+    let norm_scope = normalize_path(&scope.path);
+    norm_p == norm_scope || norm_p.starts_with(&norm_scope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +151,20 @@ mod tests {
     #[test]
     fn normalize_handles_dotdot() {
         assert_eq!(normalize_path(std::path::Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn path_within_prefix_recursive() {
+        let scope = PathScope { path: PathBuf::from("/home/x/proj"), trust: TrustLevel::Host };
+        assert!(path_within(std::path::Path::new("/home/x/proj"), &scope));
+        assert!(path_within(std::path::Path::new("/home/x/proj/sub/f.go"), &scope));
+        assert!(!path_within(std::path::Path::new("/home/x/other"), &scope));
+        assert!(!path_within(std::path::Path::new("/home/x/proj-evil"), &scope), "前缀必须按路径段,不是字符串前缀");
+    }
+
+    #[test]
+    fn path_within_normalizes() {
+        let scope = PathScope { path: PathBuf::from("/a/b"), trust: TrustLevel::Host };
+        assert!(path_within(std::path::Path::new("/a/b/../b/c"), &scope));
     }
 }
