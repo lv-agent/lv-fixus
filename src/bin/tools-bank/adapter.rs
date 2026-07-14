@@ -239,6 +239,26 @@ pub fn sandbox_payload(
     })
 }
 
+/// 构造 tool-invoke event 的 metadata(含 effective_policy,若有)。
+///
+/// `task_id` / `step_id` / `event_type` 恒在;`effective_policy` 仅当 `Some` 时
+/// 以序列化 JSON 字符串写入(sandbox-server 侧 `serde_json::from_str` 反序列化)。
+/// 抽纯函数便于单测 + 让 `SandboxAdapter::invoke` 聚焦副作用(broker produce)。
+pub fn build_invoke_meta(
+    task_id: &str,
+    step_id: &str,
+    effective_policy: &Option<serde_json::Value>,
+) -> HashMap<String, String> {
+    let mut meta = HashMap::new();
+    meta.insert("task_id".into(), task_id.to_string());
+    meta.insert("step_id".into(), step_id.to_string());
+    meta.insert("event_type".into(), "tool_invoked".into());
+    if let Some(p) = effective_policy {
+        meta.insert("effective_policy".into(), serde_json::to_string(p).unwrap_or_default());
+    }
+    meta
+}
+
 // ── PendingToolResult(sandbox oneshot 载荷;consumer 侧构造)─────────────
 
 /// sandbox 结果帧的反序列化形态。由 main.rs 的 result consumer 构造、经
@@ -384,10 +404,7 @@ impl ActionAdapter for SandboxAdapter {
 
         // Produce to broker
         let content = serde_json::to_vec(&payload).unwrap_or_default();
-        let mut meta = HashMap::new();
-        meta.insert("task_id".into(), ctx.task_id.clone());
-        meta.insert("step_id".into(), step_id.clone());
-        meta.insert("event_type".into(), "tool_invoked".into());
+        let meta = build_invoke_meta(&ctx.task_id, &step_id, &ctx.effective_policy);
 
         let mut prod = self.producer.lock().await;
         if let Err(e) = prod
@@ -744,6 +761,26 @@ mod tests {
     }
 
     // ── §4.2 SandboxAdapter parity ────────────────────────────────────
+
+    #[test]
+    fn build_invoke_meta_includes_policy_when_present() {
+        let meta = build_invoke_meta("t", "s", &Some(serde_json::json!({"x": 1})));
+        assert_eq!(meta.get("task_id").unwrap(), "t");
+        assert_eq!(meta.get("step_id").unwrap(), "s");
+        assert_eq!(meta.get("event_type").unwrap(), "tool_invoked");
+        // effective_policy 以序列化 JSON 字符串写入
+        assert_eq!(meta.get("effective_policy").unwrap(), r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn build_invoke_meta_omits_policy_when_absent() {
+        let meta = build_invoke_meta("t", "s", &None);
+        assert_eq!(meta.get("task_id").unwrap(), "t");
+        assert_eq!(meta.get("step_id").unwrap(), "s");
+        // effective_policy 缺席(None)→ 不写入 key
+        assert!(!meta.contains_key("effective_policy"));
+    }
+
 
     #[test]
     fn sandbox_tools_are_the_six_builtins() {
