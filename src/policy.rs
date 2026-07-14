@@ -117,9 +117,37 @@ pub fn path_within(p: &std::path::Path, scope: &PathScope) -> bool {
     norm_p == norm_scope || norm_p.starts_with(&norm_scope)
 }
 
+/// 两 allowlist 的交集:取每个重叠对里更窄(more-specific)的 scope。
+/// 路径段前缀语义下,两 scope 要么包含要么不相交,故交集 = 重叠对中的更深者。
+pub fn intersect_fs(a: &FsPolicy, b: &FsPolicy) -> FsPolicy {
+    fn intersect_set(a: &[PathScope], b: &[PathScope]) -> Vec<PathScope> {
+        let mut out: Vec<PathScope> = Vec::new();
+        let mut push_if_new = |out: &mut Vec<PathScope>, s: PathScope| {
+            if !out.iter().any(|e| e.path == s.path) {
+                out.push(s);
+            }
+        };
+        for sa in a {
+            if let Some(sb) = b.iter().find(|sb| path_within(&sa.path, sb) || path_within(&sb.path, sa)) {
+                let tighter = if path_within(&sa.path, sb) { sa.clone() } else { sb.clone() };
+                push_if_new(&mut out, tighter);
+            }
+        }
+        out
+    }
+    FsPolicy {
+        read_paths: intersect_set(&a.read_paths, &b.read_paths),
+        write_paths: intersect_set(&a.write_paths, &b.write_paths),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope(p: &str) -> PathScope {
+        PathScope { path: PathBuf::from(p), trust: TrustLevel::Host }
+    }
 
     #[test]
     fn capability_policy_serde_roundtrip() {
@@ -166,5 +194,35 @@ mod tests {
     fn path_within_normalizes() {
         let scope = PathScope { path: PathBuf::from("/a/b"), trust: TrustLevel::Host };
         assert!(path_within(std::path::Path::new("/a/b/../b/c"), &scope));
+    }
+
+    #[test]
+    fn intersect_fs_takes_tighter_overlap() {
+        let a = FsPolicy { read_paths: vec![scope("/home/x")], write_paths: vec![] };
+        let b = FsPolicy { read_paths: vec![scope("/home/x/proj")], write_paths: vec![] };
+        let r = intersect_fs(&a, &b);
+        assert_eq!(r.read_paths, vec![scope("/home/x/proj")]);
+    }
+
+    #[test]
+    fn intersect_fs_disjoint_yields_empty() {
+        let a = FsPolicy { read_paths: vec![scope("/a")], write_paths: vec![] };
+        let b = FsPolicy { read_paths: vec![scope("/b")], write_paths: vec![] };
+        assert!(intersect_fs(&a, &b).read_paths.is_empty());
+    }
+
+    #[test]
+    fn intersect_fs_write_paths_intersected_too() {
+        let a = FsPolicy { read_paths: vec![], write_paths: vec![scope("/repo")] };
+        let b = FsPolicy { read_paths: vec![], write_paths: vec![scope("/repo/sub")] };
+        let r = intersect_fs(&a, &b);
+        assert_eq!(r.write_paths, vec![scope("/repo/sub")]);
+    }
+
+    #[test]
+    fn intersect_fs_dedups_identical() {
+        let a = FsPolicy { read_paths: vec![scope("/x")], write_paths: vec![] };
+        let b = FsPolicy { read_paths: vec![scope("/x")], write_paths: vec![] };
+        assert_eq!(intersect_fs(&a, &b).read_paths.len(), 1);
     }
 }
