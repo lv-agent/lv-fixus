@@ -3,7 +3,7 @@
 //! 路径校验走声明式 `EffectivePolicy`(随 tool-invoke event metadata 透传):
 //!   - read 类(R/Glob/Grep):work_dir 内 OR effective.fs.read_paths 某 scope 下。
 //!   - write 类(W/E):work_dir 内 OR effective.fs.write_paths 某 scope 下。
-//! 缺 policy → 严默认(仅 work_dir)。Bash 由 `executor::execute` 经 Landlock 子进程执行(D-b)。
+//!     缺 policy → 严默认(仅 work_dir)。Bash 由 `executor::execute_bash` 经 Landlock 子进程执行(D-b)。
 //!
 //! 注:文件工具目前仅应用层路径校验(与原进程内沙箱平级),未套 Landlock;
 //! 给文件工具加内核级隔离是后续加固项。

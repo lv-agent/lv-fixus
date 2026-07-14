@@ -368,7 +368,7 @@ async fn execute_tool(
 ) -> Result<serde_json::Value, String> {
     let input = payload.get("input").cloned().unwrap_or(serde_json::Value::Null);
     let timeout_ms = payload.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(120_000);
-    let timeout_secs = (timeout_ms / 1000).max(1).min(600); // 1-600s
+    let timeout_secs = (timeout_ms / 1000).clamp(1, 600); // 1-600s
     let timeout_dur = std::time::Duration::from_secs(timeout_secs);
 
     // 查表用全名(fixus_bash / fixus_read / fixus_jq …)。不做任何前缀 strip ——

@@ -218,7 +218,6 @@ pub async fn execute_bash(
 /// - `io == Read` → [`crate::tools::validate_read_policy`].
 /// - `io == Write` → [`crate::tools::validate_write_policy`].
 /// - `io == None` → skip (no path args to validate).
-#[allow(dead_code)] // wired into execute_tool dispatch in T8
 pub(crate) fn validate_bin_paths(
     spec: &fixus_tool_catalog::BinSpec,
     args: &serde_json::Value,
@@ -256,9 +255,7 @@ pub(crate) fn validate_bin_paths(
 /// never shell-interpreted). Path args are pre-validated against the effective
 /// policy for a clear, fast failure before we fork; Landlock is the backstop.
 ///
-/// Not yet wired into `execute_tool` dispatch (that's T8) — exposed here for the
-/// upcoming dispatch table.
-#[allow(dead_code)] // wired into execute_tool dispatch in T8
+/// Wired into `execute_tool` dispatch (`ExecutorKind::Bin`).
 pub async fn execute_bin(
     spec: &fixus_tool_catalog::BinSpec,
     args: &serde_json::Value,
