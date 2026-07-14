@@ -215,6 +215,18 @@ pub fn validate_subset(child: &CapabilityPolicy, parent: &CapabilityPolicy) -> R
     if v.is_empty() { Ok(()) } else { Err(v) }
 }
 
+/// 信任边界编排:校验 task ⊆ tenant,通过则 resolve effective;越权 → Err(violations)。
+/// 供 task 创建 / API 设置调用。
+pub fn resolve_and_validate(
+    operator: &CapabilityPolicy,
+    tenant: &CapabilityPolicy,
+    task: &CapabilityPolicy,
+    role: AgentRole,
+) -> Result<EffectivePolicy, SubsetViolation> {
+    validate_subset(task, tenant)?;
+    Ok(resolve_effective(operator, tenant, task, role))
+}
+
 /// 解析 Operator policy TOML(部署期 fixus host 文件)。
 /// 空/缺字段 → 默认(严:仅 work_dir,无外网)。非法 TOML → Err(fixus 启动 fail-closed)。
 pub fn parse_operator_toml(s: &str) -> Result<CapabilityPolicy, String> {
@@ -451,5 +463,21 @@ egress = []
     #[test]
     fn parse_operator_toml_malformed_err() {
         assert!(parse_operator_toml("not = valid = toml = {{{").is_err());
+    }
+
+    #[test]
+    fn resolve_and_validate_rejects_over_ceiling() {
+        let op = policy(&["/home"], &[], &[]);
+        let tenant = policy(&["/home/x/proj"], &[], &[]);
+        let task = policy(&["/home/x/other"], &[], &[]);
+        assert!(resolve_and_validate(&op, &tenant, &task, AgentRole::Reader).is_err());
+    }
+
+    #[test]
+    fn resolve_and_validate_ok_within_ceiling() {
+        let op = policy(&["/home"], &[], &[]);
+        let tenant = policy(&["/home/x/proj"], &[], &[]);
+        let task = policy(&["/home/x/proj/src"], &[], &[]);
+        assert!(resolve_and_validate(&op, &tenant, &task, AgentRole::Reader).is_ok());
     }
 }
