@@ -19,6 +19,7 @@ pub mod orchestrator;
 pub mod stream;
 pub mod projection;
 pub mod broker_store;
+pub mod policy;
 
 // 重新导出核心类型
 pub use error::{AppError, Result};
