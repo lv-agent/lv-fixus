@@ -51,6 +51,9 @@ hex = "0.4"
 # Config — Operator policy TOML parsing (Phase 1 sandbox boundary)
 toml = "0.8"
 
+# Tool registry single source of truth (tool-registry consolidation)
+fixus-tool-catalog = { path = "crates/tool-catalog" }
+
 # Streaming — fixus-stream SSE 网关 + token 逐字流式(Redis ephemeral 快路径)
 redis = { version = "0.31", features = ["tokio-comp", "aio", "connection-manager"] }
 tokio-stream = "0.1"
@@ -98,3 +101,7 @@ path = "src/bin/tools-bank/main.rs"
 [[bin]]
 name = "fixus-stream"
 path = "src/bin/fixus-stream/main.rs"
+
+[workspace]
+members = [".", "crates/tool-catalog"]
+resolver = "2"

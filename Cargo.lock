@@ -656,6 +656,7 @@ dependencies = [
  "axum 0.8.9",
  "chrono",
  "clap",
+ "fixus-tool-catalog",
  "futures-util",
  "hex",
  "http-body-util",
@@ -687,6 +688,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "fixus-tool-catalog"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]

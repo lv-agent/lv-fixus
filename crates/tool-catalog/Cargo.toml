@@ -1,0 +1,11 @@
+[package]
+name = "fixus-tool-catalog"
+version = "0.1.0"
+edition = "2021"
+description = "Tool registry single source of truth (name/schema/timeout/executor) for tools-bank + sandbox-server"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
