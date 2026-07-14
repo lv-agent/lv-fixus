@@ -283,10 +283,10 @@ async fn run_consumer(
                     };
                     let dur = t0.elapsed().as_millis() as u64;
                     tracing::info!(
-                        "executed {} in work_dir={} success={} exit_code={} duration_ms={} error={:?}",
+                        "executed {} in work_dir={} success={} exit_code={} duration_ms={} role={:?} net_off={} error={:?}",
                         tool_name_fix, work_dir.display(), success,
                         output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
-                        dur, error
+                        dur, eff.agent_role, eff.net_off(), error
                     );
 
                     let r = ToolResult { success, output, error, duration_ms: dur };

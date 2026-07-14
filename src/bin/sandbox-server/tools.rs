@@ -32,11 +32,13 @@ pub fn validate_read_policy(
     };
     let normalized = normalize_path(&canonical);
     if normalized.starts_with(work_dir) {
+        tracing::debug!(path = %normalized.display(), "policy read allow (work_dir)");
         return Ok(normalized);
     }
     for scope in &eff.fs.read_paths {
         let s = normalize_path(&scope.path);
         if normalized == s || normalized.starts_with(&s) {
+            tracing::debug!(path = %normalized.display(), "policy read allow (scope)");
             return Ok(normalized);
         }
     }
@@ -62,11 +64,13 @@ pub fn validate_write_policy(
     };
     let normalized = normalize_path(&canonical);
     if normalized.starts_with(work_dir) {
+        tracing::debug!(path = %normalized.display(), "policy write allow (work_dir)");
         return Ok(normalized);
     }
     for scope in &eff.fs.write_paths {
         let s = normalize_path(&scope.path);
         if normalized == s || normalized.starts_with(&s) {
+            tracing::debug!(path = %normalized.display(), "policy write allow (scope)");
             return Ok(normalized);
         }
     }
