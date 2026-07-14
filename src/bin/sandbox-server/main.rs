@@ -62,6 +62,10 @@ struct Cli {
     /// GC:活跃 session 数上限,超限按 LRU 回收(CR-5)
     #[arg(long, default_value = "100")]
     gc_max_sessions: usize,
+
+    /// operator extras catalog file (shared with tools-bank); tools beyond the 8 builtins
+    #[arg(long)]
+    extra_tools: Option<PathBuf>,
 }
 
 // ── Idempotence Cache ──
@@ -100,6 +104,24 @@ async fn main() {
     let stream = format!("tool-invoke-{}", cli.region);
     let consumer_id = format!("sandbox-{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
 
+    // Load operator extras catalog (shared with tools-bank) + merge with builtins.
+    // Missing/unreadable file → builtins only (not fatal). Malformed → log + builtins only.
+    // (spec §7: extras optional — never crash the sandbox over a bad catalog.)
+    let extra_path = cli.extra_tools.clone()
+        .or_else(|| std::env::var("FIXUS_TOOLS_CATALOG_FILE").ok().map(PathBuf::from));
+    let extras: Vec<fixus_tool_catalog::ToolSpec> = match extra_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(contents) => match fixus_tool_catalog::parse_extra_catalog(&contents) {
+            Ok(v) => { tracing::info!("loaded {} extra tool(s) from {:?}", v.len(), extra_path); v }
+            Err(e) => { tracing::error!("extra-tools parse failed ({:?}): {}; continuing with builtins only", extra_path, e); vec![] }
+        },
+        None => vec![],
+    };
+    let all_tools: Arc<Vec<fixus_tool_catalog::ToolSpec>> = Arc::new(
+        fixus_tool_catalog::builtins().iter().chain(extras.iter()).cloned().collect()
+    );
+    tracing::info!("tool catalog: {} total ({} builtins + {} extras)",
+        all_tools.len(), fixus_tool_catalog::builtins().len(), extras.len());
+
     // CR-5:后台 session/work_dir GC。
     spawn_gc_task(
         session_mgr.clone(),
@@ -124,7 +146,7 @@ async fn main() {
                 continue;
             }
         };
-        match run_consumer(&cli, &stream, &result_stream, &consumer_id, &session_mgr, &cache, result_producer).await {
+        match run_consumer(&cli, &stream, &result_stream, &consumer_id, &session_mgr, &cache, result_producer, all_tools.clone()).await {
             Ok(()) => tracing::info!("consumer loop ended normally"),
             Err(e) => {
                 tracing::error!("consumer error: {}; retrying in 1s", e);
@@ -160,6 +182,9 @@ fn spawn_gc_task(
     });
 }
 
+// 8 params:each由其调用上下文必传(broker 连接坐标 + 协调器 + 工具目录);T8 把 all_tools 线程穿入。
+// 打包成 struct 会跨越本任务边界(仅 main.rs dispatch 重构),故就地 allow。
+#[allow(clippy::too_many_arguments)]
 async fn run_consumer(
     cli: &Cli,
     stream: &str,
@@ -168,6 +193,7 @@ async fn run_consumer(
     session_mgr: &SessionManager,
     cache: &Arc<IdempotentCache>,
     result_producer: BrokerProducer,
+    all_tools: Arc<Vec<fixus_tool_catalog::ToolSpec>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("http://{}", cli.broker_addr);
     let mut consumer = GroupConsumer::join(addr, &cli.namespace, stream, &cli.group, consumer_id).await?;
@@ -261,6 +287,7 @@ async fn run_consumer(
                 let ns = cli.namespace.clone();
                 let rs = result_stream.to_string();
                 let cache_clone = cache.clone();
+                let tools = all_tools.clone();
                 // 优先用 payload 的 session_id(=task_id)做 per-task 隔离目录;
                 // 兜底 step_id(per-call)。tools-bank 传 session_id → base_dir/{task_id}。
                 let work_dir = payload
@@ -268,7 +295,6 @@ async fn run_consumer(
                     .and_then(|v| v.as_str())
                     .map(|sid| session_mgr.get_or_create(sid))
                     .unwrap_or_else(|| session_mgr.get_or_create(&step_id));
-                let tool_name_fix = tool_name.strip_prefix("fixus_").unwrap_or(&tool_name).to_string();
 
                 in_flight += 1;
                 let eff = effective_policy.clone();
@@ -276,14 +302,15 @@ async fn run_consumer(
                     let _permit = sem.acquire().await.expect("semaphore closed");
                     let t0 = std::time::Instant::now();
 
-                    let (success, output, error) = match execute_tool(&tool_name_fix, &payload, &work_dir, &eff).await {
+                    // 全名查找(catalog 是工具身份唯一权威;不再 strip fixus_ 前缀)。
+                    let (success, output, error) = match execute_tool(&tool_name, &payload, &work_dir, &eff, &tools).await {
                         Ok(o) => (true, o, None),
                         Err(e) => (false, serde_json::Value::Null, Some(e)),
                     };
                     let dur = t0.elapsed().as_millis() as u64;
                     tracing::info!(
                         "executed {} in work_dir={} success={} exit_code={} duration_ms={} role={:?} net_off={} error={:?}",
-                        tool_name_fix, work_dir.display(), success,
+                        tool_name, work_dir.display(), success,
                         output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1),
                         dur, eff.agent_role, eff.net_off(), error
                     );
@@ -333,21 +360,24 @@ async fn run_consumer(
 
 
 async fn execute_tool(
-    tool_name: &str,
+    name: &str,
     payload: &serde_json::Value,
     work_dir: &Path,
     eff: &crate::policy::EffectivePolicy,
+    all_tools: &[fixus_tool_catalog::ToolSpec],
 ) -> Result<serde_json::Value, String> {
     let input = payload.get("input").cloned().unwrap_or(serde_json::Value::Null);
     let timeout_ms = payload.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(120_000);
     let timeout_secs = (timeout_ms / 1000).max(1).min(600); // 1-600s
     let timeout_dur = std::time::Duration::from_secs(timeout_secs);
 
-    // fixus_ 前缀由 sandbox-server 统一 strip
-    let name = tool_name.strip_prefix("fixus_").unwrap_or(tool_name);
-    match name {
+    // 查表用全名(fixus_bash / fixus_read / fixus_jq …)。不做任何前缀 strip ——
+    // catalog 是工具身份的唯一权威(spec §7),字符串名派发到此为止。
+    let spec = fixus_tool_catalog::find(all_tools, name)
+        .ok_or_else(|| format!("unknown tool {}", name))?;
+    match &spec.executor {
         // Bash 走 executor(Landlock 子进程 + setrlimit + seccomp net-off)。eff 驱动 Landlock 规则集。
-        "Bash" | "bash" => {
+        fixus_tool_catalog::ExecutorKind::Bash => {
             let code = input
                 .get("command")
                 .or(input.get("code"))
@@ -362,12 +392,59 @@ async fn execute_tool(
             }))
         }
         // 文件工具(sandbox-server 进程内):路径校验走 EffectivePolicy。
-        "Read" | "read" => crate::tools::execute_read(&input, work_dir, eff).await,
-        "Write" | "write" => crate::tools::execute_write(&input, work_dir, eff).await,
-        "Edit" | "edit" => crate::tools::execute_edit(&input, work_dir, eff).await,
-        "Glob" | "glob" => crate::tools::execute_glob(&input, work_dir, eff).await,
-        "Grep" | "grep" => crate::tools::execute_grep(&input, work_dir, eff, timeout_dur).await,
-        _ => Err(format!("unknown tool {}", name)),
+        fixus_tool_catalog::ExecutorKind::FileRead => crate::tools::execute_read(&input, work_dir, eff).await,
+        fixus_tool_catalog::ExecutorKind::FileWrite => crate::tools::execute_write(&input, work_dir, eff).await,
+        fixus_tool_catalog::ExecutorKind::FileEdit => crate::tools::execute_edit(&input, work_dir, eff).await,
+        fixus_tool_catalog::ExecutorKind::Glob => crate::tools::execute_glob(&input, work_dir, eff).await,
+        fixus_tool_catalog::ExecutorKind::Grep => crate::tools::execute_grep(&input, work_dir, eff, timeout_dur).await,
+        // 外部二进制工具(jq/rg/operators extras):复用 Bash 同款硬隔离(Landlock+setrlimit+seccomp),
+        // argv 由 catalog 模板注入安全渲染(spec §5.3),路径参数先过 policy 校验。
+        fixus_tool_catalog::ExecutorKind::Bin(b) => {
+            let exec_result = crate::executor::execute_bin(b, &input, work_dir, eff, timeout_secs)
+                .await
+                .map_err(|e| format!("{}", e))?;
+            Ok(serde_json::json!({
+                "stdout": exec_result.stdout, "stderr": exec_result.stderr, "exit_code": exec_result.exit_code,
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn execute_tool_dispatches_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x"), "hello").unwrap();
+        let payload = serde_json::json!({"input": {"file_path": "x"}, "timeout_ms": 5000});
+        let r = execute_tool("fixus_read", &payload, dir.path(),
+            &crate::policy::EffectivePolicy::default(), fixus_tool_catalog::builtins()).await;
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap()["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_unknown_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = execute_tool("fixus_nope", &serde_json::json!({}), dir.path(),
+            &crate::policy::EffectivePolicy::default(), fixus_tool_catalog::builtins()).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_dispatches_bin_jq_name_lookup() {
+        // fixus_jq 必须经 catalog 查表解析到 Bin 执行器(无字符串 strip)。这里不真的跑 jq,
+        // 只确认能查到(查到就不会是 "unknown tool"),缺失必需参数应给出清晰的参数/策略错误。
+        let dir = tempfile::tempdir().unwrap();
+        let payload = serde_json::json!({"input": {}, "timeout_ms": 5000});
+        let r = execute_tool("fixus_jq", &payload, dir.path(),
+            &crate::policy::EffectivePolicy::default(), fixus_tool_catalog::builtins()).await;
+        let err = r.unwrap_err();
+        // 不是 "unknown tool" —— 工具被找到了,失败在缺参数 / 策略。
+        assert!(!err.contains("unknown tool"), "fixus_jq must be found: {}", err);
     }
 }
 
