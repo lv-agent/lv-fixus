@@ -89,6 +89,10 @@ pub enum AppError {
     // ── 内部错误 ──
     #[error("internal error: {0}")]
     Internal(String),
+
+    // ── 配置错误(启动期 Operator policy 解析等;fail-closed 拒启动)──
+    #[error("config error: {0}")]
+    Config(String),
 }
 
 /// 便捷 Result 类型别名

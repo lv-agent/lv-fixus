@@ -40,6 +40,9 @@ pub struct AppState {
     /// 业务指标(CR-4)。与 orchestrator 内部 `metrics` 同一 `Arc`(start 时注入),
     /// `/metrics` handler 用它 sync Gauge + render。
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// Operator policy(部署期 TOML 加载,严默认)。信任边界 ceiling:tenant ⊆ operator。
+    /// task 创建 resolve + tenant policy 设置均以此为根上限。
+    pub operator_policy: crate::policy::CapabilityPolicy,
 }
 
 // ── 错误转换 ────────────────────────────────────────────────────────────
@@ -71,8 +74,31 @@ impl IntoResponse for AppError {
 
 // ── 服务器启动 ──────────────────────────────────────────────────────────
 
+/// 加载 Operator policy(env `FIXUS_OPERATOR_POLICY_FILE` 指向 TOML;空 → 严默认)。
+/// 读失败 / TOML 非法 → Err(调用方 fail-closed 拒启动)。
+fn load_operator_policy() -> Result<crate::policy::CapabilityPolicy, AppError> {
+    let path = std::env::var("FIXUS_OPERATOR_POLICY_FILE").unwrap_or_default();
+    if path.is_empty() {
+        return Ok(crate::policy::CapabilityPolicy::default());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        AppError::Config(format!("read operator policy {}: {}", path, e))
+    })?;
+    crate::policy::parse_operator_toml(&content)
+        .map_err(|e| AppError::Config(format!("parse operator policy: {}", e)))
+}
+
 /// 启动 fixus HTTP 服务器
 pub async fn start() -> Result<(), AppError> {
+    // Operator policy(Phase 1 沙箱边界):env 指向 TOML;空 = 严默认;非法 → fail-closed 拒启动。
+    let operator_policy = load_operator_policy()?;
+    tracing::info!(
+        "operator policy loaded: {} read path(s), {} write path(s), {} egress rule(s)",
+        operator_policy.fs.read_paths.len(),
+        operator_policy.fs.write_paths.len(),
+        operator_policy.net.egress.len(),
+    );
+
     // broker 地址（默认 localhost:5100,与 logdbd 不同端口）
     let broker_addr = std::env::var("BROKER_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:5100".into());
@@ -139,6 +165,7 @@ pub async fn start() -> Result<(), AppError> {
         token_publisher,
         orchestrator,
         metrics,
+        operator_policy,
     };
     let app = build_router(state);
 
@@ -817,6 +844,7 @@ mod tests {
             token_publisher,
             metrics: orchestrator.metrics_handle(),
             orchestrator,
+            operator_policy: crate::policy::CapabilityPolicy::default(),
         };
         (state, registry, dir)
     }
@@ -896,5 +924,61 @@ mod tests {
         let (state, _reg, _d) = setup().await;
         let err = mark_ready_handler(State(state), Path("task_nonexistent".into())).await;
         assert!(matches!(err, Err(AppError::TaskNotFound(_))));
+    }
+}
+
+#[cfg(test)]
+mod policy_loader_tests {
+    use super::*;
+
+    #[test]
+    fn load_operator_policy_empty_env_is_strict() {
+        std::env::remove_var("FIXUS_OPERATOR_POLICY_FILE");
+        let p = load_operator_policy().unwrap();
+        assert!(p.fs.read_paths.is_empty());
+        assert!(p.fs.write_paths.is_empty());
+        assert!(p.net.egress.is_empty(), "空 env = 严默认 deny-all");
+    }
+
+    #[test]
+    fn load_operator_policy_missing_file_errors() {
+        std::env::set_var("FIXUS_OPERATOR_POLICY_FILE", "/nonexistent/operator-policy.toml");
+        let err = load_operator_policy().unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "缺文件 → Config err (fail-closed)");
+        std::env::remove_var("FIXUS_OPERATOR_POLICY_FILE");
+    }
+
+    #[test]
+    fn load_operator_policy_bad_toml_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("op.toml");
+        std::fs::write(&path, "not = valid = toml = {{{").unwrap();
+        std::env::set_var("FIXUS_OPERATOR_POLICY_FILE", path.to_str().unwrap());
+        let err = load_operator_policy().unwrap_err();
+        assert!(matches!(err, AppError::Config(_)), "非法 TOML → Config err");
+        std::env::remove_var("FIXUS_OPERATOR_POLICY_FILE");
+    }
+
+    #[test]
+    fn load_operator_policy_valid_toml_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("op.toml");
+        std::fs::write(
+            &path,
+            r#"
+[fs]
+[[fs.read_paths]]
+path = "/home/lvtao/codeagent"
+trust = "host"
+[net]
+egress = []
+"#,
+        )
+        .unwrap();
+        std::env::set_var("FIXUS_OPERATOR_POLICY_FILE", path.to_str().unwrap());
+        let p = load_operator_policy().unwrap();
+        assert_eq!(p.fs.read_paths.len(), 1);
+        assert!(p.net.egress.is_empty());
+        std::env::remove_var("FIXUS_OPERATOR_POLICY_FILE");
     }
 }
