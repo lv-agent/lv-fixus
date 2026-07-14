@@ -3,6 +3,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 
+use crate::policy::EffectivePolicy;
+
 #[derive(Debug)]
 pub struct ExecOutput {
     pub stdout: String,
@@ -10,12 +12,17 @@ pub struct ExecOutput {
     pub exit_code: i32,
 }
 
-/// Execute code in the given working directory with resource limits and
-/// Landlock filesystem restrictions.
+/// Execute bash code in the given working directory with resource limits,
+/// policy-driven Landlock fs isolation, and (D4) seccomp net-off.
+///
+/// `eff` drives the Landlock ruleset (work_dir rw + eff.fs read/write + infra ro).
+/// **fail-closed**:Landlock/seccomp setup failure aborts the child (returns
+/// `ExecError::Spawn`) unless `SANDBOX_ALLOW_NO_LANDLOCK=true`(opt-in degraded)。
 pub async fn execute(
     code: &str,
     work_dir: &Path,
     env: Option<std::collections::HashMap<String, String>>,
+    eff: &EffectivePolicy,
     timeout_secs: u64,
 ) -> Result<ExecOutput, ExecError> {
     let cpu_limit = timeout_secs + 5;
@@ -25,6 +32,7 @@ pub async fn execute(
     );
 
     let work_dir = work_dir.to_path_buf();
+    let eff = eff.clone();
 
     let output = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
@@ -36,13 +44,26 @@ pub async fn execute(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Apply Landlock in the child process (after fork, before exec)
-        #[cfg(target_os = "linux")]
+        // Apply Landlock + seccomp in the child (after fork, before exec).
+        // pre_exec is unix-only; on non-Linux, sandbox_core::apply returns Err
+        // → fail-closed (refuse to exec unsandboxed) unless SANDBOX_ALLOW_NO_LANDLOCK=true.
+        #[cfg(unix)]
         {
             let work_dir_clone = work_dir.clone();
+            let eff_clone = eff.clone();
             unsafe {
                 cmd.pre_exec(move || {
-                    crate::landlock::apply(&work_dir_clone, &[]);
+                    // ── Landlock(policy-driven)── fail-closed ──
+                    if let Err(e) = crate::sandbox_core::apply(&work_dir_clone, &eff_clone) {
+                        if std::env::var("SANDBOX_ALLOW_NO_LANDLOCK").as_deref() == Ok("true") {
+                            tracing::warn!("landlock disabled (opt-in degraded): {}", e);
+                        } else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("sandbox enforce failed (fail-closed): {}", e),
+                            ));
+                        }
+                    }
                     Ok(())
                 });
             }

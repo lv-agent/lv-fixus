@@ -82,7 +82,8 @@ pub fn validate_write_policy(
 }
 
 /// 路径规范化(不要求文件存在):处理 `.`、`..`、多余分隔符。
-fn normalize_path(path: &Path) -> PathBuf {
+/// `pub` 供 sandbox_core::build_landlock_rules 复用(同一规范化语义)。
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut parts = Vec::new();
     for component in path.components() {
         match component {
