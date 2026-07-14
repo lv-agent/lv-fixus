@@ -178,9 +178,12 @@ impl BrokerEventStore {
         use tokio_stream::StreamExt;
 
         let addr = format!("http://{}", self.broker_addr);
-        // 每次读用独立 group(从 earliest 起读,确保 latest 不被 offset 跳过)。
-        let group = format!("fixus-cfg-read-{}", stream);
-        let mut consumer = GroupConsumer::join(addr, &self.namespace, stream, &group, "singleton")
+        // 每次读用唯一 group + consumer_id:独立扫描(从 earliest 起,latest wins),
+        // 且并发读互不驱逐。固定 group/consumer_id 会让后到的 join 顶掉前者的 broker
+        // session → 前者读到 None(fail-closed 严)。leave() 清理本次的 transient group。
+        let read_id = uuid::Uuid::now_v7().to_string().replace('-', "");
+        let group = format!("fixus-cfg-read-{}-{}", stream, read_id);
+        let mut consumer = GroupConsumer::join(addr, &self.namespace, stream, &group, &read_id)
             .await
             .map_err(|e| AppError::Internal(format!("broker consumer join: {}", e)))?;
         let all_shards: std::collections::HashSet<u32> =
