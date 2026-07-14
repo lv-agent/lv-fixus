@@ -346,7 +346,7 @@ async fn execute_tool(
     // fixus_ 前缀由 sandbox-server 统一 strip
     let name = tool_name.strip_prefix("fixus_").unwrap_or(tool_name);
     match name {
-        // Bash 走 executor(Landlock 子进程 + ulimit + seccomp net-off)。eff 驱动 Landlock 规则集。
+        // Bash 走 executor(Landlock 子进程 + setrlimit + seccomp net-off)。eff 驱动 Landlock 规则集。
         "Bash" | "bash" => {
             let code = input
                 .get("command")
@@ -354,7 +354,7 @@ async fn execute_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("echo 'no command'")
                 .to_string();
-            let exec_result = crate::executor::execute(&code, work_dir, None, eff, timeout_secs)
+            let exec_result = crate::executor::execute_bash(&code, work_dir, None, eff, timeout_secs)
                 .await
                 .map_err(|e| format!("{}", e))?;
             Ok(serde_json::json!({

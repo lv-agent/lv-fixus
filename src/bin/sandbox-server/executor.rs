@@ -12,31 +12,103 @@ pub struct ExecOutput {
     pub exit_code: i32,
 }
 
-/// Execute bash code in the given working directory with resource limits,
-/// policy-driven Landlock fs isolation, and (D4) seccomp net-off.
+/// rlimit 元组(纯函数,linux-only;逐字节 parity 旧 bash `ulimit`)。
 ///
-/// `eff` drives the Landlock ruleset (work_dir rw + eff.fs read/write + infra ro).
-/// **fail-closed**:Landlock/seccomp setup failure aborts the child (returns
-/// `ExecError::Spawn`) unless `SANDBOX_ALLOW_NO_LANDLOCK=true`(opt-in degraded)。
-pub async fn execute(
-    code: &str,
+/// | 资源 | 旧 bash ulimit | 本函数 setrlimit 值 |
+/// |------|---------------|-------------------|
+/// | CPU 秒 | `-t <timeout+5>` | `timeout_secs + 5`(RLIMIT_CPU) |
+/// | 虚拟内存 | `-v 2097152`(KiB) | `2_097_152 * 1024` bytes = 2 GiB(RLIMIT_AS) |
+/// | 进程数 | `-u 50` | `50`(RLIMIT_NPROC) |
+/// | 文件大小 | `-f 524288`(512B 块) | `524_288 * 512` bytes = 256 MiB(RLIMIT_FSIZE) |
+#[cfg(target_os = "linux")]
+pub(crate) fn rlimit_tuple(timeout_secs: u64) -> (u64, u64, u64, u64) {
+    (timeout_secs + 5, 2_097_152 * 1024, 50, 524_288 * 512)
+}
+
+/// 在 `pre_exec`(fork 后、exec 前)上下文装 rlimit。
+///
+/// soft == hard(与旧 `ulimit` 行为一致:ulimit 同时设两者)。
+/// **fail-closed**:任一 `setrlimit` 失败 → `Err`(调用方拒 exec,绝不放行一个无 rlimit 的进程;
+/// 无 opt-out —— rlimit 无法被"安全降级")。
+#[cfg(target_os = "linux")]
+fn apply_rlimits(timeout_secs: u64) -> Result<(), String> {
+    use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE, RLIMIT_NPROC};
+    let (cpu, as_bytes, nproc, fsize) = rlimit_tuple(timeout_secs);
+
+    // 用 4 个显式 unsafe 块(closure 借用 setrlimit/常量无必要,显式更清晰且零歧义)。
+    unsafe {
+        let rl = rlimit {
+            rlim_cur: cpu,
+            rlim_max: cpu,
+        };
+        if setrlimit(RLIMIT_CPU, &rl) != 0 {
+            return Err(format!(
+                "setrlimit RLIMIT_CPU failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    unsafe {
+        let rl = rlimit {
+            rlim_cur: as_bytes,
+            rlim_max: as_bytes,
+        };
+        if setrlimit(RLIMIT_AS, &rl) != 0 {
+            return Err(format!(
+                "setrlimit RLIMIT_AS failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    unsafe {
+        let rl = rlimit {
+            rlim_cur: nproc,
+            rlim_max: nproc,
+        };
+        if setrlimit(RLIMIT_NPROC, &rl) != 0 {
+            return Err(format!(
+                "setrlimit RLIMIT_NPROC failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    unsafe {
+        let rl = rlimit {
+            rlim_cur: fsize,
+            rlim_max: fsize,
+        };
+        if setrlimit(RLIMIT_FSIZE, &rl) != 0 {
+            return Err(format!(
+                "setrlimit RLIMIT_FSIZE failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 核心:spawn 任意 argv,在 `pre_exec` 装 rlimit + Landlock + seccomp。
+///
+/// 泛化自旧 bash-only `execute`:外部二进制工具(jq/rg,T7)复用同一硬隔离。
+/// rlimit 机制已从 bash `ulimit` 迁移到 `pre_exec` 的 `libc::setrlimit`(对任意 spawned 进程生效)。
+///
+/// `eff` 驱动 Landlock 规则集(work_dir rw + eff.fs read/write + infra ro)。
+/// **fail-closed**:setrlimit/Landlock/seccomp setup 失败中止子进程(返回 `ExecError::Spawn`),
+/// 唯一例外是 Landlock 在 `SANDBOX_ALLOW_NO_LANDLOCK=true` 时 opt-in 降级(setrlimit/seccomp 无 opt-out)。
+pub async fn execute_argv(
+    argv: &[String],
     work_dir: &Path,
     env: Option<std::collections::HashMap<String, String>>,
     eff: &EffectivePolicy,
     timeout_secs: u64,
 ) -> Result<ExecOutput, ExecError> {
-    let cpu_limit = timeout_secs + 5;
-    let wrapped_code = format!(
-        "ulimit -t {} -v 2097152 -u 50 -f 524288 2>/dev/null; {}",
-        cpu_limit, code
-    );
-
     let work_dir = work_dir.to_path_buf();
     let eff = eff.clone();
+    let argv: Vec<String> = argv.to_vec();
 
     let output = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("bash");
-        cmd.args(["-c", &wrapped_code])
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .current_dir(&work_dir)
             .env("HOME", &work_dir)
             .env("TMPDIR", &work_dir)
@@ -44,37 +116,47 @@ pub async fn execute(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Apply Landlock + seccomp in the child (after fork, before exec).
-        // pre_exec is unix-only; on non-Linux, sandbox_core::apply returns Err
-        // → fail-closed (refuse to exec unsandboxed) unless SANDBOX_ALLOW_NO_LANDLOCK=true.
+        // 在子进程(fork 后、exec 前)装 rlimit + Landlock + seccomp。
+        // pre_exec 是 unix-only;非-Linux 上 sandbox_core::apply 返回 Err
+        // → fail-closed(拒 exec 无沙箱进程),除非 SANDBOX_ALLOW_NO_LANDLOCK=true。
         #[cfg(unix)]
         {
             let work_dir_clone = work_dir.clone();
             let eff_clone = eff.clone();
             unsafe {
                 cmd.pre_exec(move || {
-                    // ── Landlock(policy-driven)── fail-closed ──
+                    // ── 1. setrlimit(linux only)── fail-closed,无 opt-out ──
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Err(e) = apply_rlimits(timeout_secs) {
+                            return Err(std::io::Error::other(format!(
+                                "rlimit failed (fail-closed): {}",
+                                e
+                            )));
+                        }
+                    }
+                    // ── 2. Landlock(policy-driven)── fail-closed ──
                     if let Err(e) = crate::sandbox_core::apply(&work_dir_clone, &eff_clone) {
                         if std::env::var("SANDBOX_ALLOW_NO_LANDLOCK").as_deref() == Ok("true") {
                             tracing::warn!("landlock disabled (opt-in degraded): {}", e);
                         } else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("sandbox enforce failed (fail-closed): {}", e),
-                            ));
+                            return Err(std::io::Error::other(format!(
+                                "sandbox enforce failed (fail-closed): {}",
+                                e
+                            )));
                         }
                     }
-                    // ── seccomp net-off(linux only)── fail-closed ──
+                    // ── 3. seccomp net-off(linux only)── fail-closed ──
                     // net_off(egress 空)→ 拒 socket(AF_INET/AF_INET6)。filter apply 失败 → 拒 exec
                     // (绝不放行一个本应 net-off 却未强制的进程)。
                     #[cfg(target_os = "linux")]
                     {
                         if crate::sandbox_core::should_block_net(&eff_clone) {
                             if let Err(e) = crate::sandbox_core::apply_net_filter_block() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("seccomp net filter failed (fail-closed): {}", e),
-                                ));
+                                return Err(std::io::Error::other(format!(
+                                    "seccomp net filter failed (fail-closed): {}",
+                                    e
+                                )));
                             }
                         }
                     }
@@ -105,6 +187,22 @@ pub async fn execute(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         exit_code: output.status.code().unwrap_or(-1),
     })
+}
+
+/// 执行 bash 代码的薄包装:`bash -c <code>` → `execute_argv`。
+///
+/// **rlimit 机制迁移**:`code` 原样透传(不再注入 `ulimit -t ... -v ... -u ... -f ...` 前缀);
+/// rlimit 现由 `execute_argv` 的 `pre_exec` 经 `libc::setrlimit` 装载(数值逐字节 parity 旧 ulimit)。
+/// Landlock + seccomp net-off 语义不变(Phase 1)。
+pub async fn execute_bash(
+    code: &str,
+    work_dir: &Path,
+    env: Option<std::collections::HashMap<String, String>>,
+    eff: &EffectivePolicy,
+    timeout_secs: u64,
+) -> Result<ExecOutput, ExecError> {
+    let argv = vec!["bash".to_string(), "-c".to_string(), code.to_string()];
+    execute_argv(&argv, work_dir, env, eff, timeout_secs).await
 }
 
 #[derive(Debug)]
@@ -164,6 +262,18 @@ mod tests {
         }
     }
 
+    /// rlimit 元组 parity:锁定旧 bash `ulimit` → 新 `setrlimit` 数值精确转换。
+    /// (KiB→bytes for AS;512B-blocks→bytes for FSIZE)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rlimit_values_match_bash_ulimit_parity() {
+        let (cpu, asb, nproc, fsize) = rlimit_tuple(10);
+        assert_eq!(cpu, 15); // timeout+5
+        assert_eq!(asb, 2_097_152 * 1024); // -v 2097152 KiB → bytes (2 GiB)
+        assert_eq!(nproc, 50); // -u 50
+        assert_eq!(fsize, 524_288 * 512); // -f 524288 × 512B-blocks → bytes (256 MiB)
+    }
+
     /// E1 回归测:锁定 Phase 1 沙箱 enforcement —— Landlock fs 隔离 + seccomp net-off。
     ///
     /// `#[ignore]`:需真 fork + Landlock/seccomp 内核支持,非默认 CI。手动跑:
@@ -189,7 +299,7 @@ mod tests {
         let eff = strict_eff(&["/tmp/fixus-sandbox-test-allowed-marker"]);
 
         // (a) 读 /etc/hostname(/etc 不在 infra_ro)→ Landlock 拒。
-        let r_a = execute(
+        let r_a = execute_bash(
             "cat /etc/hostname",
             work.path(),
             None,
@@ -203,7 +313,7 @@ mod tests {
         );
 
         // (b) /dev/tcp → socket(AF_INET) → seccomp 拒(net off 时套 filter)。
-        let r_b = execute(
+        let r_b = execute_bash(
             "echo test > /dev/tcp/127.0.0.1/1",
             work.path(),
             None,
