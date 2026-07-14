@@ -205,6 +205,73 @@ pub async fn execute_bash(
     execute_argv(&argv, work_dir, env, eff, timeout_secs).await
 }
 
+/// Pre-validate a [`fixus_tool_catalog::BinSpec`]'s declared file-path args against
+/// the effective policy.
+///
+/// Application-layer fail-fast for clear errors (missing arg, outside-policy path);
+/// Landlock remains the kernel backstop (T6) — a path that slips past here is still
+/// denied at exec time if it leaves work_dir.
+///
+/// - Missing / null / empty-string path arg → `Err`. We do NOT pass an empty
+///   string to `validate_*` — empty resolves to `work_dir` (validate_* sees
+///   "the work dir itself") and would wrongly pass (spec §4.4).
+/// - `io == Read` → [`crate::tools::validate_read_policy`].
+/// - `io == Write` → [`crate::tools::validate_write_policy`].
+/// - `io == None` → skip (no path args to validate).
+#[allow(dead_code)] // wired into execute_tool dispatch in T8
+pub(crate) fn validate_bin_paths(
+    spec: &fixus_tool_catalog::BinSpec,
+    args: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+) -> Result<(), String> {
+    for name in &spec.path_args {
+        // Missing OR non-string (incl. Null) OR empty string → fail loud. Never
+        // fall through to validate_* with "" — that would resolve to work_dir and
+        // wrongly pass (spec §4.4).
+        let val = args
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("Bin tool missing or empty path arg '{}'", name))?;
+        match spec.io {
+            fixus_tool_catalog::BinIo::Read => {
+                crate::tools::validate_read_policy(val, work_dir, eff)?;
+            }
+            fixus_tool_catalog::BinIo::Write => {
+                crate::tools::validate_write_policy(val, work_dir, eff)?;
+            }
+            fixus_tool_catalog::BinIo::None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Execute an external binary tool: pre-validate path args → render argv →
+/// [`execute_argv`].
+///
+/// Reuses the same Landlock + seccomp + setrlimit hard isolation as bash (T6):
+/// the spawned process is `spec.binary` with argv rendered injection-safe by
+/// [`fixus_tool_catalog::render_argv`] (each `Arg` = exactly one argv element,
+/// never shell-interpreted). Path args are pre-validated against the effective
+/// policy for a clear, fast failure before we fork; Landlock is the backstop.
+///
+/// Not yet wired into `execute_tool` dispatch (that's T8) — exposed here for the
+/// upcoming dispatch table.
+#[allow(dead_code)] // wired into execute_tool dispatch in T8
+pub async fn execute_bin(
+    spec: &fixus_tool_catalog::BinSpec,
+    args: &serde_json::Value,
+    work_dir: &Path,
+    eff: &EffectivePolicy,
+    timeout_secs: u64,
+) -> Result<ExecOutput, ExecError> {
+    validate_bin_paths(spec, args, work_dir, eff).map_err(ExecError::Spawn)?;
+    let argv = fixus_tool_catalog::render_argv(&spec.argv, args)
+        .map_err(|e| ExecError::Spawn(format!("argv render: {}", e)))?;
+    execute_argv(&argv, work_dir, None, eff, timeout_secs).await
+}
+
 #[derive(Debug)]
 pub enum ExecError {
     Timeout,
@@ -325,5 +392,148 @@ mod tests {
             blocked(r_b),
             "(b) /dev/tcp 应被 seccomp 拒(socket AF_INET → EACCES 或 fail-closed Spawn)"
         );
+    }
+
+    // ── validate_bin_paths (T7): pre-validate BinSpec path args vs policy ──
+
+    #[test]
+    fn validate_bin_paths_missing_path_arg_errors() {
+        // spec wants "file" but args omits it → Err. Do NOT pass empty to
+        // validate_* — empty resolves to work_dir and would wrongly pass.
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "cat".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("cat".into()),
+                fixus_tool_catalog::ArgvPart::Arg("file".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::Read,
+            path_args: vec!["file".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let r = validate_bin_paths(
+            &spec,
+            &serde_json::json!({}),
+            dir.path(),
+            &EffectivePolicy::default(),
+        );
+        assert!(r.is_err(), "missing path arg must error");
+    }
+
+    #[test]
+    fn validate_bin_paths_rejects_empty_string() {
+        // explicit "" must NOT reach validate_* — empty resolves to work_dir and
+        // would wrongly pass (spec §4.4).
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "cat".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("cat".into()),
+                fixus_tool_catalog::ArgvPart::Arg("file".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::Read,
+            path_args: vec!["file".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let r = validate_bin_paths(
+            &spec,
+            &serde_json::json!({"file": ""}),
+            dir.path(),
+            &EffectivePolicy::default(),
+        );
+        assert!(
+            r.is_err(),
+            "explicit empty-string path arg must error (would resolve to work_dir)"
+        );
+    }
+
+    #[test]
+    fn validate_bin_paths_rejects_outside_policy() {
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "cat".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("cat".into()),
+                fixus_tool_catalog::ArgvPart::Arg("file".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::Read,
+            path_args: vec!["file".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // default policy = work_dir only, no read scopes; /etc/hosts → outside → Err
+        let r = validate_bin_paths(
+            &spec,
+            &serde_json::json!({"file": "/etc/hosts"}),
+            dir.path(),
+            &EffectivePolicy::default(),
+        );
+        assert!(r.is_err(), "outside-policy path must be rejected");
+    }
+
+    #[test]
+    fn validate_bin_paths_accepts_in_workdir() {
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "cat".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("cat".into()),
+                fixus_tool_catalog::ArgvPart::Arg("file".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::Read,
+            path_args: vec!["file".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, "hi").unwrap();
+        let r = validate_bin_paths(
+            &spec,
+            &serde_json::json!({"file": f.to_string_lossy()}),
+            dir.path(),
+            &EffectivePolicy::default(),
+        );
+        assert!(r.is_ok(), "file in work_dir must pass; got: {:?}", r);
+    }
+
+    #[test]
+    fn validate_bin_paths_none_io_skips_validation() {
+        // io=None → no path validation (path_args normally empty for None tools)
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "echo".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("echo".into()),
+                fixus_tool_catalog::ArgvPart::Arg("msg".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::None,
+            path_args: vec![],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let r = validate_bin_paths(
+            &spec,
+            &serde_json::json!({"msg": "hi"}),
+            dir.path(),
+            &EffectivePolicy::default(),
+        );
+        assert!(r.is_ok());
+    }
+
+    /// Live test: needs real fork + Landlock + `cat` on host.
+    ///   cargo test --bin sandbox-server -- --ignored execute_bin_runs_cat --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn execute_bin_runs_cat_in_workdir() {
+        let spec = fixus_tool_catalog::BinSpec {
+            binary: "cat".into(),
+            argv: vec![
+                fixus_tool_catalog::ArgvPart::Literal("cat".into()),
+                fixus_tool_catalog::ArgvPart::Arg("file".into()),
+            ],
+            io: fixus_tool_catalog::BinIo::Read,
+            path_args: vec!["file".into()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, "hello").unwrap();
+        let args = serde_json::json!({"file": f.to_string_lossy()});
+        let out = execute_bin(&spec, &args, dir.path(), &EffectivePolicy::default(), 5)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "hello");
+        assert_eq!(out.exit_code, 0);
     }
 }
