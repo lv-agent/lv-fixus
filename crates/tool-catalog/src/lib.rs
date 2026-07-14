@@ -266,6 +266,75 @@ impl From<&ToolSpec> for ToolDef {
     }
 }
 
+// ── argv template rendering (spec §5.3) — injection-safe by construction ──
+
+/// Render an argv template against agent-supplied arguments (spec §5.3).
+///
+/// Each [`ArgvPart`] maps to exactly one output `String` (or zero, for a
+/// `Flag` whose value is absent/false). The output `Vec<String>` is intended
+/// to be passed verbatim to `Command::new(&out[0]).args(&out[1..])` →
+/// `execve`: argv elements are handed to the kernel directly and are NEVER
+/// interpreted by a shell.
+///
+/// # Injection safety (the whole point)
+///
+/// Each `Arg(name)` substitution contributes **exactly one** argv element,
+/// regardless of what characters the value contains (spaces, `;`, `$()`,
+/// backticks, newlines, quotes). There is no shell anywhere in this path —
+/// no `sh -c`, no string concatenation into a command line, no whitespace
+/// splitting, no globbing. Shell injection is therefore impossible by
+/// construction: a malicious value can only become the single argv element
+/// it was meant to be, never a new flag or a second argument.
+///
+/// # Per-variant rules
+///
+/// - `Literal(s)` → push `s` (one element).
+/// - `Arg(name)`:
+///   - missing key OR `Value::Null` → [`RenderError::MissingArg`].
+///   - `String` → push it. `Number` → push `n.to_string()`. `Bool` → push
+///     `"true"`/`"false"`. (Always one element.)
+///   - `Array`/`Object` → [`RenderError::ArgTypeMismatch`].
+/// - `Flag(name, value)`:
+///   - `Bool(true)` → push `value`. `Bool(false)` → skip.
+///   - missing key OR `Value::Null` → skip (flags are optional).
+///   - any non-bool present → [`RenderError::ArgTypeMismatch`].
+///
+/// If `args` is not a JSON object, every lookup is treated as missing (so an
+/// `Arg` errors with `MissingArg`, a `Flag` is skipped) — callers always pass
+/// an object per the MCP contract.
+pub fn render_argv(argv: &[ArgvPart], args: &serde_json::Value) -> Result<Vec<String>, RenderError> {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    for part in argv {
+        match part {
+            ArgvPart::Literal(s) => out.push(s.clone()),
+            ArgvPart::Arg(name) => {
+                // ONE value, ONE push. No splitting, no concatenation.
+                match args.get(name) {
+                    None | Some(serde_json::Value::Null) => {
+                        return Err(RenderError::MissingArg(name.clone()));
+                    }
+                    Some(serde_json::Value::String(s)) => out.push(s.clone()),
+                    Some(serde_json::Value::Number(n)) => out.push(n.to_string()),
+                    Some(serde_json::Value::Bool(b)) => out.push(b.to_string()),
+                    // Array / Object → wrong shape; refuse.
+                    Some(_) => return Err(RenderError::ArgTypeMismatch(name.clone())),
+                }
+            }
+            ArgvPart::Flag(name, value) => {
+                // Push only the static template `value` (never an arg), and only
+                // when the flag is explicitly true. Missing/null/false → skip.
+                match args.get(name) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Bool(true)) => out.push(value.clone()),
+                    Some(serde_json::Value::Bool(false)) => {}
+                    Some(_) => return Err(RenderError::ArgTypeMismatch(name.clone())),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ── argv element parsing (spec §5.2) ────────────────────────────────────
 
 /// Parse one argv element string into an [`ArgvPart`] (spec §5.2).
@@ -465,5 +534,80 @@ mod tests {
         // NOT brace-wrapped (doesn't start with {) → whole string literal, braces preserved
         assert_eq!(parse_argv_element("--out={f}").unwrap(), ArgvPart::Literal("--out={f}".into()));
         assert_eq!(parse_argv_element("a{b}c").unwrap(), ArgvPart::Literal("a{b}c".into()));
+    }
+
+    // ── render_argv (spec §5.3) — injection-safe argv template rendering ──
+
+    #[test]
+    fn render_basic_with_and_without_flag() {
+        let argv = vec![
+            ArgvPart::Literal("jq".into()),
+            ArgvPart::Flag("raw".into(), "-r".into()),
+            ArgvPart::Arg("filter".into()),
+            ArgvPart::Arg("file".into()),
+        ];
+        let with = serde_json::json!({"filter":".x","file":"a.json","raw":true});
+        assert_eq!(render_argv(&argv, &with).unwrap(), vec!["jq", "-r", ".x", "a.json"]);
+        let without = serde_json::json!({"filter":".x","file":"a.json","raw":false});
+        assert_eq!(render_argv(&argv, &without).unwrap(), vec!["jq", ".x", "a.json"]);
+        // flag absent entirely → treated as false → skipped
+        let absent = serde_json::json!({"filter":".x","file":"a.json"});
+        assert_eq!(render_argv(&argv, &absent).unwrap(), vec!["jq", ".x", "a.json"]);
+    }
+
+    #[test]
+    fn render_arg_injection_stays_one_element() {
+        // THE security test: shell metacharacters must NOT split or be interpreted.
+        let argv = vec![ArgvPart::Literal("jq".into()), ArgvPart::Arg("filter".into())];
+        let payload = "; rm -rf /";
+        let args = serde_json::json!({"filter": payload});
+        let out = render_argv(&argv, &args).unwrap();
+        assert_eq!(out.len(), 2, "metacharacters must not add elements");
+        assert_eq!(out[0], "jq");
+        assert_eq!(out[1], payload, "the malicious string is ONE argv element, verbatim");
+        // more metacharacter flavors — all stay one element
+        for nasty in ["a b c", "$(whoami)", "`id`", "foo\nbar", "x | y", "\"q\"", "'q'", "  $HOME  "] {
+            let out = render_argv(&argv, &serde_json::json!({"filter": nasty})).unwrap();
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[1], nasty);
+        }
+    }
+
+    #[test]
+    fn render_missing_required_arg_errors() {
+        let argv = vec![ArgvPart::Arg("filter".into())];
+        assert!(matches!(render_argv(&argv, &serde_json::json!({})),
+                         Err(RenderError::MissingArg(n)) if n == "filter"));
+        // explicit null also counts as missing
+        assert!(render_argv(&argv, &serde_json::json!({"filter": serde_json::Value::Null})).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is a sample float, not π
+    fn render_number_and_bool_args_coerced_to_string() {
+        let argv = vec![ArgvPart::Literal("echo".into()), ArgvPart::Arg("n".into())];
+        assert_eq!(render_argv(&argv, &serde_json::json!({"n": 42})).unwrap(), vec!["echo", "42"]);
+        assert_eq!(render_argv(&argv, &serde_json::json!({"n": 3.14})).unwrap(), vec!["echo", "3.14"]);
+        assert_eq!(render_argv(&argv, &serde_json::json!({"n": true})).unwrap(), vec!["echo", "true"]);
+    }
+
+    #[test]
+    fn render_arg_rejects_object_and_array() {
+        let argv = vec![ArgvPart::Arg("x".into())];
+        assert!(render_argv(&argv, &serde_json::json!({"x": {"a":1}})).is_err());
+        assert!(render_argv(&argv, &serde_json::json!({"x": [1,2]})).is_err());
+    }
+
+    #[test]
+    fn render_flag_non_bool_errors() {
+        let argv = vec![ArgvPart::Flag("r".into(), "-r".into())];
+        // present but non-bool → error (NOT silently skipped; an explicit wrong type is a misuse)
+        assert!(render_argv(&argv, &serde_json::json!({"r": "yes"})).is_err());
+        assert!(render_argv(&argv, &serde_json::json!({"r": 1})).is_err());
+    }
+
+    #[test]
+    fn render_empty_template_yields_empty() {
+        assert_eq!(render_argv(&[], &serde_json::json!({})).unwrap(), Vec::<String>::new());
     }
 }
