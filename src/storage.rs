@@ -1363,6 +1363,57 @@ impl EventStore for LogdbdEventStore {
             path: String::new(),
         })
     }
+
+    // ── Tenant policy(Phase 1 沙箱边界;与 BrokerEventStore 同语义:专用 stream,latest wins)──
+
+    async fn set_tenant_policy(
+        &self,
+        tenant_id: &str,
+        policy: &crate::policy::CapabilityPolicy,
+    ) -> Result<()> {
+        let stream = tenant_policy_stream_name(tenant_id);
+        let content = serde_json::to_vec(policy)
+            .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
+        let mut meta = HashMap::new();
+        meta.insert("tenant_id".into(), tenant_id.to_string());
+        let ts_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        let mut client = self.client.lock().await;
+        client
+            .append_full(&self.namespace, &stream, "tenant_policy", "application/json", &meta, ts_ns, &content)
+            .await
+            .map_err(|e| AppError::Internal(format!("logdbd append: {}", e)))?;
+        Ok(())
+    }
+
+    async fn get_tenant_policy(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::policy::CapabilityPolicy>> {
+        let stream = tenant_policy_stream_name(tenant_id);
+        let mut client = self.client.lock().await;
+        let records = client
+            .scan_all(&self.namespace, &stream, 1)
+            .await
+            .map_err(|e| AppError::Internal(format!("logdbd scan: {}", e)))?;
+        // latest wins:取 seq 最大记录
+        match records.into_iter().max_by_key(|r| r.seq) {
+            None => Ok(None),
+            Some(rec) => {
+                let policy: crate::policy::CapabilityPolicy = serde_json::from_slice(&rec.content)
+                    .map_err(|e| AppError::Internal(format!("tenant policy decode: {}", e)))?;
+                Ok(Some(policy))
+            }
+        }
+    }
+}
+
+/// tenant policy 专用 stream 名(与 BrokerEventStore::tenant_policy_stream 同策略)。
+fn tenant_policy_stream_name(tenant_id: &str) -> String {
+    let sanitized: String = tenant_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    format!("tenant-policy-{}", sanitized)
 }
 
 // ── 集成测试 ────────────────────────────────────────────────────────────────
@@ -1459,6 +1510,27 @@ mod logdbd_tests {
                     sid,
                     store.get_max_seq(sid).await
                 );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// 轮询 get_tenant_policy 直到谓词成立(committed 游标亚毫秒级 lag,同 wait_seq)。
+    async fn wait_tenant_policy<F: Fn(&crate::policy::CapabilityPolicy) -> bool>(
+        store: &LogdbdEventStore,
+        tenant: &str,
+        pred: F,
+        timeout: Duration,
+    ) -> crate::policy::CapabilityPolicy {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Ok(Some(p)) = store.get_tenant_policy(tenant).await {
+                if pred(&p) {
+                    return p;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("tenant policy {} not readable within {:?}", tenant, timeout);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1888,6 +1960,40 @@ mod logdbd_tests {
 
         // 不存在的 task → None
         assert_eq!(store.get_task_state("nope").await.unwrap(), None);
+    }
+
+    // ── Tenant policy 存取(Phase 1 沙箱边界)──────────────────────────────────
+
+    #[tokio::test]
+    async fn tenant_policy_set_get_roundtrip_and_overwrite() {
+        let (store, _dir) = setup().await;
+        use crate::policy::{
+            CapabilityPolicy, FsPolicy, NetPolicy, PathScope, TrustLevel,
+        };
+        let p1 = CapabilityPolicy {
+            fs: FsPolicy {
+                read_paths: vec![PathScope { path: "/home/x/proj".into(), trust: TrustLevel::Host }],
+                write_paths: vec![],
+            },
+            net: NetPolicy::default(),
+        };
+
+        // 缺省 None(继承 Operator 严默认)
+        assert!(store.get_tenant_policy("t1").await.unwrap().is_none());
+
+        // set p1 → get 回读(read_paths 非空)
+        store.set_tenant_policy("t1", &p1).await.unwrap();
+        let got = wait_tenant_policy(&store, "t1", |p| !p.fs.read_paths.is_empty(), Duration::from_secs(5)).await;
+        assert_eq!(got.fs.read_paths.len(), 1);
+
+        // 覆盖 p2(空)→ latest wins(等到 latest 变空)
+        let p2 = CapabilityPolicy::default();
+        store.set_tenant_policy("t1", &p2).await.unwrap();
+        let got2 = wait_tenant_policy(&store, "t1", |p| p.fs.read_paths.is_empty(), Duration::from_secs(5)).await;
+        assert!(got2.fs.read_paths.is_empty(), "latest set 应覆盖前者");
+
+        // 不同 tenant 隔离
+        assert!(store.get_tenant_policy("t2").await.unwrap().is_none());
     }
 
     // ── 性能测试(#[ignore],cargo test -- --ignored --nocapture 看)──────
