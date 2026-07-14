@@ -93,6 +93,10 @@ pub enum AppError {
     // ── 配置错误(启动期 Operator policy 解析等;fail-closed 拒启动)──
     #[error("config error: {0}")]
     Config(String),
+
+    // ── 策略越权(task ⊄ tenant 或 tenant ⊄ operator)→ HTTP 400 ──
+    #[error("policy violation: {0}")]
+    PolicyViolation(String),
 }
 
 /// 便捷 Result 类型别名

@@ -880,6 +880,24 @@ impl Task {
 
 // ── 类型化 Payload ──────────────────────────────────────────────────────
 
+/// 创建 task 时的策略请求体(task 创建者声明,须 ⊆ Tenant ceiling)。
+///
+/// `agent_role` 缺省 Reader(严默认);`policy` 缺省 None(空 Task policy)。
+/// fixus 在 task 创建时 `resolve_and_validate(operator, tenant, task, role)`,
+/// 越权 → HTTP 400;通过则 resolve 出 effective_policy 写入 task_created event。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskPolicyRequest {
+    #[serde(default = "default_agent_role")]
+    pub agent_role: crate::policy::AgentRole,
+    /// task 自声明的策略(可选;缺省 = 空 Task policy,经 resolve 与 Operator∩Tenant 交集)。
+    #[serde(default)]
+    pub policy: Option<crate::policy::CapabilityPolicy>,
+}
+
+fn default_agent_role() -> crate::policy::AgentRole {
+    crate::policy::AgentRole::Reader
+}
+
 /// session_started 的 payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStartedPayload {

@@ -61,6 +61,10 @@ pub struct CreateSessionRequest {
     /// 优先级(CR-1):大者优先派发。默认 0。
     #[serde(default)]
     pub priority: i32,
+    /// Phase 1 沙箱边界:task 创建者声明的策略(agent_role + 可选 policy)。
+    /// fixus resolve_and_validate(operator, tenant, task_policy, role);越权 → 400。
+    #[serde(default)]
+    pub policy: Option<crate::models::TaskPolicyRequest>,
 }
 
 /// 创建 Session 响应

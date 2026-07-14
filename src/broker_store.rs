@@ -172,9 +172,10 @@ impl EventStore for BrokerEventStore {
         provenance: &Provenance,
         body: Option<&serde_json::Value>,
         priority: i32,
+        effective_policy: Option<&crate::policy::EffectivePolicy>,
     ) -> Result<(String, AgentEvent)> {
         let task_id = format!("task_{}", uuid::Uuid::now_v7().to_string().replace('-', ""));
-        let payload = serde_json::json!({"task_type":task_type,"provenance":provenance,"body":body.cloned().unwrap_or(serde_json::Value::Null),"priority":priority});
+        let payload = serde_json::json!({"task_type":task_type,"provenance":provenance,"body":body.cloned().unwrap_or(serde_json::Value::Null),"priority":priority,"effective_policy":effective_policy});
         let content = serde_json::to_vec(&payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
         let mut meta = HashMap::new();
         meta.insert("task_id".into(), task_id.clone());
@@ -261,7 +262,7 @@ impl EventStore for BrokerEventStore {
             created_at: p.provenance.created_at,
             metadata: None,
             priority: p.priority,
-            effective_policy: None,
+            effective_policy: p.effective_policy.clone(),
         })).await
     }
 
@@ -621,7 +622,7 @@ mod tests {
             source_tenant_id: Some("t".into()), source_message_id: None,
             created_at: chrono::Utc::now(), created_by: "test".into(),
         };
-        let (tid, _) = store.create_task("db.repair", "t", "u", &prov, None, 0).await.unwrap();
+        let (tid, _) = store.create_task("db.repair", "t", "u", &prov, None, 0, None).await.unwrap();
         assert!(tid.starts_with("task_"));
 
         // catch_up 可能因 broker forwarder 延迟,短暂重试

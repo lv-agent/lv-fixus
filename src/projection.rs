@@ -29,6 +29,8 @@ pub struct TaskProjection {
     pub body: Option<serde_json::Value>,
     /// 优先级(CR-1):大者优先派发。从 task_created payload 析出。
     pub priority: i32,
+    /// 解析后的有效策略(Phase 1 沙箱边界)。从 task_created payload 析出;get_task 透传。
+    pub effective_policy: Option<crate::policy::EffectivePolicy>,
 
     // 投影 state
     pub state: TaskState,
@@ -75,6 +77,7 @@ impl TaskProjection {
             },
             body: None,
             priority: 0,
+            effective_policy: None,
             state: TaskState::Created,
             max_seq: 0,
             max_turn_id: 0,
@@ -149,6 +152,10 @@ impl TaskProjection {
                 }
                 self.body = payload.get("body").filter(|v| !v.is_null()).cloned();
                 self.priority = payload["priority"].as_i64().unwrap_or(0) as i32;
+                self.effective_policy = payload
+                    .get("effective_policy")
+                    .filter(|v| !v.is_null())
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
                 self.state = TaskState::Created;
             }
             EventType::TaskReady => self.state = TaskState::Ready,

@@ -42,6 +42,7 @@ pub trait EventStore: Send + Sync {
         provenance: &Provenance,
         body: Option<&serde_json::Value>,
         priority: i32,
+        effective_policy: Option<&crate::policy::EffectivePolicy>,
     ) -> Result<(String, AgentEvent)>;
 
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>>;
@@ -115,6 +116,25 @@ pub trait EventStore: Send + Sync {
     /// 默认 no-op;BrokerEventStore 覆盖。
     async fn publish_turn_begin(&self, _task_id: &str, _task_type: &str, _payload: &serde_json::Value) -> Result<()> {
         Ok(())
+    }
+
+    // ── Tenant policy(Phase 1 沙箱边界)────────────────────────────────
+
+    /// 存 tenant policy(覆盖)。默认 no-op;BrokerEventStore 走专用 stream 覆盖。
+    async fn set_tenant_policy(
+        &self,
+        _tenant_id: &str,
+        _policy: &crate::policy::CapabilityPolicy,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// 取 tenant policy;默认 None(= 继承 Operator 的严默认)。
+    async fn get_tenant_policy(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<crate::policy::CapabilityPolicy>> {
+        Ok(None)
     }
 
     /// 失效 task 投影缓存(下次 get_task 重新 catch_up)。默认 no-op;BrokerEventStore 覆盖。
@@ -423,6 +443,7 @@ impl EventStore for LogdbdEventStore {
         provenance: &Provenance,
         body: Option<&serde_json::Value>,
         priority: i32,
+        effective_policy: Option<&crate::policy::EffectivePolicy>,
     ) -> Result<(String, AgentEvent)> {
         // fixus 分配 task_id(UUIDv7,全局唯一单调)— spec §8.4
         let task_id = format!(
@@ -435,6 +456,7 @@ impl EventStore for LogdbdEventStore {
             "provenance": provenance,
             "body": body.cloned().unwrap_or(serde_json::Value::Null),
             "priority": priority,
+            "effective_policy": effective_policy,
         });
         let content = serde_json::to_vec(&payload)
             .map_err(|e| AppError::Internal(format!("json: {}", e)))?;
@@ -536,7 +558,10 @@ impl EventStore for LogdbdEventStore {
             created_at: Utc::now(),
             metadata: None,
             priority: payload["priority"].as_i64().unwrap_or(0) as i32,
-            effective_policy: None,
+            effective_policy: payload
+                .get("effective_policy")
+                .filter(|v| !v.is_null())
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
         }))
     }
 
@@ -1455,7 +1480,7 @@ mod logdbd_tests {
     async fn create_test_task(store: &LogdbdEventStore, task_type: &str) -> String {
         let prov = test_provenance();
         let (tid, _ev) = store
-            .create_task(task_type, "t", "u", &prov, None, 0)
+            .create_task(task_type, "t", "u", &prov, None, 0, None)
             .await
             .unwrap();
         tid
@@ -1476,7 +1501,7 @@ mod logdbd_tests {
             created_by: "test".into(),
         };
         let (tid, ev) = store
-            .create_task("claude-code", "tenant-a", "user-1", &prov, None, 0)
+            .create_task("claude-code", "tenant-a", "user-1", &prov, None, 0, None)
             .await
             .unwrap();
         assert_eq!(ev.event_type, EventType::TaskCreated);
@@ -1677,7 +1702,7 @@ mod logdbd_tests {
         let (store, _dir) = setup().await;
         let prov = test_provenance();
         let (sid, ev) = store
-            .create_task("a", "t", "u", &prov, None, 0)
+            .create_task("a", "t", "u", &prov, None, 0, None)
             .await
             .unwrap();
         assert_eq!(ev.seq, 1, "task_created seq must be 1");
@@ -1805,7 +1830,7 @@ mod logdbd_tests {
         let (store, _dir) = setup().await;
         let prov = test_provenance();
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, None, 0)
+            .create_task("db.repair", "t", "u", &prov, None, 0, None)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;
@@ -1894,7 +1919,7 @@ mod logdbd_tests {
         // warm-up( primes logdbd 连接 / segment)
         for _ in 0..20 {
             let (tid, _) = store
-                .create_task("db.repair", "t", "u", &prov, None, 0)
+                .create_task("db.repair", "t", "u", &prov, None, 0, None)
                 .await
                 .unwrap();
             wait_seq(&store, &tid, 1).await;
@@ -1904,7 +1929,7 @@ mod logdbd_tests {
         for _ in 0..n {
             let t0 = std::time::Instant::now();
             let (tid, _) = store
-                .create_task("db.repair", "t", "u", &prov, None, 0)
+                .create_task("db.repair", "t", "u", &prov, None, 0, None)
                 .await
                 .unwrap();
             us.push(t0.elapsed().as_micros() as u64);
@@ -1919,7 +1944,7 @@ mod logdbd_tests {
         let (store, _d) = setup().await;
         let prov = test_provenance();
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, None, 0)
+            .create_task("db.repair", "t", "u", &prov, None, 0, None)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;
@@ -1971,7 +1996,7 @@ mod logdbd_tests {
         let prov = test_provenance();
         let body = serde_json::json!({"task_brief":"fix db1","contract":{"x":1}});
         let (tid, _) = store
-            .create_task("db.repair", "t", "u", &prov, Some(&body), 0)
+            .create_task("db.repair", "t", "u", &prov, Some(&body), 0, None)
             .await
             .unwrap();
         wait_seq(&store, &tid, 1).await;

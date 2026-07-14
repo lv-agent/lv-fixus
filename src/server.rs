@@ -64,6 +64,7 @@ impl IntoResponse for AppError {
             AppError::InvalidEventType(_) | AppError::InvalidPayload(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
+            AppError::PolicyViolation(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
 
@@ -303,6 +304,33 @@ async fn create_session_handler(
         created_by: "api".into(),
     };
     let task_type = req.task_type.as_deref().unwrap_or(&req.agent_type);
+
+    // Phase 1 沙箱边界:resolve effective(Operator ∩ Tenant ∩ Task)+ 越权硬失败(400)。
+    // tenant policy 缺省 = 严默认(继承 Operator);task policy 缺省 = 空(经 resolve 交集)。
+    let tenant_policy = state
+        .store
+        .get_tenant_policy(tenant_id)
+        .await?
+        .unwrap_or_default();
+    let task_req = req.policy.clone().unwrap_or_default();
+    let task_policy = task_req.policy.unwrap_or_default();
+    let effective = match crate::policy::resolve_and_validate(
+        &state.operator_policy,
+        &tenant_policy,
+        &task_policy,
+        task_req.agent_role,
+    ) {
+        Ok(e) => e,
+        Err(v) => {
+            return Err(AppError::PolicyViolation(format!(
+                "task policy exceeds tenant ceiling: {} fs_read_violation(s), {} fs_write_violation(s), {} net_violation(s)",
+                v.fs_read_violations.len(),
+                v.fs_write_violations.len(),
+                v.net_violations.len()
+            )));
+        }
+    };
+
     // fixus 分配 task_id(spec §8.4);req.session_id(client 指定)被忽略。
     let (task_id, event) = service::create_task(
         &*state.store,
@@ -310,6 +338,7 @@ async fn create_session_handler(
         &prov,
         req.body.as_ref(),
         req.priority,
+        Some(&effective),
     )
     .await?;
     // 打点(CR-4):新 task 计数。
@@ -869,7 +898,7 @@ mod tests {
     async fn mark_ready_handler_writes_event() {
         let (state, _registry, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0)
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0, None)
             .await
             .unwrap();
         wait_seq(&state, &tid, 1).await;
@@ -897,7 +926,7 @@ mod tests {
     async fn get_task_state_handler_returns_projection() {
         let (state, _reg, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0)
+        let (tid, _) = service::create_task(&*state.store, "db.repair", &prov, None, 0, None)
             .await
             .unwrap();
         wait_seq(&state, &tid, 1).await;

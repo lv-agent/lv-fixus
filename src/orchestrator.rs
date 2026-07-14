@@ -1702,7 +1702,7 @@ mod tests {
     async fn cr3_setup_task_at_executing(
         store: &dyn EventStore,
     ) -> (String, i64, String) {
-        let (tid, _) = service::create_task(store, "default", &test_provenance(), None, 0)
+        let (tid, _) = service::create_task(store, "default", &test_provenance(), None, 0, None)
             .await
             .unwrap();
         wait_seq(store, &tid, 1).await;
@@ -1856,8 +1856,8 @@ mod tests {
         let orch = Orchestrator::new(store.clone(), registry, tp).with_max_concurrent(1);
 
         let prov = test_provenance();
-        let (ta, _) = service::create_task(&*store, "default", &prov, None, 0).await.unwrap();
-        let (tb, _) = service::create_task(&*store, "default", &prov, None, 0).await.unwrap();
+        let (ta, _) = service::create_task(&*store, "default", &prov, None, 0, None).await.unwrap();
+        let (tb, _) = service::create_task(&*store, "default", &prov, None, 0, None).await.unwrap();
         wait_seq(&*store, &ta, 1).await;
         wait_seq(&*store, &tb, 1).await;
 
@@ -1895,7 +1895,7 @@ mod tests {
         let orch = Orchestrator::new(store.clone(), registry, tp).with_max_concurrent(2);
 
         let prov = test_provenance();
-        let (th, _) = service::create_task(&*store, "default", &prov, None, 9).await.unwrap();
+        let (th, _) = service::create_task(&*store, "default", &prov, None, 9, None).await.unwrap();
         wait_seq(&*store, &th, 1).await;
 
         // 高优先 task 的 turn 入队;priority 从 task head 读出进 QueuedTurn(dispatch_pending 派发后 in_flight=1)

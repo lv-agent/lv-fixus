@@ -28,6 +28,7 @@ pub async fn create_task(
     provenance: &crate::models::Provenance,
     body: Option<&serde_json::Value>,
     priority: i32,
+    effective_policy: Option<&crate::policy::EffectivePolicy>,
 ) -> Result<(String, AgentEvent)> {
     let tenant_id = provenance
         .source_tenant_id
@@ -35,7 +36,7 @@ pub async fn create_task(
         .unwrap_or_else(|| "default".to_string());
     let user_id = provenance.source_user_id.clone().unwrap_or_default();
     store
-        .create_task(task_type, &tenant_id, &user_id, provenance, body, priority)
+        .create_task(task_type, &tenant_id, &user_id, provenance, body, priority, effective_policy)
         .await
 }
 
@@ -901,7 +902,7 @@ mod tests {
     async fn create_task_assigns_id_and_created_state() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, ev) = create_task(&store, "db.repair", &prov, None, 0)
+        let (tid, ev) = create_task(&store, "db.repair", &prov, None, 0, None)
             .await
             .unwrap();
         assert_eq!(ev.event_type, EventType::TaskCreated);
@@ -917,7 +918,7 @@ mod tests {
     async fn lifecycle_transitions_enforce_invariants() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0, None).await.unwrap();
         wait_seq(&store, &tid, 1).await;
 
         // 非法:created → claimed(跳过 ready)
@@ -971,7 +972,7 @@ mod tests {
     async fn cancel_from_blocked_returns_to_ready() {
         let (store, _d) = setup().await;
         let prov = test_provenance();
-        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0, None).await.unwrap();
         wait_seq(&store, &tid, 1).await;
         mark_task_ready(&store, &tid).await.unwrap();
         wait_seq(&store, &tid, 2).await;
@@ -1000,7 +1001,7 @@ mod tests {
         let (store, _d) = setup().await;
         let prov = test_provenance();
         // created → canceled
-        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0).await.unwrap();
+        let (tid, _) = create_task(&store, "db.repair", &prov, None, 0, None).await.unwrap();
         wait_seq(&store, &tid, 1).await;
         cancel_task(&store, &tid, "abandoned").await.unwrap();
         wait_seq(&store, &tid, 2).await;
