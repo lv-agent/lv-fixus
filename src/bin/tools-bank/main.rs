@@ -10,6 +10,7 @@
 mod adapter;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,12 @@ struct Cli {
 
     #[arg(long, default_value = "3001")]
     port: u16,
+
+    /// operator extras catalog file (shared with sandbox-server); tools beyond
+    /// the 8 builtins. Missing/unreadable → builtins only (not fatal); malformed
+    /// → log + builtins only.
+    #[arg(long)]
+    extra_tools: Option<PathBuf>,
 }
 
 // ── MCP types ──
@@ -262,13 +269,14 @@ async fn try_consume_results(
     Ok(())
 }
 
-// ── 构造 registry:sandbox builtins + env 外部 HTTP adapter ──
+// ── 构造 registry:sandbox builtins + operator extras + env 外部 HTTP adapter ──
 
 fn build_registry(
     producer: BrokerProducer,
     pending: PendingMap,
     namespace: String,
     region: String,
+    extras: Vec<fixus_tool_catalog::ToolSpec>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
@@ -277,6 +285,7 @@ fn build_registry(
         pending: pending.clone(),
         namespace: namespace.clone(),
         region: region.clone(),
+        extras,
     };
     registry
         .register(Box::new(sandbox))
@@ -343,11 +352,31 @@ async fn main() {
     // pending 共享:sandbox adapter(注册工具时) + result consumer(回灌结果)
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
+    // Load operator extras catalog (shared with sandbox-server). CLI flag 优先于
+    // FIXUS_TOOLS_CATALOG_FILE env;missing/unreadable → builtins only(not fatal);
+    // malformed → log + builtins only(spec §7:extras 永不让一个坏 catalog 打挂 tools-bank)。
+    let extra_path = cli.extra_tools.clone()
+        .or_else(|| std::env::var("FIXUS_TOOLS_CATALOG_FILE").ok().map(PathBuf::from));
+    let extras: Vec<fixus_tool_catalog::ToolSpec> = match extra_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(s) => match fixus_tool_catalog::parse_extra_catalog(&s) {
+            Ok(v) => { tracing::info!("loaded {} extra tool(s) from {:?}", v.len(), extra_path); v }
+            Err(e) => { tracing::error!("extra-tools parse failed ({:?}): {}; continuing with builtins only", extra_path, e); vec![] }
+        },
+        None => vec![],
+    };
+    tracing::info!(
+        "tool catalog for sandbox adapter: {} total ({} builtins + {} extras)",
+        fixus_tool_catalog::builtins().len() + extras.len(),
+        fixus_tool_catalog::builtins().len(),
+        extras.len()
+    );
+
     let registry = build_registry(
         producer,
         pending.clone(),
         cli.namespace.clone(),
         cli.region.clone(),
+        extras,
     );
 
     let state = Arc::new(AppState { registry });

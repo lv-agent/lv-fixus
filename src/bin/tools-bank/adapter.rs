@@ -14,21 +14,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use fixus_tool_catalog::{builtins, find, ToolDef, ToolSpec};
 use logdb_client::broker::BrokerProducer;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 
 // ── 工具元数据 / 结果 / 上下文 ───────────────────────────────────────────
 
-/// 工具元数据。`tools/list` 直接序列化此结构(故字段名/顺序 = MCP 契约)。
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    #[serde(rename = "inputSchema")]
-    pub input_schema: serde_json::Value,
-}
+// `ToolDef`(MCP-facing:`{name, description, input_schema}` + serde rename
+// `inputSchema`)来自 `fixus_tool_catalog` —— 它现在是工具身份的 single source
+// of truth(见 `crates/tool-catalog/src/lib.rs`)。本 crate 不再自带 ToolDef,
+// 避免与 catalog 出现两份逐字节漂移的定义。tools/list 直接序列化此结构,故其
+// 字段名/顺序 = MCP 契约(由 catalog 保证)。
 
 /// 统一工具执行结果。`success` 驱动 MCP `isError`;adapter 级 infra 故障用
 /// [`AdapterError`] 表达(→ MCP -32603),区别于"工具执行了但失败"(→ isError)。
@@ -201,17 +198,16 @@ pub fn build_key(task_id: &str, tool_name: &str, args: &serde_json::Value) -> St
     format!("{}:bank:{}:{}", task_id, tool_name, &hash[..16])
 }
 
-/// per-tool 默认超时表(秒)。与原 `default_timeout` 逐项 parity。
-pub fn default_timeout(tool_name: &str) -> u64 {
-    let name = tool_name
-        .strip_prefix("fixus_")
-        .unwrap_or(tool_name)
-        .to_lowercase();
-    match name.as_str() {
-        "bash" => 30,
-        "read" | "write" | "edit" | "glob" | "grep" => 15,
-        _ => 30,
-    }
+/// per-tool 默认超时(秒)。查 catalog(已合并 builtins + extras),按全名查找;
+/// 命中 → `default_timeout_secs`,未命中(外部工具 / 未知)→ 30s 兜底。
+///
+/// **不剥离 `fixus_` 前缀** —— catalog 用全名键(`fixus_bash` / `fixus_jq` / ...)。
+/// 与原硬编码表逐项 parity:bash=30,read/write/edit/glob/grep=15(均为 catalog
+/// 内置值);新增 jq/rg=15;未知工具仍 30s 兜底。
+pub fn default_timeout(tool_name: &str, all_tools: &[ToolSpec]) -> u64 {
+    find(all_tools, tool_name)
+        .map(|s| s.default_timeout_secs)
+        .unwrap_or(30)
 }
 
 /// 构造 sandbox payload(纯函数,便于 parity 快照测试)。
@@ -276,91 +272,26 @@ pub type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<PendingToolResul
 
 // ── SandboxAdapter(parity)──────────────────────────────────────────────
 
-/// 原 6 builtins 的归属:broker→sandbox 路径。行为与重构前逐字节等价。
+/// 原 8 builtins(6 originals + jq + rg)与 operator extras 的归属:broker→
+/// sandbox 路径。行为与重构前对 builtins 逐字节等价(身份现由 catalog 提供)。
+/// `extras` 是从 `--extra-tools` / `FIXUS_TOOLS_CATALOG_FILE` 加载的 operator
+/// 外部二进制工具,与 builtins 合并后同时出现在 `tools/list` 与 timeout 查找中。
 pub struct SandboxAdapter {
     pub producer: Arc<Mutex<BrokerProducer>>,
     pub pending: PendingMap,
     pub namespace: String,
     pub region: String,
+    /// operator extras(与 builtins 同一 `ToolSpec` 形态,经 broker 同路径派发)。
+    pub extras: Vec<ToolSpec>,
 }
 
-/// 6 builtins 定义(独立函数,parity 快照测试用)。
+/// 内置工具定义(catalog 来源)。返回 8 个 ToolDef(6 originals + fixus_jq +
+/// fixus_rg)。保留独立函数供 parity 快照测试用(无 broker 依赖的纯路径);
+/// `SandboxAdapter::tools()` 在 extras=∅ 时与此等价。仅测试用 —— 生产路径走
+/// `SandboxAdapter::tools()`(builtins ∪ extras)。
+#[cfg(test)]
 pub fn builtin_tools() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "fixus_bash".into(),
-            description: "Execute a shell command (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The command to execute"},
-                    "description": {"type": "string", "description": "Brief description"}
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDef {
-            name: "fixus_read".into(),
-            description: "Read a file (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Path to file (relative or absolute, scoped to workspace)"},
-                    "offset": {"type": "integer", "description": "Line number to start reading from"},
-                    "limit": {"type": "integer", "description": "Number of lines to read"}
-                },
-                "required": ["file_path"]
-            }),
-        },
-        ToolDef {
-            name: "fixus_write".into(),
-            description: "Write to a file (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Path to file (relative or absolute, scoped to workspace)"},
-                    "content": {"type": "string", "description": "Content to write"}
-                },
-                "required": ["file_path", "content"]
-            }),
-        },
-        ToolDef {
-            name: "fixus_edit".into(),
-            description: "Edit a file by replacing a string (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "Path to file (relative or absolute, scoped to workspace)"},
-                    "old_string": {"type": "string", "description": "String to replace"},
-                    "new_string": {"type": "string", "description": "Replacement string"}
-                },
-                "required": ["file_path", "old_string", "new_string"]
-            }),
-        },
-        ToolDef {
-            name: "fixus_glob".into(),
-            description: "Find files matching a pattern (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern (e.g. *.rs)"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-        ToolDef {
-            name: "fixus_grep".into(),
-            description: "Search for a pattern in files (via fixus sandbox)".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Pattern to search for"},
-                    "path": {"type": "string", "description": "Directory or file to search in"}
-                },
-                "required": ["pattern"]
-            }),
-        },
-    ]
+    builtins().iter().map(ToolDef::from).collect()
 }
 
 #[async_trait]
@@ -370,7 +301,11 @@ impl ActionAdapter for SandboxAdapter {
     }
 
     fn tools(&self) -> Vec<ToolDef> {
-        builtin_tools()
+        builtins()
+            .iter()
+            .chain(self.extras.iter())
+            .map(ToolDef::from)
+            .collect()
     }
 
     async fn invoke(
@@ -381,7 +316,9 @@ impl ActionAdapter for SandboxAdapter {
     ) -> Result<ToolResult, AdapterError> {
         let step_id = uuid::Uuid::now_v7().to_string();
         let tool_call_id = uuid::Uuid::now_v7().to_string();
-        let timeout_secs = default_timeout(tool);
+        // timeout 查 builtins ∪ 本 adapter 的 extras(全名查找,无前缀剥离)。
+        let all: Vec<ToolSpec> = builtins().iter().chain(self.extras.iter()).cloned().collect();
+        let timeout_secs = default_timeout(tool, &all);
         let stream = format!("tool-invoke-{}", self.region);
         let payload = sandbox_payload(
             &ctx.task_id,
@@ -783,24 +720,30 @@ mod tests {
 
 
     #[test]
-    fn sandbox_tools_are_the_six_builtins() {
+    fn sandbox_tools_list_catalog_sourced() {
+        // tools/list 现以 catalog 为 source of truth:`SandboxAdapter`(无 extras)
+        // 暴露 builtins()—— 6 originals + fixus_jq + fixus_rg = 8 个。无 broker
+        // 依赖的纯路径直接测 `builtin_tools()`(它就是 `SandboxAdapter::tools()`
+        // 在 extras=∅ 时的结果)。identity 由 catalog 保证 byte-parity。
         let tools = builtin_tools();
+        assert_eq!(tools.len(), 8, "expected 6 originals + jq + rg");
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "fixus_bash",
-                "fixus_read",
-                "fixus_write",
-                "fixus_edit",
-                "fixus_glob",
-                "fixus_grep"
-            ]
-        );
-        // 每个 tool 的关键字段非空
+        for expected in [
+            "fixus_bash",
+            "fixus_read",
+            "fixus_write",
+            "fixus_edit",
+            "fixus_glob",
+            "fixus_grep",
+            "fixus_jq",
+            "fixus_rg",
+        ] {
+            assert!(names.contains(&expected), "missing builtin {}", expected);
+        }
+        // 每个 tool 的关键字段非空 + schema 形状(MCP 契约)
         for t in &tools {
-            assert!(!t.description.is_empty());
-            assert_eq!(t.input_schema["type"], "object");
+            assert!(!t.description.is_empty(), "{}", t.name);
+            assert_eq!(t.input_schema["type"], "object", "{}", t.name);
         }
     }
 
@@ -832,15 +775,21 @@ mod tests {
 
     #[test]
     fn default_timeout_table_preserved() {
-        assert_eq!(default_timeout("fixus_bash"), 30);
-        assert_eq!(default_timeout("fixus_read"), 15);
-        assert_eq!(default_timeout("fixus_write"), 15);
-        assert_eq!(default_timeout("fixus_edit"), 15);
-        assert_eq!(default_timeout("fixus_glob"), 15);
-        assert_eq!(default_timeout("fixus_grep"), 15);
-        // 非 builtin / 外部工具默认 30s
-        assert_eq!(default_timeout("ext_slack"), 30);
-        assert_eq!(default_timeout("BASH"), 30); // 大写非 fixus_ 前缀 → 30
+        // catalog 为 source:bash=30,read/write/edit/glob/grep=15,新增 jq/rg=15,
+        // 未知工具 30s 兜底。无 `fixus_` 前缀剥离 —— 全名查找。
+        let all: Vec<ToolSpec> = builtins().to_vec();
+        assert_eq!(default_timeout("fixus_bash", &all), 30);
+        assert_eq!(default_timeout("fixus_read", &all), 15);
+        assert_eq!(default_timeout("fixus_write", &all), 15);
+        assert_eq!(default_timeout("fixus_edit", &all), 15);
+        assert_eq!(default_timeout("fixus_glob", &all), 15);
+        assert_eq!(default_timeout("fixus_grep", &all), 15);
+        // jq / rg 是新 builtin(均 15s)
+        assert_eq!(default_timeout("fixus_jq", &all), 15);
+        assert_eq!(default_timeout("fixus_rg", &all), 15);
+        // 非 builtin / 未知工具默认 30s 兜底(全名不命中)
+        assert_eq!(default_timeout("ext_slack", &all), 30);
+        assert_eq!(default_timeout("BASH", &all), 30); // 大写不命中 → 30
     }
 
     #[test]
