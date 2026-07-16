@@ -1787,7 +1787,8 @@ async fn run_lifecycle_consumer(
                         let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
                         let idempotency_key = payload["idempotency_key"].as_str().unwrap_or("");
                         let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let input = payload.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                        let null = serde_json::Value::Null;
+                        let input = payload.get("input").unwrap_or(&null);
                         if step_id.is_empty() { continue; }
                         tracing::info!("lifecycle: tool_invoked task={} step={}", task_id, step_id);
                         let _ = orch.handle_tool_invoked(task_id, turn_id, step_id, tool_name, tool_call_id, idempotency_key, &input, local_seq).await;
@@ -1797,7 +1798,8 @@ async fn run_lifecycle_consumer(
                         let step_id = payload["step_id"].as_str().unwrap_or("");
                         let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
                         let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let output = payload.get("output").cloned().unwrap_or(serde_json::Value::Null);
+                        let null = serde_json::Value::Null;
+                        let output = payload.get("output").unwrap_or(&null);
                         let is_error = payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         if step_id.is_empty() { continue; }
                         tracing::info!("lifecycle: tool_completed task={} step={}", task_id, step_id);
@@ -1819,7 +1821,16 @@ async fn run_lifecycle_consumer(
                         let step_id = payload["step_id"].as_str().unwrap_or("");
                         let model = payload["model"].as_str().unwrap_or("");
                         let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let messages: Vec<crate::models::Message> = payload.get("messages").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+                        let messages: Vec<crate::models::Message> = match payload.get("messages") {
+                            Some(v) => match serde_json::from_value(v.clone()) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!("lifecycle: llm_invoked malformed messages task={}: {}", task_id, e);
+                                    vec![]
+                                }
+                            },
+                            None => vec![],
+                        };
                         if step_id.is_empty() { continue; }
                         tracing::info!("lifecycle: llm_invoked task={} step={}", task_id, step_id);
                         let _ = orch.handle_llm_invoked(task_id, turn_id, step_id, model, &messages, local_seq).await;
@@ -2474,6 +2485,7 @@ mod tests {
         let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
         assert_eq!(evs[0].event_type, EventType::LlmCompleted);
         assert_eq!(evs[0].step_id.as_deref(), Some("llm-step-1"));
+        assert_eq!(evs[0].payload["local_seq"], 1);
 
         let out = orch.metrics_handle().render();
         assert!(
