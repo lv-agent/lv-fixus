@@ -37,7 +37,7 @@ pub struct ToolResult {
     pub duration_ms: u64,
 }
 
-/// 调用上下文(跨 adapter 契约:task_id + 幂等键)。
+/// 调用上下文(跨 adapter 契约:task_id + 幂等键 + 步事件配对键)。
 #[derive(Debug, Clone)]
 pub struct CallCtx {
     pub task_id: String,
@@ -46,6 +46,13 @@ pub struct CallCtx {
     /// 来自 HTTP `X-Fixus-Policy` header,由 SandboxAdapter 写入 tool-invoke event
     /// metadata 供 sandbox-server 消费(CallCtx 本身不序列化,故无需 serde 属性)。
     pub effective_policy: Option<serde_json::Value>,
+    /// task-end 配对 key(整个 tools/call 共享,由 tools_call 铸造)。
+    /// SandboxAdapter 复用此值作为 tool-invoke→sandbox 的 pending-map key +
+    /// invoke metadata step_id(逐字节一致),让 fixus 收到的两半落在同一 step。
+    pub step_id: String,
+    /// 来自 `X-Fixus-Turn-Id`;直接 MCP 调用(无 turn)时为 None。
+    /// 步事件允许 NULL turn_id(models.rs: turn_id 可为 NULL)。
+    pub turn_id: Option<i64>,
 }
 
 /// Adapter 级 infra 故障(无法到达执行器:broker down / 连接拒绝 / 超时)。
@@ -314,7 +321,7 @@ impl ActionAdapter for SandboxAdapter {
         args: &serde_json::Value,
         ctx: &CallCtx,
     ) -> Result<ToolResult, AdapterError> {
-        let step_id = uuid::Uuid::now_v7().to_string();
+        let step_id = ctx.step_id.clone();
         let tool_call_id = uuid::Uuid::now_v7().to_string();
         // timeout 查 builtins ∪ 本 adapter 的 extras(全名查找,无前缀剥离)。
         let all: Vec<ToolSpec> = builtins().iter().chain(self.extras.iter()).cloned().collect();
@@ -612,6 +619,8 @@ mod tests {
             task_id: "t".into(),
             idempotency_key: "k".into(),
             effective_policy: Some(serde_json::json!({"agent_role": "reader"})),
+            step_id: "test-step".into(),
+            turn_id: None,
         };
         assert!(ctx.effective_policy.is_some());
         assert_eq!(ctx.effective_policy.as_ref().unwrap()["agent_role"], "reader");
@@ -620,6 +629,8 @@ mod tests {
             task_id: "t".into(),
             idempotency_key: "k".into(),
             effective_policy: None,
+            step_id: "test-step".into(),
+            turn_id: None,
         };
         assert!(ctx_none.effective_policy.is_none());
     }
@@ -671,6 +682,8 @@ mod tests {
                 task_id: "t".into(),
                 idempotency_key: "k".into(),
                 effective_policy: None,
+                step_id: "test-step".into(),
+                turn_id: None,
             })
             .await
             .expect_err("unknown tool");
@@ -689,6 +702,8 @@ mod tests {
                 task_id: "t".into(),
                 idempotency_key: "k".into(),
                 effective_policy: None,
+                step_id: "test-step".into(),
+                turn_id: None,
             })
             .await
             .unwrap();
@@ -886,6 +901,8 @@ mod tests {
                     task_id: "t1".into(),
                     idempotency_key: "k1".into(),
                     effective_policy: None,
+                    step_id: "test-step".into(),
+                    turn_id: None,
                 },
             )
             .await
@@ -928,6 +945,8 @@ mod tests {
                     task_id: "t".into(),
                     idempotency_key: "k".into(),
                     effective_policy: None,
+                    step_id: "test-step".into(),
+                    turn_id: None,
                 },
             )
             .await
@@ -974,6 +993,8 @@ mod tests {
                     task_id: "t".into(),
                     idempotency_key: "k".into(),
                     effective_policy: None,
+                    step_id: "test-step".into(),
+                    turn_id: None,
                 },
             )
             .await

@@ -112,19 +112,23 @@ fn tools_list(registry: &ToolRegistry, id: Option<i64>) -> McpResponse {
 async fn tools_call(
     state: &AppState,
     task_id: &str,
+    turn_id: Option<i64>,
     tool_name: &str,
     args: &serde_json::Value,
     effective_policy: Option<serde_json::Value>,
     id: Option<i64>,
 ) -> McpResponse {
     let idempotency_key = build_key(task_id, tool_name, args);
+    let step_id = uuid::Uuid::now_v7().to_string();
     let ctx = CallCtx {
         task_id: task_id.to_string(),
         idempotency_key,
         effective_policy,
+        step_id,
+        turn_id,
     };
 
-    tracing::info!("tools-bank: tools/call task={} tool={}", task_id, tool_name);
+    tracing::info!("tools-bank: tools/call task={} tool={} step={}", task_id, tool_name, ctx.step_id);
 
     match state.registry.invoke(tool_name, args, &ctx).await {
         Ok(r) => {
@@ -181,6 +185,10 @@ async fn handle_mcp(
             let task_id = headers.get("X-Fixus-Session-Id")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
+            // X-Fixus-Turn-Id:fixlet 按轮注入;直接 MCP 调用(无 turn)→ None。
+            let turn_id = headers.get("X-Fixus-Turn-Id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<i64>().ok());
             // X-Fixus-Policy:fixlet 注入的 effective policy JSON 字符串 → opaque Value。
             // 缺 header 或非法 JSON → None(sandbox 侧 fail-closed 严默认)。
             let effective_policy = headers.get("X-Fixus-Policy")
@@ -188,7 +196,7 @@ async fn handle_mcp(
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(serde_json::Value::Null);
 
-            Ok(Json(tools_call(&state, task_id, tool_name, &args, effective_policy, body.id).await))
+            Ok(Json(tools_call(&state, task_id, turn_id, tool_name, &args, effective_policy, body.id).await))
         }
         _ => {
             Ok(Json(mcp_err(body.id, -32601, &format!("unknown method: {}", body.method))))
