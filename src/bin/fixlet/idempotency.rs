@@ -62,6 +62,9 @@ pub struct TurnContext {
     pub local_seq: LocalSeqCounter,
     /// Agent 当前使用的 model（从 ACP session/new 响应中提取）
     pub model: String,
+    /// 本 turn 的 LLM step 标识。session/prompt 发送前 mint,
+    /// 在 llm_invoked / llm_completed / llm_failed 三事件间共享,用于配对。
+    pub step_id: Option<String>,
 }
 
 impl TurnContext {
@@ -78,6 +81,7 @@ impl TurnContext {
             redo_count,
             local_seq: LocalSeqCounter::new(),
             model: String::new(),
+            step_id: None,
         }
     }
 }

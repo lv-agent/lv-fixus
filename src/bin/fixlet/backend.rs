@@ -143,11 +143,17 @@ pub fn build_session_new_params(
     task_id: &str,
     cwd: &str,
     tools_bank_url: &str,
+    turn_id: i64,
     effective_policy: Option<String>,
 ) -> Value {
-    // headers 动态构造:X-Fixus-Session-Id(per-task 路由)恒在;
-    // X-Fixus-Policy(effective policy JSON 字符串)仅当 policy 存在时注入。
-    let mut headers = vec![serde_json::json!({"name": "X-Fixus-Session-Id", "value": task_id})];
+    // headers 动态构造:
+    // - X-Fixus-Session-Id(per-task 路由)恒在
+    // - X-Fixus-Turn-Id(本 turn 标识,tools-bank 用它关联 tool 事件到 turn)恒在
+    // - X-Fixus-Policy(effective policy JSON 字符串)仅当 policy 存在时注入
+    let mut headers = vec![
+        serde_json::json!({"name": "X-Fixus-Session-Id", "value": task_id}),
+        serde_json::json!({"name": "X-Fixus-Turn-Id", "value": turn_id}),
+    ];
     if let Some(p) = effective_policy {
         headers.push(serde_json::json!({"name": "X-Fixus-Policy", "value": p}));
     }
@@ -284,7 +290,7 @@ mod tests {
         // warm-up
         for _ in 0..1000 {
             let _ = b.spawn_spec();
-            let p = build_session_new_params(&b, "t", "/tmp", "http://tb/mcp", None);
+            let p = build_session_new_params(&b, "t", "/tmp", "http://tb/mcp", 1, None);
             let _ = build_session_new_request(1, p);
             let _ = b.extract_model(&result);
         }
@@ -293,7 +299,7 @@ mod tests {
         for i in 0..n {
             let t0 = std::time::Instant::now();
             let _ = b.spawn_spec();
-            let p = build_session_new_params(&b, &format!("t{i}"), "/tmp", "http://tb/mcp", None);
+            let p = build_session_new_params(&b, &format!("t{i}"), "/tmp", "http://tb/mcp", 1, None);
             let _ = build_session_new_request(i as i64, p);
             let m = b.extract_model(&result);
             ns.push(t0.elapsed().as_nanos() as u64);
@@ -327,16 +333,19 @@ mod tests {
     #[test]
     fn build_session_new_params_matches_legacy_claude() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
-        let got = build_session_new_params(&b, "task_abc", "/tmp/work", "http://127.0.0.1:3001/mcp", None);
+        let got = build_session_new_params(&b, "task_abc", "/tmp/work", "http://127.0.0.1:3001/mcp", 42, None);
 
-        // 重构前 router.rs:440 硬编码的等价 params(legacy oracle)
+        // 等价 params(legacy oracle + X-Fixus-Turn-Id header,step-events Phase 3)
         let legacy = serde_json::json!({
             "cwd": "/tmp/work",
             "mcpServers": [{
                 "type": "http",
                 "name": "fixus",
                 "url": "http://127.0.0.1:3001/mcp",
-                "headers": [{"name": "X-Fixus-Session-Id", "value": "task_abc"}]
+                "headers": [
+                    {"name": "X-Fixus-Session-Id", "value": "task_abc"},
+                    {"name": "X-Fixus-Turn-Id", "value": 42}
+                ]
             }]
         });
         assert_eq!(got, legacy, "session/new params 必须与重构前等价");
@@ -347,7 +356,7 @@ mod tests {
     #[test]
     fn build_session_new_request_matches_legacy_envelope() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
-        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", None);
+        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", 7, None);
         let got = build_session_new_request(7, params);
 
         let legacy = serde_json::json!({
@@ -356,7 +365,10 @@ mod tests {
                 "cwd": "/tmp",
                 "mcpServers": [{
                     "type": "http", "name": "fixus", "url": "http://tb/mcp",
-                    "headers": [{"name": "X-Fixus-Session-Id", "value": "task_x"}]
+                    "headers": [
+                        {"name": "X-Fixus-Session-Id", "value": "task_x"},
+                        {"name": "X-Fixus-Turn-Id", "value": 7}
+                    ]
                 }]
             }
         });
@@ -373,10 +385,21 @@ mod tests {
             fn session_new_extra(&self) -> Value { serde_json::json!({"model": "gpt-5", "mode": "plan"}) }
             fn extract_model(&self, _: &Value) -> Option<String> { None }
         }
-        let got = build_session_new_params(&WithExtra, "t", "/tmp", "http://tb", None);
+        let got = build_session_new_params(&WithExtra, "t", "/tmp", "http://tb", 1, None);
         assert_eq!(got["model"], "gpt-5");
         assert_eq!(got["mode"], "plan");
         assert_eq!(got["mcpServers"][0]["headers"][0]["value"], "t"); // 外壳仍在
+    }
+
+    // ── X-Fixus-Turn-Id header(step-events Phase 3)──
+
+    #[test]
+    fn session_new_params_include_turn_id_header() {
+        let backend = select_backend("claude-code");
+        let params = build_session_new_params(backend.as_ref(), "task-123", "/cwd", "http://tools-bank", 42, None);
+        let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
+        let turn_id_hdr = headers.iter().find(|h| h["name"] == "X-Fixus-Turn-Id").unwrap();
+        assert_eq!(turn_id_hdr["value"], 42);
     }
 
     // ── X-Fixus-Policy header 注入(Part C2)──
@@ -394,6 +417,7 @@ mod tests {
             "task_x",
             "/tmp",
             "http://tb/mcp",
+            1,
             Some(policy.to_string()),
         );
         let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
@@ -410,7 +434,7 @@ mod tests {
     #[test]
     fn session_new_params_omit_policy_header_when_absent() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
-        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", None);
+        let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", 1, None);
         let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
         assert!(!headers.iter().any(|h| h["name"] == "X-Fixus-Policy"));
     }

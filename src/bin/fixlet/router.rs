@@ -507,6 +507,7 @@ async fn handle_execute_turn_from_broker(
         task_id,
         &cwd,
         &tools_bank_url,
+        turn_id,
         policy_str,
     );
     acp.send_raw(
