@@ -415,6 +415,35 @@ mod tests {
     }
 
     #[test]
+    fn g1_git_profile_contract_three_scopes_net_survives_with_operator_role() {
+        // CR-12 G1 契约:桥 net_profile_override 认 effective_policy.net.egress 非空 → 选 git
+        // profile(开 allowlist 出口)。effective net 非空需要三 scope(Operator∩Tenant∩Task)
+        // 同声明同一 egress 且 agent_role=Operator。任一 scope 缺(intersect_net 清空)或
+        // role=Reader(role_narrow 清空 net)→ effective net 空(fail-closed:Reader/默认任务拿不到网络)。
+        let egress = |h: &str| CapabilityPolicy {
+            fs: FsPolicy::default(),
+            net: NetPolicy { egress: vec![rule(h)] },
+        };
+
+        // 三 scope 同声明 + Operator → egress 存活
+        let eff = resolve_effective(&egress("github.com"), &egress("github.com"), &egress("github.com"), AgentRole::Operator);
+        assert_eq!(eff.net.egress.len(), 1, "三 scope 同声明 + operator → egress 存活");
+        assert_eq!(eff.agent_role, AgentRole::Operator);
+
+        // tenant scope 缺(默认空)→ intersect_net 清空
+        let eff = resolve_effective(&egress("github.com"), &CapabilityPolicy::default(), &egress("github.com"), AgentRole::Operator);
+        assert!(eff.net.egress.is_empty(), "tenant 缺声明 → 交集清空 net");
+
+        // task scope 缺(默认空)→ intersect_net 清空
+        let eff = resolve_effective(&egress("github.com"), &egress("github.com"), &CapabilityPolicy::default(), AgentRole::Operator);
+        assert!(eff.net.egress.is_empty(), "task 缺声明 → 交集清空 net");
+
+        // 三 scope 全声明但 role=Reader → role_narrow 清空 net
+        let eff = resolve_effective(&egress("github.com"), &egress("github.com"), &egress("github.com"), AgentRole::Reader);
+        assert!(eff.net.egress.is_empty(), "Reader → role_narrow 清空 net");
+    }
+
+    #[test]
     fn validate_subset_child_within_parent_ok() {
         let parent = policy(&["/home/x"], &[], &[]);
         let child = policy(&["/home/x/proj"], &[], &[]);
