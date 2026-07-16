@@ -44,7 +44,7 @@ pub struct CallCtx {
     pub idempotency_key: String,
     /// 透传的 effective policy(opaque JSON,tools-bank 不解析)。
     /// 来自 HTTP `X-Fixus-Policy` header,由 SandboxAdapter 写入 tool-invoke event
-    /// metadata 供 sandbox-server 消费(CallCtx 本身不序列化,故无需 serde 属性)。
+    /// metadata 供 sandbox 消费方消费(CallCtx 本身不序列化,故无需 serde 属性)。
     pub effective_policy: Option<serde_json::Value>,
     /// task-end 配对 key(整个 tools/call 共享,由 tools_call 铸造)。
     /// SandboxAdapter 复用此值作为 tool-invoke→sandbox 的 pending-map key +
@@ -245,7 +245,7 @@ pub fn sandbox_payload(
 /// 构造 tool-invoke event 的 metadata(含 effective_policy,若有)。
 ///
 /// `task_id` / `step_id` / `event_type` 恒在;`effective_policy` 仅当 `Some` 时
-/// 以序列化 JSON 字符串写入(sandbox-server 侧 `serde_json::from_str` 反序列化)。
+/// 以序列化 JSON 字符串写入(sandbox 消费方侧 `serde_json::from_str` 反序列化)。
 /// 抽纯函数便于单测 + 让 `SandboxAdapter::invoke` 聚焦副作用(broker produce)。
 pub fn build_invoke_meta(
     task_id: &str,

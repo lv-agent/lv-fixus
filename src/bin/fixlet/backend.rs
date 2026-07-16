@@ -39,6 +39,18 @@ pub struct ClaudeCodeBackend {
     command: String,
 }
 
+/// Claude Code 内置工具全集(`claude_code` preset)。session/new 经
+/// `_meta.claudeCode.options.disallowedTools` 全部 deny → 这些工具从模型上下文移除,
+/// 模型只剩 `mcp__fixus__*`(8 工具),必走 fixus 工具链(tools-bank→broker→sandbox)。
+///
+/// 多列无害(SDK 语义:deny 一个不存在的工具是 no-op)。`AskUserQuestion` 由 ACP 自身
+/// 基线 deny(`acp-agent.js` createSession),此处不重复。
+const NATIVE_CLAUDE_TOOLS: &[&str] = &[
+    "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep",
+    "NotebookEdit", "TodoWrite", "WebSearch", "WebFetch",
+    "Task", "Agent", "BashOutput", "KillShell", "ExitPlanMode",
+];
+
 impl ClaudeCodeBackend {
     pub fn new(command: String) -> Self {
         Self { command }
@@ -66,6 +78,32 @@ impl AgentBackend for ClaudeCodeBackend {
             .and_then(|m| m.get("currentModelId"))
             .and_then(|s| s.as_str())
             .map(String::from)
+    }
+
+    /// session/new 注入 `_meta.claudeCode.options.disallowedTools = NATIVE_CLAUDE_TOOLS`
+    /// → claude-agent-acp 把这些内置工具名(Read/Write/Edit/Bash/Glob/Grep/Task/…)从模型
+    /// 上下文移除(SDK `disallowedTools` 语义:removed from the model's context)。preset
+    /// 仍加载、`mcpServers`(fixus)正常发现,于是模型只看到 `mcp__fixus__*`(8 工具),必走
+    /// tools-bank→broker→sandbox-broker→lv-sandbox 工具链。bypassPermissions 默认开
+    /// (`ALLOW_BYPASS`),fixus 工具免审批不卡死。
+    ///
+    /// 修的是"agent 永远优先用内置工具"的经典坑:仅加 `fixus_` 前缀只消除名字碰撞,不足以让
+    /// agent 放弃原生工具。此处用 `disallowedTools` 把原生工具从上下文剔除,agent 别无选择。
+    ///
+    /// **为何不用 `_meta.disableBuiltInTools=true`(→ SDK `tools=[]`)**:实测会让 agent 进
+    /// 退化态——MCP 工具不再被发现(tools-bank 0 请求)、model 调用不发起(agent 无 socket)、
+    /// turn 无限卡死。`tools=[]` 这条路径在本 agent(model=glm-5.2 经 claude-agent-acp 0.23.1)
+    /// 下不可用。`disallowedTools` 走另一条路径(canUseTool 拒绝 + 上下文移除),preset 正常
+    /// 加载、MCP 正常发现,避开了退化态。消费点:`acp-agent.js` createSession line ~985 合并
+    /// `userProvidedOptions.disallowedTools`。
+    fn session_new_extra(&self) -> Value {
+        serde_json::json!({
+            "_meta": {
+                "claudeCode": {
+                    "options": { "disallowedTools": NATIVE_CLAUDE_TOOLS }
+                }
+            }
+        })
     }
 }
 
@@ -215,9 +253,31 @@ mod tests {
         assert_eq!(b.name(), "claude-code");
     }
 
+    /// ClaudeCode backend 在 session/new 注入 `_meta.claudeCode.options.disallowedTools`
+    /// (把内置工具从模型上下文剔除,强制走 fixus 工具链)。见 ClaudeCodeBackend::session_new_extra。
     #[test]
-    fn session_new_extra_default_null() {
+    fn claude_backend_session_new_extra_disables_builtins() {
         let b = ClaudeCodeBackend::new("x".into());
+        let extra = b.session_new_extra();
+        let denied = extra["_meta"]["claudeCode"]["options"]["disallowedTools"]
+            .as_array()
+            .expect("disallowedTools 应为数组");
+        // 关键内置工具都在 deny 列表里(Bash/Read/Write/Edit/Glob/Grep)
+        for must_deny in ["Bash", "Read", "Write", "Edit", "Glob", "Grep"] {
+            assert!(
+                denied.iter().any(|v| v.as_str() == Some(must_deny)),
+                "{must_deny} 应在 disallowedTools 中"
+            );
+        }
+        // 确认与常量一致
+        assert_eq!(denied.len(), NATIVE_CLAUDE_TOOLS.len());
+    }
+
+    /// trait 默认 session_new_extra 仍为 Null:GenericAcpBackend 等不注入 disableBuiltInTools
+    /// (那是 claude-agent-acp 特定的 `_meta` 字段,通用 ACP agent 无此语义)。
+    #[test]
+    fn session_new_extra_default_null_for_generic() {
+        let b = GenericAcpBackend::new("x".into(), "models.currentModelId".into());
         assert_eq!(b.session_new_extra(), Value::Null);
     }
 
@@ -328,51 +388,51 @@ mod tests {
         report("generic extract_model (3-seg path)", "ns", ns);
     }
 
-    /// parity(CR-9a 核心):build_session_new_params 对 ClaudeCode backend 必须与
-    /// 重构前 router.rs 硬编码的 session/new params 逐键等价(零回归)。
+    /// 形状锁定(原 CR-9a parity):build_session_new_params 对 ClaudeCode backend 产出的
+    /// session/new params —— cwd + mcpServers 外壳 + `_meta.claudeCode.options.disallowedTools`
+    /// (禁内置工具,见 ClaudeCodeBackend::session_new_extra)。锁住 wire 形状防漂移。
     #[test]
     fn build_session_new_params_matches_legacy_claude() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
         let got = build_session_new_params(&b, "task_abc", "/tmp/work", "http://127.0.0.1:3001/mcp", 42, None);
 
-        // 等价 params(legacy oracle + X-Fixus-Turn-Id header,step-events Phase 3)
-        let legacy = serde_json::json!({
-            "cwd": "/tmp/work",
-            "mcpServers": [{
-                "type": "http",
-                "name": "fixus",
-                "url": "http://127.0.0.1:3001/mcp",
-                "headers": [
-                    {"name": "X-Fixus-Session-Id", "value": "task_abc"},
-                    {"name": "X-Fixus-Turn-Id", "value": "42"}
-                ]
-            }]
-        });
-        assert_eq!(got, legacy, "session/new params 必须与重构前等价");
+        // 外壳 + headers(X-Fixus-Session-Id + X-Fixus-Turn-Id)+ 禁内置工具 disallowedTools
+        assert_eq!(got["cwd"], "/tmp/work");
+        assert_eq!(got["mcpServers"][0]["name"], "fixus");
+        assert_eq!(got["mcpServers"][0]["url"], "http://127.0.0.1:3001/mcp");
+        assert_eq!(got["mcpServers"][0]["headers"][0]["name"], "X-Fixus-Session-Id");
+        assert_eq!(got["mcpServers"][0]["headers"][0]["value"], "task_abc");
+        assert_eq!(got["mcpServers"][0]["headers"][1]["name"], "X-Fixus-Turn-Id");
+        assert_eq!(got["mcpServers"][0]["headers"][1]["value"], "42");
+        // 禁内置工具:_meta.claudeCode.options.disallowedTools == NATIVE_CLAUDE_TOOLS
+        assert_eq!(
+            got["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            serde_json::Value::from(NATIVE_CLAUDE_TOOLS),
+            "session/new 应注入 disallowedTools"
+        );
     }
 
-    /// parity(完整消息):build_session_new_request 包出的完整 JSON-RPC 消息
-    /// 与重构前 router 硬编码的 envelope(jsonrpc/id/method/params)逐键等价。
+    /// 形状锁定(完整消息):build_session_new_request 包出的完整 JSON-RPC envelope
+    /// (jsonrpc/id/method/params),params 含 disallowedTools(见 session_new_extra)。
     #[test]
     fn build_session_new_request_matches_legacy_envelope() {
         let b = ClaudeCodeBackend::new("claude-agent-acp".into());
         let params = build_session_new_params(&b, "task_x", "/tmp", "http://tb/mcp", 7, None);
         let got = build_session_new_request(7, params);
 
-        let legacy = serde_json::json!({
-            "jsonrpc": "2.0", "id": 7, "method": "session/new",
-            "params": {
-                "cwd": "/tmp",
-                "mcpServers": [{
-                    "type": "http", "name": "fixus", "url": "http://tb/mcp",
-                    "headers": [
-                        {"name": "X-Fixus-Session-Id", "value": "task_x"},
-                        {"name": "X-Fixus-Turn-Id", "value": "7"}
-                    ]
-                }]
-            }
-        });
-        assert_eq!(got, legacy, "完整 session/new 消息必须与重构前等价");
+        assert_eq!(got["jsonrpc"], "2.0");
+        assert_eq!(got["id"], 7);
+        assert_eq!(got["method"], "session/new");
+        assert_eq!(got["params"]["cwd"], "/tmp");
+        assert_eq!(got["params"]["mcpServers"][0]["name"], "fixus");
+        assert_eq!(got["params"]["mcpServers"][0]["headers"][0]["name"], "X-Fixus-Session-Id");
+        assert_eq!(got["params"]["mcpServers"][0]["headers"][0]["value"], "task_x");
+        assert_eq!(got["params"]["mcpServers"][0]["headers"][1]["name"], "X-Fixus-Turn-Id");
+        assert_eq!(got["params"]["mcpServers"][0]["headers"][1]["value"], "7");
+        assert_eq!(
+            got["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            serde_json::Value::from(NATIVE_CLAUDE_TOOLS)
+        );
     }
 
     /// session_new_extra 非 null 时合并进 params(为 CR-9b/后续 backend 验证扩展点)。

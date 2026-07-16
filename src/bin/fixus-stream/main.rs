@@ -313,7 +313,7 @@ async fn health() -> &'static str {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 与 sandbox-server / fixlet 一致:builder + EnvFilter(RUST_LOG 优先,缺省
+    // 与 fixlet / sandbox consumer 一致:builder + EnvFilter(RUST_LOG 优先,缺省
     // fixus_stream=info)。原裸 fmt::init() 默认 ERROR 级别,会吞掉本 bin 的 info 日志。
     tracing_subscriber::fmt()
         .with_env_filter(

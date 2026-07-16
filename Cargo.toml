@@ -91,10 +91,6 @@ name = "fixlet"
 path = "src/bin/fixlet/main.rs"
 
 [[bin]]
-name = "sandbox-server"
-path = "src/bin/sandbox-server/main.rs"
-
-[[bin]]
 name = "tools-bank"
 path = "src/bin/tools-bank/main.rs"
 

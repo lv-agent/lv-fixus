@@ -47,7 +47,7 @@ struct Cli {
     #[arg(long, default_value = "3001")]
     port: u16,
 
-    /// operator extras catalog file (shared with sandbox-server); tools beyond
+    /// operator extras catalog file (tools-bank 侧;消费方需支持各工具 —— lv-sandbox sandbox-broker 仅认 8 builtins);tools beyond
     /// the 8 builtins. Missing/unreadable → builtins only (not fatal); malformed
     /// → log + builtins only.
     #[arg(long)]
@@ -534,7 +534,7 @@ async fn main() {
     // pending 共享:sandbox adapter(注册工具时) + result consumer(回灌结果)
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
-    // Load operator extras catalog (shared with sandbox-server). CLI flag 优先于
+    // Load operator extras catalog (tools-bank 侧)。CLI flag 优先于
     // FIXUS_TOOLS_CATALOG_FILE env;missing/unreadable → builtins only(not fatal);
     // malformed → log + builtins only(spec §7:extras 永不让一个坏 catalog 打挂 tools-bank)。
     let extra_path = cli.extra_tools.clone()

@@ -1,7 +1,8 @@
 //! CapabilityPolicy — 沙箱边界声明式策略模型 + resolver。
 //!
 //! fixus = resolver(算 effective = Operator ∩ Tenant ∩ Task + role 收窄)。
-//! sandbox-server = enforcer(只认 EffectivePolicy)。spec:`veps/sandbox-boundary-redesign.md`。
+//! sandbox 消费方(consumer)= enforcer(只认 EffectivePolicy)。fixus 本仓不再自带 sandbox 二进制;
+//! 执行端现由 lv-sandbox 的 sandbox-broker 提供(broker tool-invoke → HTTP session)。spec:`veps/sandbox-boundary-redesign.md`。
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

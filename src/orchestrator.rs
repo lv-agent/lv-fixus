@@ -3,7 +3,7 @@
 //! 职责：
 //! - execute_turn: 用户请求 → WAL → context构建 → 下发fixlet → 等待结果
 //! - handle_turn_execution_done: fixlet done → WAL → 通知HTTP handler
-//! - Tool 执行: tools-bank MCP → broker → sandbox-server (不再经 fixus)
+//! - Tool 执行: tools-bank MCP → broker → sandbox 消费方 (不再经 fixus;消费方现由 lv-sandbox sandbox-broker 提供)
 //!
 //! Turn 编排引擎。fixus 的中心组件:Turn 启动、Claim、恢复、健康检查。
 
@@ -1620,7 +1620,7 @@ impl Orchestrator {
 
 // ── Broker Result Consumer ─────────────────────────────────────────────
 
-/// 后台消费 `tool-result-<region>` stream,将 sandbox-server 回传的工具结果
+/// 后台消费 `tool-result-<region>` stream,将 sandbox 消费方 回传的工具结果
 /// 消费 `tool-result-<region>` stream,记录工具结果用于投影和健康检查。
 async fn run_result_consumer(
     orch: &Arc<Orchestrator>,
