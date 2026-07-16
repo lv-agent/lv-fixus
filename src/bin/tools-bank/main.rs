@@ -109,6 +109,121 @@ fn tools_list(registry: &ToolRegistry, id: Option<i64>) -> McpResponse {
     mcp_ok(id, serde_json::json!({ "tools": registry.list() }))
 }
 
+// ── 步事件 payload 构造器(task-end:tool_invoked / tool_completed / tool_failed)──
+//
+// 字段名与 fixus lifecycle consumer(`orchestrator.rs` `run_lifecycle_consumer`
+// 的 tool_* dispatch arms)逐字段对齐 —— consumer 按这些 key 读取。`turn_id`
+// 在 None 时省略(步事件允许 NULL turn_id;consumer 用 `.get("turn_id").as_i64()`
+// 读出 None)。`step_id` 是配对键;`tool_call_id` 仅为信息字段(用 step_id 充当,
+// 因 tools-bank 看不到 claude 内部 tool-use id —— 见设计 §open details)。
+
+fn tool_invoked_payload(
+    task_id: &str,
+    turn_id: Option<i64>,
+    step_id: &str,
+    tool_name: &str,
+    tool_call_id: &str,
+    idempotency_key: &str,
+    input: &serde_json::Value,
+    local_seq: i64,
+) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "task_id": task_id,
+        "step_id": step_id,
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "idempotency_key": idempotency_key,
+        "input": input,
+        "local_seq": local_seq,
+        "event_type": "tool_invoked",
+    });
+    if let Some(t) = turn_id {
+        p["turn_id"] = serde_json::json!(t);
+    }
+    p
+}
+
+fn tool_completed_payload(
+    task_id: &str,
+    turn_id: Option<i64>,
+    step_id: &str,
+    tool_call_id: &str,
+    output: &serde_json::Value,
+    is_error: bool,
+    local_seq: i64,
+) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "task_id": task_id,
+        "step_id": step_id,
+        "tool_call_id": tool_call_id,
+        "output": output,
+        "is_error": is_error,
+        "local_seq": local_seq,
+        "event_type": "tool_completed",
+    });
+    if let Some(t) = turn_id {
+        p["turn_id"] = serde_json::json!(t);
+    }
+    p
+}
+
+fn tool_failed_payload(
+    task_id: &str,
+    turn_id: Option<i64>,
+    step_id: &str,
+    tool_call_id: &str,
+    error_type: &str,
+    error_message: &str,
+    local_seq: i64,
+) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "task_id": task_id,
+        "step_id": step_id,
+        "tool_call_id": tool_call_id,
+        "error_type": error_type,
+        "error_message": error_message,
+        "local_seq": local_seq,
+        "event_type": "tool_failed",
+    });
+    if let Some(t) = turn_id {
+        p["turn_id"] = serde_json::json!(t);
+    }
+    p
+}
+
+/// produce 一条 task-end 步事件。event_type 成为 broker 记录的 `rec.event_type`
+/// —— fixus lifecycle consumer 据此 dispatch。produce 失败仅记 warn(步事件为
+/// 观测用,不得阻断 MCP 响应路径)。
+async fn emit_task_end(
+    producer: &Arc<Mutex<BrokerProducer>>,
+    namespace: &str,
+    task_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let content = serde_json::to_vec(&payload).unwrap_or_default();
+    let meta = HashMap::from([
+        ("task_id".to_string(), task_id.to_string()),
+        ("event_type".to_string(), event_type.to_string()),
+    ]);
+    let mut lp = producer.lock().await;
+    if let Err(e) = lp
+        .produce_full(
+            namespace,
+            "task-end",
+            event_type,
+            &content,
+            Some(task_id),
+            0,
+            "application/json",
+            &meta,
+        )
+        .await
+    {
+        tracing::warn!("tools-bank: broker produce {} failed: {}", event_type, e);
+    }
+}
+
 async fn tools_call(
     state: &AppState,
     task_id: &str,
@@ -130,6 +245,17 @@ async fn tools_call(
 
     tracing::info!("tools-bank: tools/call task={} tool={} step={}", task_id, tool_name, ctx.step_id);
 
+    // task-end 步事件对的前半(tool_invoked)—— 先于 invoke 发出。`tool_call_id`
+    // 用 step_id 充当(见设计 §open details:tools-bank 看不到 claude 的内部 id)。
+    let local_seq = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+    emit_task_end(
+        &state.task_end_producer,
+        &state.lifecycle_namespace,
+        task_id,
+        "tool_invoked",
+        tool_invoked_payload(task_id, ctx.turn_id, &ctx.step_id, tool_name, &ctx.step_id, &ctx.idempotency_key, args, local_seq),
+    ).await;
+
     match state.registry.invoke(tool_name, args, &ctx).await {
         Ok(r) => {
             // success 时回灌 output;失败时把 error 语义拼进 text(让 agent 看到原因)。
@@ -142,6 +268,15 @@ async fn tools_call(
             } else {
                 serde_json::to_string(&r.output).unwrap_or_default()
             };
+            // 后半:Ok → tool_completed(is_error = !success,携带 output)。
+            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+            emit_task_end(
+                &state.task_end_producer,
+                &state.lifecycle_namespace,
+                task_id,
+                "tool_completed",
+                tool_completed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, &r.output, !r.success, local_seq2),
+            ).await;
             mcp_ok(id, serde_json::json!({
                 "content": [{"type": "text", "text": text}],
                 "isError": !r.success,
@@ -149,9 +284,26 @@ async fn tools_call(
             }))
         }
         Err(InvokeError::NotFound) => {
+            // 后半:Err → tool_failed(infra)。NotFound / Adapter 都是 infra 故障。
+            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+            emit_task_end(
+                &state.task_end_producer,
+                &state.lifecycle_namespace,
+                task_id,
+                "tool_failed",
+                tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "NotFound", &format!("unknown tool: {}", tool_name), local_seq2),
+            ).await;
             mcp_err(id, -32602, &format!("unknown tool: {}", tool_name))
         }
         Err(InvokeError::Adapter(msg)) => {
+            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+            emit_task_end(
+                &state.task_end_producer,
+                &state.lifecycle_namespace,
+                task_id,
+                "tool_failed",
+                tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "Adapter", &msg, local_seq2),
+            ).await;
             mcp_err(id, -32603, &msg)
         }
     }
@@ -433,4 +585,58 @@ async fn main() {
     tracing::info!("tools-bank starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+// ── 步事件 payload 构造器(task-end:tool_invoked / tool_completed / tool_failed)──
+//
+// 字段名与 fixus lifecycle consumer(`orchestrator.rs` `run_lifecycle_consumer`
+// 的 tool_* dispatch arms)逐字段对齐 —— consumer 按这些 key 读取。`turn_id`
+// 在 None 时省略(步事件允许 NULL turn_id;consumer 用 `.get("turn_id").as_i64()`
+// 读出 None)。`step_id` 是配对键,`tool_call_id` 仅为信息字段(用 step_id 充当)。
+
+#[cfg(test)]
+mod step_event_tests {
+    use super::*;
+
+    #[test]
+    fn tool_invoked_payload_shape() {
+        let p = tool_invoked_payload("t1", Some(7), "s1", "read_file", "tc1", "k", &serde_json::json!({"a":1}), 3);
+        assert_eq!(p["task_id"], "t1");
+        assert_eq!(p["turn_id"], 7);
+        assert_eq!(p["step_id"], "s1");
+        assert_eq!(p["tool_name"], "read_file");
+        assert_eq!(p["tool_call_id"], "tc1");
+        assert_eq!(p["idempotency_key"], "k");
+        assert_eq!(p["local_seq"], 3);
+    }
+
+    #[test]
+    fn tool_completed_payload_shape() {
+        let p = tool_completed_payload("t1", Some(7), "s1", "tc1", &serde_json::json!({"ok":true}), true, 4);
+        assert_eq!(p["task_id"], "t1");
+        assert_eq!(p["turn_id"], 7);
+        assert_eq!(p["step_id"], "s1");
+        assert_eq!(p["tool_call_id"], "tc1");
+        assert_eq!(p["is_error"], true);
+        assert_eq!(p["local_seq"], 4);
+    }
+
+    #[test]
+    fn tool_failed_payload_shape() {
+        let p = tool_failed_payload("t1", Some(7), "s1", "tc1", "NotFound", "unknown tool: x", 5);
+        assert_eq!(p["task_id"], "t1");
+        assert_eq!(p["turn_id"], 7);
+        assert_eq!(p["step_id"], "s1");
+        assert_eq!(p["tool_call_id"], "tc1");
+        assert_eq!(p["error_type"], "NotFound");
+        assert_eq!(p["error_message"], "unknown tool: x");
+        assert_eq!(p["local_seq"], 5);
+    }
+
+    #[test]
+    fn tool_invoked_payload_null_turn_id() {
+        // None → 省略 turn_id key(consumer .get() 读出 None;允许 NULL turn_id)
+        let p = tool_invoked_payload("t1", None, "s1", "noop", "tc1", "k", &serde_json::json!({}), 1);
+        assert!(p.get("turn_id").is_none() || p["turn_id"].is_null());
+    }
 }
