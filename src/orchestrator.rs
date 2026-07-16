@@ -902,6 +902,172 @@ impl Orchestrator {
         Ok(())
     }
 
+    // ── Step 事件处理(tool/llm invoke+complete+fail)─────────────────────
+    // 由 run_lifecycle_consumer 收到 broker lifecycle 记录后派发;事件以 step_id
+    // 配对(invoked↔completed/failed),turn_id 允许 NULL(后台无 turn 上下文)。
+
+    pub async fn handle_tool_invoked(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+        idempotency_key: &str,
+        input: &serde_json::Value,
+        local_seq: i64,
+    ) -> Result<()> {
+        service::record_tool_invoked(
+            &*self.store,
+            task_id,
+            turn_id,
+            step_id,
+            tool_name,
+            tool_call_id,
+            idempotency_key,
+            input,
+            None,
+            local_seq,
+            None,
+            None,
+        )
+        .await?;
+        tracing::info!(
+            "session {}: tool_invoked turn={:?} step={} tool={}",
+            task_id,
+            turn_id,
+            step_id,
+            tool_name
+        );
+        Ok(())
+    }
+
+    pub async fn handle_tool_completed(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        tool_call_id: &str,
+        output: &serde_json::Value,
+        is_error: bool,
+        local_seq: i64,
+    ) -> Result<()> {
+        service::record_tool_completed(
+            &*self.store,
+            task_id,
+            turn_id,
+            step_id,
+            tool_call_id,
+            output,
+            is_error,
+            local_seq,
+        )
+        .await?;
+        tracing::info!(
+            "session {}: tool_completed turn={:?} step={} is_error={}",
+            task_id,
+            turn_id,
+            step_id,
+            is_error
+        );
+        Ok(())
+    }
+
+    pub async fn handle_tool_failed(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        tool_call_id: &str,
+        error_type: &str,
+        error_message: &str,
+        local_seq: i64,
+    ) -> Result<()> {
+        service::record_tool_failed(
+            &*self.store,
+            task_id,
+            turn_id,
+            step_id,
+            tool_call_id,
+            error_type,
+            error_message,
+            None,
+            0,
+            local_seq,
+        )
+        .await?;
+        tracing::info!(
+            "session {}: tool_failed turn={:?} step={} type={}",
+            task_id,
+            turn_id,
+            step_id,
+            error_type
+        );
+        Ok(())
+    }
+
+    pub async fn handle_llm_invoked(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        model: &str,
+        messages: &[crate::models::Message],
+        local_seq: i64,
+    ) -> Result<()> {
+        service::record_llm_invoked(
+            &*self.store,
+            task_id,
+            turn_id,
+            step_id,
+            model,
+            messages,
+            None,
+            None,
+            local_seq,
+        )
+        .await?;
+        tracing::info!(
+            "session {}: llm_invoked turn={:?} step={} model={}",
+            task_id,
+            turn_id,
+            step_id,
+            model
+        );
+        Ok(())
+    }
+
+    pub async fn handle_llm_failed(
+        &self,
+        task_id: &str,
+        turn_id: Option<i64>,
+        step_id: &str,
+        error_type: &str,
+        error_message: &str,
+        local_seq: i64,
+    ) -> Result<()> {
+        service::record_llm_failed(
+            &*self.store,
+            task_id,
+            turn_id,
+            step_id,
+            error_type,
+            error_message,
+            None,
+            0,
+            local_seq,
+        )
+        .await?;
+        tracing::info!(
+            "session {}: llm_failed turn={:?} step={} type={}",
+            task_id,
+            turn_id,
+            step_id,
+            error_type
+        );
+        Ok(())
+    }
+
     pub async fn handle_turn_execution_done(
         &self,
         task_id: &str,
@@ -2261,6 +2427,91 @@ mod tests {
             out.contains("fixus_token_total_tokens_total{model=\"claude-sonnet-5\",task_type=\"default\"} 120"),
             "total tokens:\n{}", out
         );
+    }
+
+    // ── Step Events §1 orchestrator handlers ────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_tool_invoked_writes_step_event() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_tool_invoked(
+            &tid, Some(turn_id), "step-tool-1", "read_file", "tcid-1",
+            "tid:bank:read_file:abcd1234", &serde_json::json!({"path": "/a"}), 1,
+        ).await.unwrap();
+        wait_seq(&*store, &tid, 5).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_type, EventType::ToolInvoked);
+        assert_eq!(evs[0].step_id.as_deref(), Some("step-tool-1"));
+        assert_eq!(evs[0].turn_id, Some(turn_id));
+    }
+
+    #[tokio::test]
+    async fn handle_tool_completed_pairs_step_event() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_tool_invoked(&tid, Some(turn_id), "s1", "read_file", "tc1", "k", &serde_json::json!({}), 1).await.unwrap();
+        orch.handle_tool_completed(&tid, Some(turn_id), "s1", "tc1", &serde_json::json!({"ok": true}), false, 2).await.unwrap();
+        wait_seq(&*store, &tid, 6).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert_eq!(evs.iter().filter(|e| e.event_type == EventType::ToolCompleted).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_tool_failed_writes_terminal() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_tool_invoked(&tid, Some(turn_id), "s2", "write_file", "tc2", "k", &serde_json::json!({}), 1).await.unwrap();
+        orch.handle_tool_failed(&tid, Some(turn_id), "s2", "tc2", "infra", "broker down", 2).await.unwrap();
+        wait_seq(&*store, &tid, 6).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert!(evs.iter().any(|e| e.event_type == EventType::ToolFailed));
+    }
+
+    #[tokio::test]
+    async fn handle_llm_invoked_writes_messages_and_model() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        let msgs = vec![crate::models::Message { role: "user".into(), content: "hi".into() }];
+        orch.handle_llm_invoked(&tid, Some(turn_id), "llm-1", "claude-sonnet-5", &msgs, 1).await.unwrap();
+        wait_seq(&*store, &tid, 5).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert_eq!(evs[0].event_type, EventType::LlmInvoked);
+        assert_eq!(evs[0].payload["model"], "claude-sonnet-5");
+    }
+
+    #[tokio::test]
+    async fn handle_llm_failed_writes_terminal() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_llm_invoked(&tid, Some(turn_id), "llm-2", "claude-sonnet-5", &[], 1).await.unwrap();
+        orch.handle_llm_failed(&tid, Some(turn_id), "llm-2", "agent_error", "boom", 2).await.unwrap();
+        wait_seq(&*store, &tid, 6).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert!(evs.iter().any(|e| e.event_type == EventType::LlmFailed));
+    }
+
+    #[tokio::test]
+    async fn step_event_allows_null_turn_id() {
+        let (store, _d) = setup().await;
+        let store: Arc<dyn EventStore> = Arc::new(store);
+        let orch = Orchestrator::new(store.clone(), TaskRegistry::new(), TokenPublisher::new().await);
+        let (tid, _turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
+        orch.handle_tool_invoked(&tid, None, "bg-1", "noop", "tc9", "k", &serde_json::json!({}), 1).await.unwrap();
+        wait_seq(&*store, &tid, 5).await;
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert_eq!(evs[0].event_type, EventType::ToolInvoked);
     }
 
     #[tokio::test]
