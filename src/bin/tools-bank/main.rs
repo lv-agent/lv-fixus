@@ -11,6 +11,7 @@ mod adapter;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,6 +86,13 @@ struct McpErrorBody {
 
 struct AppState {
     registry: ToolRegistry,
+    /// 共享 broker producer:tools_call 顶层发 task-end 步事件对,
+    /// SandboxAdapter 发 tool-invoke→sandbox。两者复用同一 Arc<Mutex>。
+    task_end_producer: Arc<Mutex<BrokerProducer>>,
+    /// task-end 步事件 produce 的 namespace(= cli.namespace)。
+    lifecycle_namespace: String,
+    /// per-process 单调步事件序号(task-end local_seq)。
+    seq: AtomicU64,
 }
 
 // ── MCP handlers ──
@@ -272,7 +280,7 @@ async fn try_consume_results(
 // ── 构造 registry:sandbox builtins + operator extras + env 外部 HTTP adapter ──
 
 fn build_registry(
-    producer: BrokerProducer,
+    producer: Arc<Mutex<BrokerProducer>>,
     pending: PendingMap,
     namespace: String,
     region: String,
@@ -281,7 +289,7 @@ fn build_registry(
     let mut registry = ToolRegistry::new();
 
     let sandbox = SandboxAdapter {
-        producer: Arc::new(Mutex::new(producer)),
+        producer: producer.clone(),
         pending: pending.clone(),
         namespace: namespace.clone(),
         region: region.clone(),
@@ -346,8 +354,10 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let producer = BrokerProducer::connect(format!("http://{}", cli.broker_addr)).await
-        .expect("broker producer connect");
+    let producer = Arc::new(tokio::sync::Mutex::new(
+        BrokerProducer::connect(format!("http://{}", cli.broker_addr)).await
+            .expect("broker producer connect"),
+    ));
 
     // pending 共享:sandbox adapter(注册工具时) + result consumer(回灌结果)
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -383,14 +393,19 @@ async fn main() {
     );
 
     let registry = build_registry(
-        producer,
+        producer.clone(),
         pending.clone(),
         cli.namespace.clone(),
         cli.region.clone(),
         extras,
     );
 
-    let state = Arc::new(AppState { registry });
+    let state = Arc::new(AppState {
+        registry,
+        task_end_producer: producer.clone(),
+        lifecycle_namespace: cli.namespace.clone(),
+        seq: AtomicU64::new(0),
+    });
 
     // Background result consumer
     let broker_addr = cli.broker_addr.clone();
