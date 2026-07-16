@@ -81,6 +81,9 @@ logdbd-proto = { path = "../../logdb/lv-logdb/logdbd-proto" }
 logdb-broker = { path = "../../logdb/lv-logdb/logdb-broker" }
 logdb = { path = "../../logdb/lv-logdb/logdb" }
 tempfile = "3"
+# 性能基准(CR 后):上下文构建 / 状态投影热路径(criterion)。broker-backed append
+# 需活 logdbd,无法 hermetic bench;这两条是纯 CPU 的 turn 编排热路径。
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "fixus"
@@ -97,6 +100,14 @@ path = "src/bin/tools-bank/main.rs"
 [[bin]]
 name = "fixus-stream"
 path = "src/bin/fixus-stream/main.rs"
+
+[[bench]]
+name = "bench_context"
+harness = false
+
+[[bench]]
+name = "bench_projection"
+harness = false
 
 [workspace]
 members = [".", "crates/tool-catalog"]
