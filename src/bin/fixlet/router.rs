@@ -328,6 +328,15 @@ pub async fn run(config: FixletConfig) -> Result<(), Box<dyn std::error::Error>>
             } => {
                 tracing::warn!("Agent process exited unexpectedly");
                 if let Some(ref ctx) = active_turn {
+                    // close the llm pair if session/prompt already fired (step_id set)。
+                    // 本分支持 ref ctx(不可变),故用 current()+1 而非 next()(&mut);
+                    // turn 已结束,计数器即将丢弃,local_seq 仅信息性。
+                    if let Some(step_id) = ctx.step_id.as_deref() {
+                        emit_lifecycle(
+                            &lifecycle_producer_clone, &lifecycle_namespace, &ctx.task_id, "llm_failed",
+                            llm_failed_payload(&ctx.task_id, ctx.turn_id, step_id, "agent_process_exited", "Agent process exited unexpectedly", ctx.local_seq.current() + 1),
+                        ).await;
+                    }
                     let err_payload = serde_json::json!({
                         "task_id": ctx.task_id,
                         "turn_id": ctx.turn_id,
@@ -659,6 +668,9 @@ fn llm_failed_payload(
 
 /// 把 step-event produce 到 broker task-end stream。封装 produce_full + meta;
 /// 失败仅 warn(step-event 是 best-effort 观测,不影响 turn 主流程)。
+//
+// 注:既有 turn_execution_done / turn_execution_error 仍用内联 produce_full(早于本 helper,
+// 为控制 diff 范围未迁移);新 LLM step 事件统一走 emit_lifecycle。
 async fn emit_lifecycle(
     producer: &tokio::sync::Mutex<BrokerProducer>,
     namespace: &str,
@@ -748,14 +760,14 @@ async fn handle_agent_message(
             // 不再 gate on usage —— 始终 emit(无 usage 时 tokens 默认 0),保证 invoked/completed 配对完整。
             if ctx.step_id.is_some() {
                 let usage_tuple = usage.as_ref().map(|u| (u.input_tokens, u.output_tokens, u.total_tokens));
-                let step_id = ctx.step_id.clone().unwrap();
-                let completed_seq = ctx.local_seq.next();
+                let completed_seq = ctx.local_seq.next();              // &mut first, borrow ends (NLL)
+                let step_id = ctx.step_id.as_deref().unwrap();         // & second — drop the .clone()
                 emit_lifecycle(
                     lifecycle_producer,
                     &lifecycle_namespace,
                     &ctx.task_id,
                     "llm_completed",
-                    llm_completed_payload(&ctx.task_id, ctx.turn_id, &step_id, &ctx.model, usage_tuple, completed_seq),
+                    llm_completed_payload(&ctx.task_id, ctx.turn_id, step_id, &ctx.model, usage_tuple, completed_seq),
                 )
                 .await;
             }
@@ -800,14 +812,14 @@ async fn handle_agent_message(
             // llm_failed → broker lifecycle(仅当本 turn 已发过 llm_invoked,即 step_id 存在)。
             // spawn/session-new 失败发生在 session/prompt 前(无 step_id)→ 走各自的 turn_execution_error,不在此 emit。
             if ctx.step_id.is_some() {
-                let step_id = ctx.step_id.clone().unwrap();
-                let failed_seq = ctx.local_seq.next();
+                let failed_seq = ctx.local_seq.next();                // &mut first, borrow ends (NLL)
+                let step_id = ctx.step_id.as_deref().unwrap();        // & second — drop the .clone()
                 emit_lifecycle(
                     lifecycle_producer,
                     &lifecycle_namespace,
                     &ctx.task_id,
                     "llm_failed",
-                    llm_failed_payload(&ctx.task_id, ctx.turn_id, &step_id, "agent_error", &err, failed_seq),
+                    llm_failed_payload(&ctx.task_id, ctx.turn_id, step_id, "agent_error", &err, failed_seq),
                 )
                 .await;
             }
