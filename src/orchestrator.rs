@@ -1780,6 +1780,60 @@ async fn run_lifecycle_consumer(
                         tracing::info!("lifecycle: turn_execution_error task={} turn={} type={}", task_id, turn_id, error_type);
                         let _ = orch.handle_turn_execution_error(task_id, turn_id, error_type, error_message).await;
                     }
+                    "tool_invoked" => {
+                        let turn_id = payload.get("turn_id").and_then(|v| v.as_i64());
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
+                        let tool_name = payload["tool_name"].as_str().unwrap_or("");
+                        let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
+                        let idempotency_key = payload["idempotency_key"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let input = payload.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                        if step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: tool_invoked task={} step={}", task_id, step_id);
+                        let _ = orch.handle_tool_invoked(task_id, turn_id, step_id, tool_name, tool_call_id, idempotency_key, &input, local_seq).await;
+                    }
+                    "tool_completed" => {
+                        let turn_id = payload.get("turn_id").and_then(|v| v.as_i64());
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
+                        let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let output = payload.get("output").cloned().unwrap_or(serde_json::Value::Null);
+                        let is_error = payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: tool_completed task={} step={}", task_id, step_id);
+                        let _ = orch.handle_tool_completed(task_id, turn_id, step_id, tool_call_id, &output, is_error, local_seq).await;
+                    }
+                    "tool_failed" => {
+                        let turn_id = payload.get("turn_id").and_then(|v| v.as_i64());
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
+                        let tool_call_id = payload["tool_call_id"].as_str().unwrap_or("");
+                        let error_type = payload["error_type"].as_str().unwrap_or("unknown");
+                        let error_message = payload["error_message"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: tool_failed task={} step={}", task_id, step_id);
+                        let _ = orch.handle_tool_failed(task_id, turn_id, step_id, tool_call_id, error_type, error_message, local_seq).await;
+                    }
+                    "llm_invoked" => {
+                        let turn_id = payload.get("turn_id").and_then(|v| v.as_i64());
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
+                        let model = payload["model"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let messages: Vec<crate::models::Message> = payload.get("messages").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+                        if step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: llm_invoked task={} step={}", task_id, step_id);
+                        let _ = orch.handle_llm_invoked(task_id, turn_id, step_id, model, &messages, local_seq).await;
+                    }
+                    "llm_failed" => {
+                        let turn_id = payload.get("turn_id").and_then(|v| v.as_i64());
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
+                        let error_type = payload["error_type"].as_str().unwrap_or("unknown");
+                        let error_message = payload["error_message"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: llm_failed task={} step={}", task_id, step_id);
+                        let _ = orch.handle_llm_failed(task_id, turn_id, step_id, error_type, error_message, local_seq).await;
+                    }
                     _ => {}
                 }
                 let _ = consumer.commit_shard(rec.shard_id, rec.seq).await;
