@@ -152,7 +152,7 @@ pub fn build_session_new_params(
     // - X-Fixus-Policy(effective policy JSON 字符串)仅当 policy 存在时注入
     let mut headers = vec![
         serde_json::json!({"name": "X-Fixus-Session-Id", "value": task_id}),
-        serde_json::json!({"name": "X-Fixus-Turn-Id", "value": turn_id}),
+        serde_json::json!({"name": "X-Fixus-Turn-Id", "value": turn_id.to_string()}),
     ];
     if let Some(p) = effective_policy {
         headers.push(serde_json::json!({"name": "X-Fixus-Policy", "value": p}));
@@ -344,7 +344,7 @@ mod tests {
                 "url": "http://127.0.0.1:3001/mcp",
                 "headers": [
                     {"name": "X-Fixus-Session-Id", "value": "task_abc"},
-                    {"name": "X-Fixus-Turn-Id", "value": 42}
+                    {"name": "X-Fixus-Turn-Id", "value": "42"}
                 ]
             }]
         });
@@ -367,7 +367,7 @@ mod tests {
                     "type": "http", "name": "fixus", "url": "http://tb/mcp",
                     "headers": [
                         {"name": "X-Fixus-Session-Id", "value": "task_x"},
-                        {"name": "X-Fixus-Turn-Id", "value": 7}
+                        {"name": "X-Fixus-Turn-Id", "value": "7"}
                     ]
                 }]
             }
@@ -399,7 +399,7 @@ mod tests {
         let params = build_session_new_params(backend.as_ref(), "task-123", "/cwd", "http://tools-bank", 42, None);
         let headers = params["mcpServers"][0]["headers"].as_array().unwrap();
         let turn_id_hdr = headers.iter().find(|h| h["name"] == "X-Fixus-Turn-Id").unwrap();
-        assert_eq!(turn_id_hdr["value"], 42);
+        assert_eq!(turn_id_hdr["value"], "42");
     }
 
     // ── X-Fixus-Policy header 注入(Part C2)──
