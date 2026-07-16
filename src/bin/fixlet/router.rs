@@ -616,6 +616,47 @@ fn llm_invoked_payload(
     })
 }
 
+fn llm_completed_payload(
+    task_id: &str,
+    turn_id: i64,
+    step_id: &str,
+    model: &str,
+    usage: Option<(i64, i64, i64)>,
+    local_seq: i64,
+) -> Value {
+    let (input_tokens, output_tokens, total_tokens) = usage.unwrap_or((0, 0, 0));
+    serde_json::json!({
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "step_id": step_id,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "local_seq": local_seq,
+        "event_type": "llm_completed",
+    })
+}
+
+fn llm_failed_payload(
+    task_id: &str,
+    turn_id: i64,
+    step_id: &str,
+    error_type: &str,
+    error_message: &str,
+    local_seq: i64,
+) -> Value {
+    serde_json::json!({
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "step_id": step_id,
+        "error_type": error_type,
+        "error_message": error_message,
+        "local_seq": local_seq,
+        "event_type": "llm_failed",
+    })
+}
+
 /// 把 step-event produce 到 broker task-end stream。封装 produce_full + meta;
 /// 失败仅 warn(step-event 是 best-effort 观测,不影响 turn 主流程)。
 async fn emit_lifecycle(
@@ -703,30 +744,22 @@ async fn handle_agent_message(
         ParsedAcpEvent::FinalMessage { usage } => {
             let final_text = msg_acc.finalize();
 
-            // llm_completed → broker lifecycle (替代 WS)
+            // llm_completed → broker lifecycle(step-events:与 llm_invoked 配对,共享 step_id)。
+            // 不再 gate on usage —— 始终 emit(无 usage 时 tokens 默认 0),保证 invoked/completed 配对完整。
+            if ctx.step_id.is_some() {
+                let usage_tuple = usage.as_ref().map(|u| (u.input_tokens, u.output_tokens, u.total_tokens));
+                let step_id = ctx.step_id.clone().unwrap();
+                let completed_seq = ctx.local_seq.next();
+                emit_lifecycle(
+                    lifecycle_producer,
+                    &lifecycle_namespace,
+                    &ctx.task_id,
+                    "llm_completed",
+                    llm_completed_payload(&ctx.task_id, ctx.turn_id, &step_id, &ctx.model, usage_tuple, completed_seq),
+                )
+                .await;
+            }
             if let Some(ref u) = usage {
-                let llm_payload = serde_json::json!({
-                    "task_id": ctx.task_id,
-                    "turn_id": ctx.turn_id,
-                    "model": ctx.model,
-                    "input_tokens": u.input_tokens,
-                    "output_tokens": u.output_tokens,
-                    "total_tokens": u.total_tokens,
-                    "event_type": "llm_completed",
-                });
-                let content = serde_json::to_vec(&llm_payload).unwrap_or_default();
-                let mut lp = lifecycle_producer.lock().await;
-                if let Err(e) = lp.produce_full(
-                    &lifecycle_namespace, "task-end", "llm_completed", &content,
-                    Some(&ctx.task_id), 0, "application/json", &std::collections::HashMap::from([
-                        ("task_id".into(), ctx.task_id.clone()),
-                        ("event_type".into(), "llm_completed".into()),
-                    ]),
-                ).await {
-                    tracing::error!("broker produce llm_completed failed: {}", e);
-                }
-                drop(lp);
-
                 tracing::info!(
                     "LLM completed: {} input + {} output = {} total tokens",
                     u.input_tokens, u.output_tokens, u.total_tokens
@@ -764,6 +797,20 @@ async fn handle_agent_message(
 
         ParsedAcpEvent::Error(err) => {
             tracing::warn!("Agent error: {}", err);
+            // llm_failed → broker lifecycle(仅当本 turn 已发过 llm_invoked,即 step_id 存在)。
+            // spawn/session-new 失败发生在 session/prompt 前(无 step_id)→ 走各自的 turn_execution_error,不在此 emit。
+            if ctx.step_id.is_some() {
+                let step_id = ctx.step_id.clone().unwrap();
+                let failed_seq = ctx.local_seq.next();
+                emit_lifecycle(
+                    lifecycle_producer,
+                    &lifecycle_namespace,
+                    &ctx.task_id,
+                    "llm_failed",
+                    llm_failed_payload(&ctx.task_id, ctx.turn_id, &step_id, "agent_error", &err, failed_seq),
+                )
+                .await;
+            }
         }
 
         ParsedAcpEvent::Other(_) => {
@@ -971,5 +1018,31 @@ mod tests {
         assert_eq!(p["model"], "claude-sonnet-5");
         assert_eq!(p["messages"][0]["role"], "user");
         assert_eq!(p["local_seq"], 1);
+    }
+
+    #[test]
+    fn llm_completed_payload_shape_with_usage() {
+        let p = llm_completed_payload("t1", 5, "llm-s1", "claude-sonnet-5", Some((100, 20, 120)), 2);
+        assert_eq!(p["step_id"], "llm-s1");
+        assert_eq!(p["input_tokens"], 100);
+        assert_eq!(p["output_tokens"], 20);
+        assert_eq!(p["total_tokens"], 120);
+        assert_eq!(p["local_seq"], 2);
+    }
+
+    #[test]
+    fn llm_completed_payload_shape_without_usage() {
+        let p = llm_completed_payload("t1", 5, "llm-s1", "claude-sonnet-5", None, 2);
+        assert_eq!(p["step_id"], "llm-s1");
+        assert_eq!(p["input_tokens"], 0);
+    }
+
+    #[test]
+    fn llm_failed_payload_shape() {
+        let p = llm_failed_payload("t1", 5, "llm-s1", "agent_error", "boom", 3);
+        assert_eq!(p["step_id"], "llm-s1");
+        assert_eq!(p["error_type"], "agent_error");
+        assert_eq!(p["error_message"], "boom");
+        assert_eq!(p["local_seq"], 3);
     }
 }
