@@ -561,9 +561,91 @@ async fn handle_execute_turn_from_broker(
             return Ok(());
         }
     };
+    // ── 3. mint step_id + emit llm_invoked(在 session/prompt 发送前)──
+    // fixlet 是 LLM 交互的唯一观察者。step_id 在本 turn 的 invoked/completed/failed
+    // 三事件间共享(配对)。local_seq.next() 从此激活(此前 LocalSeqCounter 是死代码)。
+    let step_id = uuid::Uuid::now_v7().to_string();
+    ctx.step_id = Some(step_id.clone());
+    let invoked_seq = ctx.local_seq.next();
+    *active_turn = Some(ctx.clone());
+    emit_lifecycle(
+        lifecycle_producer,
+        &lifecycle_namespace,
+        &ctx.task_id,
+        "llm_invoked",
+        llm_invoked_payload(
+            &ctx.task_id,
+            ctx.turn_id,
+            &step_id,
+            &ctx.model,
+            &messages,
+            invoked_seq,
+        ),
+    )
+    .await;
+
     acp.session_prompt(&real_sid, prompt_blocks, vec![]);
 
     Ok(())
+}
+
+// ── step-event payload builders + lifecycle emit helper ─────────────────
+//
+// fixlet 是 LLM 交互的唯一观察者(session/prompt + FinalMessage{usage})。
+// 这里构造 step-event 对(llm_invoked / llm_completed / llm_failed)的 payload,
+// emit 到 broker task-end,由 fixus step-events 消费侧消费。
+// 消费侧契约:flat token 字段(input_tokens/output_tokens/total_tokens)用于
+// llm_completed;messages 用于 llm_invoked —— 这里 payload shape 必须匹配。
+
+fn llm_invoked_payload(
+    task_id: &str,
+    turn_id: i64,
+    step_id: &str,
+    model: &str,
+    messages: &[fixus::Message],
+    local_seq: i64,
+) -> Value {
+    serde_json::json!({
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "step_id": step_id,
+        "model": model,
+        "messages": messages,
+        "local_seq": local_seq,
+        "event_type": "llm_invoked",
+    })
+}
+
+/// 把 step-event produce 到 broker task-end stream。封装 produce_full + meta;
+/// 失败仅 warn(step-event 是 best-effort 观测,不影响 turn 主流程)。
+async fn emit_lifecycle(
+    producer: &tokio::sync::Mutex<BrokerProducer>,
+    namespace: &str,
+    task_id: &str,
+    event_type: &str,
+    payload: Value,
+) {
+    let content = serde_json::to_vec(&payload).unwrap_or_default();
+    let meta = std::collections::HashMap::from([
+        ("task_id".into(), task_id.to_string()),
+        ("event_type".into(), event_type.to_string()),
+    ]);
+    let mut lp = producer.lock().await;
+    if let Err(e) = lp
+        .produce_full(
+            namespace,
+            "task-end",
+            event_type,
+            &content,
+            Some(task_id),
+            0,
+            "application/json",
+            &meta,
+        )
+        .await
+    {
+        tracing::warn!("fixlet: broker produce {} failed: {}", event_type, e);
+    }
 }
 
 /// 处理来自 Agent 的消息
@@ -875,5 +957,19 @@ mod tests {
         if let Some(obj) = v.as_object_mut() {
             obj.remove(key);
         }
+    }
+
+    // ── step-event payload builders(step-events Phase 3)─────────────
+
+    #[test]
+    fn llm_invoked_payload_shape() {
+        let msgs = vec![fixus::Message { role: "user".into(), content: "hi".into() }];
+        let p = llm_invoked_payload("t1", 5, "llm-s1", "claude-sonnet-5", &msgs, 1);
+        assert_eq!(p["task_id"], "t1");
+        assert_eq!(p["turn_id"], 5);
+        assert_eq!(p["step_id"], "llm-s1");
+        assert_eq!(p["model"], "claude-sonnet-5");
+        assert_eq!(p["messages"][0]["role"], "user");
+        assert_eq!(p["local_seq"], 1);
     }
 }
