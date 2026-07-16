@@ -856,12 +856,13 @@ impl Orchestrator {
         &self,
         task_id: &str,
         turn_id: i64,
+        step_id: &str,
         model: &str,
         input_tokens: i64,
         output_tokens: i64,
         total_tokens: i64,
+        local_seq: i64,
     ) -> Result<()> {
-        let step_id = uuid::Uuid::now_v7().to_string();
         let payload = serde_json::json!({
             "model": model,
             "usage": {
@@ -869,14 +870,14 @@ impl Orchestrator {
                 "completion_tokens": output_tokens,
                 "total_tokens": total_tokens,
             },
-            "local_seq": 0,
+            "local_seq": local_seq,
         });
 
         service::record_event(
             &*self.store,
             task_id,
             Some(turn_id),
-            Some(&step_id),
+            Some(step_id),
             crate::models::EventType::LlmCompleted,
             payload,
         )
@@ -891,9 +892,10 @@ impl Orchestrator {
             .record_llm_tokens(&tt, model, input_tokens, output_tokens, total_tokens);
 
         tracing::info!(
-            "session {}: llm_completed turn={} tokens(in={} out={} total={})",
+            "session {}: llm_completed turn={} step={} tokens(in={} out={} total={})",
             task_id,
             turn_id,
+            step_id,
             input_tokens,
             output_tokens,
             total_tokens
@@ -1760,13 +1762,15 @@ async fn run_lifecycle_consumer(
                     }
                     "llm_completed" => {
                         let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
+                        let step_id = payload["step_id"].as_str().unwrap_or("");
                         let model = payload["model"].as_str().unwrap_or("");
+                        let local_seq = payload.get("local_seq").and_then(|v| v.as_i64()).unwrap_or(0);
                         let input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                         let output_tokens = payload.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                         let total_tokens = payload.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        if turn_id == 0 { continue; }
-                        tracing::info!("lifecycle: llm_completed task={} turn={} tokens={}", task_id, turn_id, total_tokens);
-                        let _ = orch.handle_llm_completed(task_id, turn_id, model, input_tokens, output_tokens, total_tokens).await;
+                        if turn_id == 0 || step_id.is_empty() { continue; }
+                        tracing::info!("lifecycle: llm_completed task={} turn={} step={} tokens={}", task_id, turn_id, step_id, total_tokens);
+                        let _ = orch.handle_llm_completed(task_id, turn_id, step_id, model, input_tokens, output_tokens, total_tokens, local_seq).await;
                     }
                     "turn_execution_error" => {
                         let turn_id = payload["turn_id"].as_i64().unwrap_or(0);
@@ -2409,10 +2413,13 @@ mod tests {
         let orch = Orchestrator::new(store.clone(), registry, tp);
 
         let (tid, turn_id, _rg) = cr3_setup_task_at_executing(&*store).await;
-        orch.handle_llm_completed(&tid, turn_id, "claude-sonnet-5", 100, 20, 120)
+        orch.handle_llm_completed(&tid, turn_id, "llm-step-1", "claude-sonnet-5", 100, 20, 120, 1)
             .await
             .unwrap();
         wait_seq(&*store, &tid, 5).await; // setup 到 4,llm_completed = 5
+        let evs = store.get_events_after_seq(&tid, 4).await.unwrap();
+        assert_eq!(evs[0].event_type, EventType::LlmCompleted);
+        assert_eq!(evs[0].step_id.as_deref(), Some("llm-step-1"));
 
         let out = orch.metrics_handle().render();
         assert!(
