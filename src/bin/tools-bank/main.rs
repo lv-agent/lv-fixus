@@ -193,21 +193,22 @@ fn tool_failed_payload(
 
 /// produce 一条 task-end 步事件。event_type 成为 broker 记录的 `rec.event_type`
 /// —— fixus lifecycle consumer 据此 dispatch。produce 失败仅记 warn(步事件为
-/// 观测用,不得阻断 MCP 响应路径)。
+/// 观测用,不得阻断 MCP 响应路径)。返回 true=produce 成功;调用方据此决定是否
+/// 发后半事件,避免孤儿 terminal(tool_invoked 失败却仍发 tool_completed/failed)。
 async fn emit_task_end(
     producer: &Arc<Mutex<BrokerProducer>>,
     namespace: &str,
     task_id: &str,
     event_type: &str,
     payload: serde_json::Value,
-) {
+) -> bool {
     let content = serde_json::to_vec(&payload).unwrap_or_default();
     let meta = HashMap::from([
         ("task_id".to_string(), task_id.to_string()),
         ("event_type".to_string(), event_type.to_string()),
     ]);
-    let mut lp = producer.lock().await;
-    if let Err(e) = lp
+    let mut producer_guard = producer.lock().await;
+    match producer_guard
         .produce_full(
             namespace,
             "task-end",
@@ -220,7 +221,11 @@ async fn emit_task_end(
         )
         .await
     {
-        tracing::warn!("tools-bank: broker produce {} failed: {}", event_type, e);
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("tools-bank: broker produce {} failed: {}", event_type, e);
+            false
+        }
     }
 }
 
@@ -247,8 +252,9 @@ async fn tools_call(
 
     // task-end 步事件对的前半(tool_invoked)—— 先于 invoke 发出。`tool_call_id`
     // 用 step_id 充当(见设计 §open details:tools-bank 看不到 claude 的内部 id)。
+    // opening_ok 决定后半是否发:前半失败则跳过 terminal,避免孤儿 tool_completed/failed。
     let local_seq = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
-    emit_task_end(
+    let opening_ok = emit_task_end(
         &state.task_end_producer,
         &state.lifecycle_namespace,
         task_id,
@@ -269,14 +275,16 @@ async fn tools_call(
                 serde_json::to_string(&r.output).unwrap_or_default()
             };
             // 后半:Ok → tool_completed(is_error = !success,携带 output)。
-            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
-            emit_task_end(
-                &state.task_end_producer,
-                &state.lifecycle_namespace,
-                task_id,
-                "tool_completed",
-                tool_completed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, &r.output, !r.success, local_seq2),
-            ).await;
+            if opening_ok {
+                let terminal_seq = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+                emit_task_end(
+                    &state.task_end_producer,
+                    &state.lifecycle_namespace,
+                    task_id,
+                    "tool_completed",
+                    tool_completed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, &r.output, !r.success, terminal_seq),
+                ).await;
+            }
             mcp_ok(id, serde_json::json!({
                 "content": [{"type": "text", "text": text}],
                 "isError": !r.success,
@@ -285,25 +293,29 @@ async fn tools_call(
         }
         Err(InvokeError::NotFound) => {
             // 后半:Err → tool_failed(infra)。NotFound / Adapter 都是 infra 故障。
-            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
-            emit_task_end(
-                &state.task_end_producer,
-                &state.lifecycle_namespace,
-                task_id,
-                "tool_failed",
-                tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "NotFound", &format!("unknown tool: {}", tool_name), local_seq2),
-            ).await;
+            if opening_ok {
+                let terminal_seq = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+                emit_task_end(
+                    &state.task_end_producer,
+                    &state.lifecycle_namespace,
+                    task_id,
+                    "tool_failed",
+                    tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "NotFound", &format!("unknown tool: {}", tool_name), terminal_seq),
+                ).await;
+            }
             mcp_err(id, -32602, &format!("unknown tool: {}", tool_name))
         }
         Err(InvokeError::Adapter(msg)) => {
-            let local_seq2 = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
-            emit_task_end(
-                &state.task_end_producer,
-                &state.lifecycle_namespace,
-                task_id,
-                "tool_failed",
-                tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "Adapter", &msg, local_seq2),
-            ).await;
+            if opening_ok {
+                let terminal_seq = state.seq.fetch_add(1, Ordering::Relaxed) as i64 + 1;
+                emit_task_end(
+                    &state.task_end_producer,
+                    &state.lifecycle_namespace,
+                    task_id,
+                    "tool_failed",
+                    tool_failed_payload(task_id, ctx.turn_id, &ctx.step_id, &ctx.step_id, "Adapter", &msg, terminal_seq),
+                ).await;
+            }
             mcp_err(id, -32603, &msg)
         }
     }
@@ -586,13 +598,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
 }
-
-// ── 步事件 payload 构造器(task-end:tool_invoked / tool_completed / tool_failed)──
-//
-// 字段名与 fixus lifecycle consumer(`orchestrator.rs` `run_lifecycle_consumer`
-// 的 tool_* dispatch arms)逐字段对齐 —— consumer 按这些 key 读取。`turn_id`
-// 在 None 时省略(步事件允许 NULL turn_id;consumer 用 `.get("turn_id").as_i64()`
-// 读出 None)。`step_id` 是配对键,`tool_call_id` 仅为信息字段(用 step_id 充当)。
 
 #[cfg(test)]
 mod step_event_tests {
