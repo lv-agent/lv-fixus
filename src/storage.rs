@@ -141,12 +141,6 @@ pub trait EventStore: Send + Sync {
     /// 用于 broker forwarder lag 时强制重读(catch_up 可能没看到刚写的事件)。
     async fn invalidate_projection(&self, _task_id: &str) {}
 
-    /// 把工具事件发到 sandbox dispatch stream(Plan D)。
-    /// 默认 no-op;BrokerEventStore 覆盖。
-    async fn dispatch_tool(&self, _task_id: &str, _event: &AgentEvent) -> Result<()> {
-        Ok(())
-    }
-
     // ── Archive ─────────────────────────────────────────────────────────
 
     async fn archive_events_before_seq(

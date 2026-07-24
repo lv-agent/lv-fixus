@@ -476,35 +476,6 @@ impl EventStore for BrokerEventStore {
         }
     }
 
-    /// 把工具事件发到 sandbox dispatch stream `tool-invoke-<SANDBOX_REGION>`。
-    /// 失败时自动重试(backoff: 100ms → 200ms → 400ms),总共最多 3 次尝试。
-    async fn dispatch_tool(&self, task_id: &str, event: &AgentEvent) -> Result<()> {
-        let region = std::env::var("SANDBOX_REGION").unwrap_or_else(|_| "default".into());
-        let stream = format!("tool-invoke-{}", region);
-        let content = serde_json::to_vec(&event.payload).map_err(|e| AppError::Internal(format!("json: {}", e)))?;
-        let meta = event_meta(event);
-
-        let mut last_err = None;
-        for attempt in 0..3 {
-            let mut w = self.writer.lock().await;
-            match w.produce(&stream, event.event_type.as_str(), &content, Some(task_id), 0, "application/json", &meta).await {
-                Ok((gid, seq)) => {
-                    tracing::debug!("dispatch_tool: gid={} seq={} (attempt {})", gid, seq, attempt + 1);
-                    return Ok(());
-                }
-                Err(e) => {
-                    drop(w); // 释放锁,重试时重新获取
-                    last_err = Some(e);
-                    if attempt < 2 {
-                        let delay_ms = 100u64 << attempt; // 100, 200, 400
-                        tracing::warn!("dispatch_tool retry {}/3 after {}ms: {}", attempt + 1, delay_ms, last_err.as_ref().unwrap());
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
-            }
-        }
-        Err(AppError::Internal(format!("dispatch after 3 retries: {}", last_err.unwrap())))
-    }
 }
 
 // ── 测试 ────────────────────────────────────────────────────────────────
@@ -759,7 +730,7 @@ mod tests {
         use logdb_broker_proto::pb::consume_response::Payload;
         use tokio_stream::StreamExt;
 
-        // 设置 SANDBOX_REGION 让 dispatch_tool 用
+        // 设置 SANDBOX_REGION:此测试直接写 tool-invoke-test stream(不走 dispatch_tool,后者已删)
         std::env::set_var("SANDBOX_REGION", "test");
 
         let (ld_addr, _d) = start_logdbd().await;
